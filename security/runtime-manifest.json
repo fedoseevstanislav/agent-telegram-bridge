@@ -1,0 +1,87 @@
+{
+  "externalCommands": [
+    {
+      "name": "bash",
+      "purpose": "tg-bridge launcher",
+      "required": true
+    },
+    {
+      "name": "gh",
+      "purpose": "fleet counts and durable carry-forward",
+      "required": true
+    },
+    {
+      "name": "pgrep",
+      "purpose": "session and worker discovery",
+      "required": true
+    },
+    {
+      "name": "python3",
+      "purpose": "bridge runtime",
+      "required": true
+    },
+    {
+      "name": "systemctl",
+      "purpose": "service health and watchdog",
+      "required": true
+    },
+    {
+      "name": "tmux",
+      "purpose": "interactive session routing",
+      "required": true
+    },
+    {
+      "name": "claude",
+      "purpose": "Claude session spawn feature",
+      "required": false
+    },
+    {
+      "name": "codex",
+      "purpose": "Codex session spawn feature",
+      "required": false
+    },
+    {
+      "name": "ffmpeg",
+      "purpose": "voice-transcription format fallback",
+      "required": false
+    },
+    {
+      "name": "ffprobe",
+      "purpose": "voice attachment duration probe",
+      "required": false
+    },
+    {
+      "name": "node",
+      "purpose": "Codex launcher runtime",
+      "required": false
+    }
+  ],
+  "files": {
+    "bin/tg-bridge": "sha256:d694df1981ac2905c0a90f39b7dda72e25ac00594a238e2d126a85017300c345",
+    "bridge/cli.py": "sha256:8a5c22a9012f5c4de717eddfb65561601c4bbfa805d30afabbd8b4cd3c3ee6d1",
+    "bridge/codex_ctx.py": "sha256:be7e04e6437dd5cdcb82f8f0d1ea7e6420915a1e895f5f24d09b3147ba50c9c1",
+    "bridge/common.py": "sha256:acaa9d55dfdb4a17e31c4b5da2ac62d6c50188c2c107030fed9e408cc61f6cb2",
+    "bridge/daemon.py": "sha256:81298e1251d7716f575c6795fa11f5913665993e5aa54f6befe5a97ada65ee51",
+    "bridge/digest.py": "sha256:68780daca7ab38d18d0416e620ac4966fca3b95456cedd5961e7bea31c18ef85",
+    "bridge/model_watchdog.py": "sha256:8c5b2bb459c90a629692c8e0e844a1adbe9f5e9bea2956468368e595c03ebe76",
+    "bridge/restore_cli.py": "sha256:b8509534673ad0b9e19c9e7400bfa6ab1e7dc2fdf93768490028b4d4ee40d776",
+    "bridge/transcribe.py": "sha256:6a2539e180d1ea4bec236003899e74233a167c5d7572c112e051c600e859ba90",
+    "bridge/transcript.py": "sha256:8f2cc60c3982a9a6b3c3211cad3aa13c75eea22eb9c194bdcf44c13e224175fa",
+    "bridge/watchdog.py": "sha256:258d804e7bf49be94f4b70d1405cfbb600e19fe8ab51cdb681a2fd3f682d7f14",
+    "skill/SKILL.md": "sha256:4337864e79a4d72fbc18fcf12b9fbf66f43aff47365ddde1041f7353f4edf2c9",
+    "systemd/claude-telegram-bridge-digest.service": "sha256:a41b3b4b63f6bc8158b375d26f93e66a3ffac19777717e86a85b6210f7bc7dc0",
+    "systemd/claude-telegram-bridge-digest.timer": "sha256:31c5c07a9955f4714a1c8add779cf190e06d9a527e6c9570ff6fee8b26c1bbbd",
+    "systemd/claude-telegram-bridge-model-watchdog.service": "sha256:6e39a6b39beb91be155834be5f7211eadbad0a17ac8e5cfc112bfa1e9d2b9683",
+    "systemd/claude-telegram-bridge-model-watchdog.timer": "sha256:c92ed97083c32ca01fd9c54119fc2acbfff9aec6547c1cd94085307ff677395d",
+    "systemd/claude-telegram-bridge-watchdog.service": "sha256:793539c8258d467dc13eed10948f8e01b30a002f7a3c31c31ff963d7ca7c4288",
+    "systemd/claude-telegram-bridge-watchdog.timer": "sha256:0fb43290861ccf1d8c57d77134cc29920eee0a76375db83734556c886c29af7f",
+    "systemd/claude-telegram-bridge.service": "sha256:093dc16c2c0eb9825e2cafe5c9cc06ca1227e5547dc7e8e09e366fafcabceeb8"
+  },
+  "python": {
+    "implementation": "CPython",
+    "packages": [],
+    "policy": "stdlib-only; third-party imports fail manifest verification",
+    "version": "3.12.*"
+  },
+  "schemaVersion": 1
+}

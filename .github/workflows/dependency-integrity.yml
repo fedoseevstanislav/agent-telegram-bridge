@@ -1,0 +1,35 @@
+name: Dependency integrity
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  schedule:
+    - cron: "31 4 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - name: Check out reviewed source
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      - name: Install pinned uv
+        uses: astral-sh/setup-uv@37802adc94f370d6bfd71619e3f0bf239e1f3b78 # v7
+        with:
+          version: "0.9.26"
+          enable-cache: false
+
+      - name: Install CPython 3.12
+        run: uv python install 3.12
+
+      - name: Verify manifest, lock, and advisories
+        run: scripts/verify_dependency_lock.sh
+
+      - name: Run bridge tests
+        run: uv run --frozen --python 3.12 --extra dev pytest -q

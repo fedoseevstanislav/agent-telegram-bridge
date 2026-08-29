@@ -1,0 +1,12 @@
+[Unit]
+Description=Claude Telegram bridge morning digest (deterministic daily summary to General)
+
+[Service]
+# 0077: everything this daemon creates — inboxes, the registry, carry-forward files — is
+# private to the owner. Without it these inherit the login shell's umask, and a common
+# `umask 002` makes the state directory group-writable: a peer account can then append a
+# well-formed record to a topic inbox and have an agent read it as if it arrived from
+# Telegram, with the owner check never consulted (#245).
+UMask=0077
+Type=oneshot
+ExecStart=/usr/bin/python3 @@BRIDGE_ROOT@@/bridge/digest.py

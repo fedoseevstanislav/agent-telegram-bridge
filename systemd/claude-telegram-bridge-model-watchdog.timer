@@ -1,0 +1,9 @@
+[Unit]
+Description=Periodic model-identity check for Claude Telegram bridge sessions
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=5min
+
+[Install]
+WantedBy=timers.target

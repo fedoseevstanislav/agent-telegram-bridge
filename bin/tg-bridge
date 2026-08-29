@@ -1,0 +1,15 @@
+#!/usr/bin/env bash
+# The launcher resolves its OWN location rather than carrying an absolute path (#204 §5).
+#
+# It used to exec a path baked in at authoring time, which meant this file only worked in one
+# person's home directory — and said whose, in a file that ships.
+#
+# `readlink -f` so a symlink into a bin directory still resolves to the real script, and `cd`
+# + `pwd` so the result is absolute regardless of where it was invoked from.
+#
+# -u (unbuffered): recv listeners run as harness background tasks with stdout redirected to
+# a file; block-buffered stdout could hold an inbound message in the buffer while the cursor
+# was already advanced, so a reaped listener would drop it (#105 recv-drain). Unbuffered
+# stdout writes each message to the output file immediately.
+here=$(cd -- "$(dirname -- "$(readlink -f -- "${BASH_SOURCE[0]}")")" && pwd)
+exec python3 -u "$here/../bridge/cli.py" "$@"

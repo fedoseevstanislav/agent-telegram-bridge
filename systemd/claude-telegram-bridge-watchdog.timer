@@ -1,0 +1,9 @@
+[Unit]
+Description=Periodic liveness check for the Claude Telegram bridge daemon
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=5min
+
+[Install]
+WantedBy=timers.target

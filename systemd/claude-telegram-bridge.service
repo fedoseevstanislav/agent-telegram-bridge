@@ -1,0 +1,30 @@
+[Unit]
+Description=Claude Telegram bridge daemon (getUpdates consumer)
+After=network-online.target
+# RestartSec=5 outpaces systemd's default 10s start-limit window, so a crash
+# loop would never reach 'failed' (and OnFailure would never fire) without this:
+StartLimitIntervalSec=120
+StartLimitBurst=5
+OnFailure=claude-telegram-bridge-watchdog.service
+
+[Service]
+# 0077: everything this daemon creates — inboxes, the registry, carry-forward files — is
+# private to the owner. Without it these inherit the login shell's umask, and a common
+# `umask 002` makes the state directory group-writable: a peer account can then append a
+# well-formed record to a topic inbox and have an agent read it as if it arrived from
+# Telegram, with the owner check never consulted (#245).
+UMask=0077
+# @@BRIDGE_ROOT@@ is substituted for this clone's absolute path by scripts/install.sh.
+# systemd cannot expand a variable in ExecStart, so it has to happen at install time —
+# and a unit that ships with somebody else's home directory in it is worse than one that
+# obviously needs substituting.
+ExecStart=/usr/bin/python3 @@BRIDGE_ROOT@@/bridge/daemon.py
+# Telegram-spawned tmux sessions must survive daemon restarts. With systemd's
+# default KillMode=control-group, restarting this service also kills the tmux
+# server/panes launched from /claude and /codex.
+KillMode=process
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=default.target
