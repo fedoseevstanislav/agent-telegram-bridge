@@ -49,6 +49,13 @@ ECHO_CAPTURE_LINES = 30  # rows of scrollback above the visible pane to include 
 ECHO_PROBE_CHARS = 40    # chars of the line's tail used as the probe
 SWALLOW_MAX_ATTEMPTS = 2  # consecutive unverified injections into one pane before we stop
                           # typing: each attempt appends to an input box we cannot verify
+ECHO_EXTRA_WAITS = (0.6, 1.2)  # further waits before giving up on an injection, after the
+                               # first `settle` sample. One 0.3s sample called a busy pane's
+                               # late repaint a modal, and the verdict was permanent (#250).
+                               # A ladder rather than a deadline: type_line holds the pane
+                               # lock while it waits, so the cost has to be legible — at most
+                               # 0.3+0.6+1.2s — and it must not depend on a clock, which a
+                               # test that stubs sleep would otherwise spin against.
 SWALLOW_RETRY_AFTER = 600  # s after which a capped pane is tried once more regardless — the
                            # cap must never become a one-way door (see type_line)
 BRIEFING_RETRY_DELAY = 120  # s before re-trying a revival briefing the pane didn't take
@@ -544,13 +551,54 @@ def type_line(pane, text, settle=0.3):
         except Exception as e:
             log(f"type_line: send-keys failed for pane {pane}: {e}")
             return "failed"
-        time.sleep(settle)
-        measured = _echo_counts(pane, probe)
-        if measured is None:
-            _stranded()
-            log(f"type_line: pane {pane} unreadable after typing — Enter withheld")
-            return "swallowed"
-        after, geo_after = measured
+        # #250: one 0.3s sample decides, and a pane that repaints later than that reads
+        # exactly like a modal that swallowed the keystrokes. The verdict was permanent — the
+        # text sat unsent in the input box, the topic was repeatedly told its session was
+        # unreachable, and only a human pressing Enter delivered it. In the observation that
+        # exposed this, the first sample logged `literal=0->0` on a busy pane, while a later
+        # look found the line plainly in its input box.
+        #
+        # The obvious fix — look again, and act on what the later look sees — was written
+        # twice and refused twice by review, for the same reason both times. The evidence is a
+        # COUNT of the text anywhere in the capture, which stands in for "our text is in the
+        # input box". That proxy holds only while the sole thing that can change the count is
+        # our own keystroke. Widen the window and the pane's renderer gets in: an older
+        # identical wake line repainted behind a still-open picker raises the count, and the
+        # Enter that follows accepts the picker's highlighted option — the exact failure #133
+        # exists to prevent. Reproduced against this function, not argued (#253).
+        #
+        # So the extra samples are OBSERVATION ONLY. They authorise nothing: `confirmed` is
+        # decided by the first sample alone, exactly as before, and this code path cannot
+        # press an Enter that main would not have pressed. What the later samples do is
+        # measure — how often, and how late, a render arrives that the single sample missed.
+        # That distribution is the thing nobody has, and without it a longer window is a
+        # safety change traded for an unquantified benefit (#252).
+        confirmed = False
+        cumulative = 0.0
+        for sample, wait in enumerate((settle,) + ECHO_EXTRA_WAITS):
+            time.sleep(wait)
+            cumulative += wait
+            measured = _echo_counts(pane, probe)
+            if measured is None:
+                _stranded()
+                log(f"type_line: pane {pane} unreadable after typing — Enter withheld")
+                return "swallowed"
+            after, geo_after = measured
+            if _geometry_moved(geo_before, geo_after):
+                break            # abstain below; re-sampling a moved window proves nothing
+            rose = after[0] > before[0] or after[1] > before[1]
+            if sample == 0:
+                confirmed = rose
+                if confirmed:
+                    break        # the decision, unchanged: first sample, both signals
+            elif rose:
+                # Not a delivery. A number for #252, and deliberately not acted on: this same
+                # rise is what a repaint behind a modal produces.
+                log(f"type_line: pane {pane} rendered at sample {sample} (+{cumulative:.1f}s), "
+                    f"after the {settle}s decision had already been taken — literal "
+                    f"{before[0]}->{after[0]} chip {before[1]}->{after[1]}. Enter NOT sent "
+                    f"(#250/#252); the text is stranded in the box.")
+                break
         # The two counts must come from the SAME window or comparing them means nothing. A
         # resize can move the row window backwards and admit residue, which reads as a rise
         # with nothing typed (#165 review r2). Abstain instead of guessing; the caller retries.
@@ -583,7 +631,7 @@ def type_line(pane, text, settle=0.3):
         # to quote a collapse marker, or a repaint that re-draws an erased one, still raises
         # the count at unchanged geometry. No substring can tell either from a real paste;
         # only a causal receipt can (#157).
-        if not (after[0] > before[0] or after[1] > before[1]):
+        if not confirmed:
             _stranded()
             # Log the numbers. #168 had to be diagnosed from mechanism because this line said
             # only "swallowed" — the one thing that would have settled it in a second was the
@@ -630,6 +678,23 @@ UNREADABLE_LEAD = (
     "That is not a prompt waiting for you — the pane itself is unreachable (a full-screen "
     "program, or a stuck process holding it). It needs a look."
 )
+
+
+def pane_is_persistently_swallowing(pane):
+    """True once a pane has swallowed enough consecutive injections to be worth telling its
+    owner about (#254).
+
+    A single swallow is usually not a stuck pane. #250's logging measured the common case:
+    the text renders only after the first decision, and the next sweep tick delivers it.
+    Reporting on that first swallow told the owner their session was unreachable while it was
+    in fact about to receive the message. An alarm that fires on the recoverable case trains
+    its reader to ignore it, and then the unrecoverable one is missed too.
+
+    The other failure mode already works this way: the `failed` route escalates only after
+    UNREADABLE_ESCALATE_AFTER consecutive failures. This gives `swallowed` the same shape,
+    using the streak type_line already keeps. A genuinely stuck pane is still reported, one
+    sweep tick later than before."""
+    return _swallowed_streak.get(pane, (0, 0.0))[0] >= SWALLOW_MAX_ATTEMPTS
 
 
 def report_blocked_pane(thread_id, pane, what, lead=MODAL_LEAD):
@@ -699,7 +764,7 @@ def maybe_nudge(thread_id, pane, wake_claim=None):
             status = type_line(pane, text)
             if status != "sent":
                 log(f"nudge not delivered to pane {pane} (topic {thread_id}): {status}")
-                if status == "swallowed":
+                if status == "swallowed" and pane_is_persistently_swallowing(pane):
                     report_blocked_pane(thread_id, pane, "a new Telegram message")
                 return False
             log(f"nudged pane {pane} for topic {thread_id}")
@@ -2285,7 +2350,8 @@ def idle_sweep_loop(cfg):
                             log(f"self-heal nudge {status} for topic {tid} (pane {pane})")
                             if status == "swallowed":
                                 _unreadable_streak.pop(str(tid), None)
-                                report_blocked_pane(tid, pane, undelivered)
+                                if pane_is_persistently_swallowing(pane):
+                                    report_blocked_pane(tid, pane, undelivered)
                             elif status == "failed":
                                 # "failed" means the pane could not be read or locked, which
                                 # is not always transient. Retrying forever with no exit is

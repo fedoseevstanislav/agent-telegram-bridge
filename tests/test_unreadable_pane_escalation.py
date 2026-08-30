@@ -64,7 +64,8 @@ def sweep(monkeypatch):
     monkeypatch.setattr(daemon.time, "sleep", _sleep)
 
     # Fresh module-level tables per test; monkeypatch restores the originals afterwards.
-    for name in ("_dark_since", "_last_sweep_nudge", "_unreadable_streak", "_blocked_reported"):
+    for name in ("_dark_since", "_last_sweep_nudge", "_unreadable_streak", "_blocked_reported",
+                 "_swallowed_streak"):
         monkeypatch.setattr(daemon, name, {})
 
     def _run(status="failed", sweeps=1):
@@ -131,12 +132,26 @@ def test_a_delivered_nudge_clears_the_streak(sweep):
 
 
 def test_a_swallowed_nudge_clears_the_streak_and_reports_as_a_modal(sweep):
+    # type_line is stubbed here, so the swallow streak it normally keeps has to be stated:
+    # this is the pane that has already swallowed enough to be worth reporting (#254).
     sweep("failed", sweeps=daemon.UNREADABLE_ESCALATE_AFTER - 1)
+    daemon._swallowed_streak[PANE] = (daemon.SWALLOW_MAX_ATTEMPTS, 0.0)
     reports = sweep("swallowed", sweeps=1)
     assert daemon._unreadable_streak.get(TID) is None
     assert len(reports) == 1
     assert reports[0]["lead"] == daemon.MODAL_LEAD, (
         "a modal is a different condition and keeps its own copy")
+
+
+def test_a_single_swallow_reports_nothing(sweep):
+    """#254. The unreadable streak is still cleared — a swallow is not an unreadable pane —
+    but the owner hears nothing until the pane proves it is actually stuck. Most single
+    swallows are a late render that the next tick delivers."""
+    sweep("failed", sweeps=daemon.UNREADABLE_ESCALATE_AFTER - 1)
+    assert not daemon.pane_is_persistently_swallowing(PANE)
+    reports = sweep("swallowed", sweeps=1)
+    assert daemon._unreadable_streak.get(TID) is None
+    assert reports == []
 
 
 # ---- the surrounding contract the fix must not break -------------------------

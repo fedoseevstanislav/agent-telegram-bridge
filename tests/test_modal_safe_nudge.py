@@ -833,7 +833,13 @@ def test_cf_clear_modal_takes_the_pane_lock_and_rechecks(monkeypatch):
 
 # ---- call sites --------------------------------------------------------------
 
-def test_maybe_nudge_reports_a_blocked_pane(monkeypatch):
+def test_maybe_nudge_reports_a_pane_that_keeps_swallowing(monkeypatch):
+    """A picker never accepts the text, so the streak reaches the cap and the owner is told.
+
+    #254 moved this from the FIRST swallow to a persistent one: most single swallows are a
+    late render that the next tick delivers, and reporting those told the owner a session was
+    unreachable while the message was already on its way. The alarm still fires here — it just
+    takes the second consecutive failure to do it, which for the sweep is one tick later."""
     pane = _install(monkeypatch, FakePane(CODEX_RATE_LIMIT_MODAL, accepts=False))
     monkeypatch.setattr(daemon, "unread_count", lambda _tid: 1)
     monkeypatch.setattr(daemon, "pane_alive", lambda _p: True)
@@ -843,7 +849,12 @@ def test_maybe_nudge_reports_a_blocked_pane(monkeypatch):
                         lambda tid, p, what: reported.append((tid, p, what)))
     assert daemon.maybe_nudge(55, "%1") is False
     assert pane.enters == 0
+    assert reported == []            # one swallow is not yet news
+
+    while not daemon.pane_is_persistently_swallowing("%1"):
+        assert daemon.maybe_nudge(55, "%1") is False
     assert reported and reported[0][0] == 55
+    assert pane.enters == 0          # and still no Enter on the picker
 
 
 def test_maybe_nudge_is_silent_on_a_normal_pane(monkeypatch):
