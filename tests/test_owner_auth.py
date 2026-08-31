@@ -9,7 +9,7 @@ def _message(text, *, sender_id=42, **extra):
     return {
         "chat": {"id": -1001},
         "from": {"id": sender_id, "first_name": "Sender"},
-        "message_thread_id": 4109,
+        "message_thread_id": 8265,
         "message_id": 101,
         "text": text,
         **extra,
@@ -100,7 +100,7 @@ def test_forwarded_content_uses_outer_sender_for_authorization(monkeypatch):
     )
 
     assert appended[0]["text"] == "forwarded material"
-    assert scheduled == [(4109, common.WakeClaim(0))]
+    assert scheduled == [(8265, common.WakeClaim(0))]
 
 
 def test_forwarded_content_from_non_owner_is_rejected(monkeypatch):

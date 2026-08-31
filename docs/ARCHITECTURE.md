@@ -1,4 +1,4 @@
-# claude-telegram-bridge — Architecture
+# agent-telegram-bridge — Architecture
 
 ## 1. Status
 
@@ -49,7 +49,7 @@ Two design priorities shape every structural decision:
 flowchart TB
     human["Human (owner)<br/>Telegram client"]
     tg["Telegram Bot API<br/>(forum supergroup)"]
-    bridge["claude-telegram-bridge<br/><i>(daemon + CLI + units)</i>"]
+    bridge["agent-telegram-bridge<br/><i>(daemon + CLI + units)</i>"]
     tmux["tmux<br/>(session host)"]
     claude["claude CLI"]
     codex["codex CLI"]
@@ -79,7 +79,7 @@ Key external boundaries: the **human** interacts only through Telegram; **tmux**
 
 ```mermaid
 flowchart TB
-    subgraph bridge["claude-telegram-bridge (repo)"]
+    subgraph bridge["agent-telegram-bridge (repo)"]
         daemon["daemon.py<br/>sole getUpdates consumer,<br/>routing, commands, spawn,<br/>monitoring loops, dashboard"]
         cli["cli.py / tg-bridge<br/>per-session client"]
         common["common.py<br/>config, Telegram api(),<br/>registry, state paths"]
@@ -146,7 +146,7 @@ erDiagram
     }
 ```
 
-New persistent state lives entirely under `~/.local/share/claude-telegram-bridge/` (per-topic inboxes/cursors/media, the registry, the update offset, dashboard/digest/warning/watchdog state, and the carry-forward records auto-carry-forward retries from). Config lives under `~/.config/claude-telegram-bridge/` (chmod 600). No state is stored in the repository. Full field-level schemas are in the [specification](./SPECIFICATION.md#data-model).
+New persistent state lives entirely under `~/.local/share/agent-telegram-bridge/` (per-topic inboxes/cursors/media, the registry, the update offset, dashboard/digest/warning/watchdog state, and the carry-forward records auto-carry-forward retries from). Config lives under `~/.config/agent-telegram-bridge/` (chmod 600). No state is stored in the repository. Full field-level schemas are in the [specification](./SPECIFICATION.md#data-model).
 
 ## 7. Key Flows
 

@@ -1,5 +1,5 @@
 [Unit]
-Description=Claude Telegram bridge morning digest (deterministic daily summary to General)
+Description=Agent Telegram bridge morning digest (deterministic daily summary to General)
 
 [Service]
 # 0077: everything this daemon creates — inboxes, the registry, carry-forward files — is

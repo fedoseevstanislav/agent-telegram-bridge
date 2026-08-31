@@ -27,7 +27,7 @@ def test_home_is_not_the_real_home():
 
 
 def test_state_dir_is_outside_the_live_bridge():
-    live = os.path.join(_real_home(), ".local", "share", "claude-telegram-bridge")
+    live = os.path.join(_real_home(), ".local", "share", "agent-telegram-bridge")
     assert not common.STATE_DIR.startswith(live)
     assert not daemon.state_path("registry.json").startswith(live)
 
@@ -42,7 +42,7 @@ def test_the_import_time_pending_reopen_read_is_isolated(import_time_state_dir):
     # bridge.daemon reads pending-reopens.json while it is being IMPORTED, which is earlier
     # than any fixture can run — so the per-test redirection below cannot be what saved it.
     # This asserts against the value bound at import: the module-scope HOME swap covered it.
-    live = os.path.join(_real_home(), ".local", "share", "claude-telegram-bridge")
+    live = os.path.join(_real_home(), ".local", "share", "agent-telegram-bridge")
     assert not import_time_state_dir.startswith(live)
     assert import_time_state_dir.startswith(os.environ["HOME"] + os.sep)
 
@@ -59,7 +59,7 @@ def test_tuning_variables_from_the_host_are_cleared():
 #
 # These two run in file order and are a pair: the first writes through the real `state_path`,
 # the second proves the write is gone. Before the per-test STATE_DIR patch this leaked —
-# `topics/4109`, `topics/55` and `topics/4106` were each created by one test and still there
+# `topics/8265`, `topics/33` and `topics/11722` were each created by one test and still there
 # for every later one (#203 review, C5).
 
 _LEAK_PROBE = ("topics", "999999", "leak-probe.json")

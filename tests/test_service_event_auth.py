@@ -23,7 +23,7 @@ def registry(tmp_path, monkeypatch):
     # branch reading an empty registry and the test proves nothing.
     monkeypatch.setattr(common, "STATE_DIR", str(tmp_path))
     root = tmp_path / "registry.json"
-    root.write_text(json.dumps({"55": {"name": "bridge", "closed": True}}))
+    root.write_text(json.dumps({"33": {"name": "bridge", "closed": True}}))
     monkeypatch.setattr(daemon, "log", lambda *a, **k: None)
     return root
 
@@ -33,11 +33,11 @@ def _read(root):
 
 
 def _reopen(**extra):
-    return {"chat": {"id": 1}, "message_thread_id": 55, "forum_topic_reopened": {}, **extra}
+    return {"chat": {"id": 1}, "message_thread_id": 33, "forum_topic_reopened": {}, **extra}
 
 
 def _close(**extra):
-    return {"chat": {"id": 1}, "message_thread_id": 55, "forum_topic_closed": {}, **extra}
+    return {"chat": {"id": 1}, "message_thread_id": 33, "forum_topic_closed": {}, **extra}
 
 
 @pytest.fixture
@@ -56,12 +56,12 @@ def revivals(monkeypatch):
 
 def test_the_owner_may_close_a_topic(registry):
     daemon.handle_message(CFG, _close(**{"from": {"id": OWNER}}))
-    assert _read(registry)["55"]["closed"] is True
+    assert _read(registry)["33"]["closed"] is True
 
 
 def test_the_owner_may_reopen_a_topic_and_it_revives(registry, revivals):
     daemon.handle_message(CFG, _reopen(**{"from": {"id": OWNER}}))
-    assert "closed" not in _read(registry)["55"]
+    assert "closed" not in _read(registry)["33"]
     assert revivals == ["maybe_auto_revive"]
 
 
@@ -69,7 +69,7 @@ def test_the_bridges_own_echo_is_trusted(registry, revivals):
     # revive_one reopens the topic itself and Telegram echoes that back. Rejecting our own
     # echo would log a false alarm on every revive and bury a real one.
     daemon.handle_message(CFG, _reopen(**{"from": {"id": BOT_ID, "is_bot": True}}))
-    assert "closed" not in _read(registry)["55"]
+    assert "closed" not in _read(registry)["33"]
 
 
 # ---- rejected ---------------------------------------------------------------------------
@@ -77,13 +77,13 @@ def test_the_bridges_own_echo_is_trusted(registry, revivals):
 def test_a_service_message_with_no_sender_changes_nothing(registry, revivals):
     # This is the shape the previous test suite asserted SHOULD work.
     daemon.handle_message(CFG, _reopen())
-    assert _read(registry)["55"]["closed"] is True
+    assert _read(registry)["33"]["closed"] is True
     assert revivals == []
 
 
 def test_another_group_member_cannot_reopen(registry, revivals):
     daemon.handle_message(CFG, _reopen(**{"from": {"id": OWNER + 1}}))
-    assert _read(registry)["55"]["closed"] is True
+    assert _read(registry)["33"]["closed"] is True
     assert revivals == []
 
 
@@ -91,13 +91,13 @@ def test_an_anonymous_admin_cannot_reopen(registry, revivals):
     # Anonymous admins post as the group itself: sender_chat, no `from`. The Bot API does not
     # say WHICH admin acted, so there is no actor to authorize.
     daemon.handle_message(CFG, _reopen(sender_chat={"id": 1, "type": "supergroup"}))
-    assert _read(registry)["55"]["closed"] is True
+    assert _read(registry)["33"]["closed"] is True
     assert revivals == []
 
 
 def test_another_bot_cannot_reopen(registry, revivals):
     daemon.handle_message(CFG, _reopen(**{"from": {"id": BOT_ID + 1, "is_bot": True}}))
-    assert _read(registry)["55"]["closed"] is True
+    assert _read(registry)["33"]["closed"] is True
     assert revivals == []
 
 
@@ -116,19 +116,19 @@ def test_a_truthy_non_mapping_actor_is_logged_rather_than_raising(
     lines = []
     monkeypatch.setattr(daemon, "log", lines.append)
     daemon.handle_message(CFG, _reopen(**{field: value}))
-    assert _read(registry)["55"]["closed"] is True
+    assert _read(registry)["33"]["closed"] is True
     assert revivals == []
     assert any("ignored forum reopen" in line and "untrusted sender" in line
                for line in lines), lines
 
 
 def test_a_member_cannot_close_a_topic(registry):
-    open_registry = {"55": {"name": "bridge"}}
+    open_registry = {"33": {"name": "bridge"}}
     path = str(registry)
     with open(path, "w") as handle:
         json.dump(open_registry, handle)
     daemon.handle_message(CFG, _close(**{"from": {"id": OWNER + 1}}))
-    assert "closed" not in _read(registry)["55"]
+    assert "closed" not in _read(registry)["33"]
 
 
 def test_a_missing_owner_pin_trusts_nobody(registry, revivals):
@@ -136,7 +136,7 @@ def test_a_missing_owner_pin_trusts_nobody(registry, revivals):
     # back to trusting the group. True is deliberately not a valid owner id.
     for broken in (None, 0, -1, True, "7"):
         daemon.handle_message({**CFG, "owner_id": broken}, _reopen(**{"from": {"id": OWNER}}))
-    assert _read(registry)["55"]["closed"] is True
+    assert _read(registry)["33"]["closed"] is True
     assert revivals == []
 
 

@@ -1,8 +1,8 @@
 """Unit tests for the outbound echo into the sender's own topic (#140).
 
 `notify` mirrored only into the recipient's topic, so each thread held just the half of the
-conversation it received. The first observed peer exchange put four questions in one topic
-and their four answers in the other: reading either one, the owner
+conversation it received. The first real peer exchange (topics 6258 ↔ 8713, 2026-08-10) put
+four questions in one topic and their four answers in the other: reading either one, the owner
 saw replies with nothing they answered. Every hop had reached Telegram; neither thread read
 as a conversation.
 
@@ -26,9 +26,9 @@ CFG = {"bot_token": "token", "chat_id": -100}
 
 def _registry():
     return {
-        "111": {"name": "Alpha", "created": "2000-01-01T00:00:00+0000",
+        "111": {"name": "Alpha", "created": "2026-08-10T10:00:00+0000",
                 "pane": CALLER_PANE, "icon": A_ICON},
-        "222": {"name": "Beta", "created": "2000-01-01T00:05:00+0000",
+        "222": {"name": "Beta", "created": "2026-08-10T10:05:00+0000",
                 "pane": "%B", "icon": B_ICON},
     }
 
@@ -119,7 +119,7 @@ def test_echo_is_reported_ambiguous_like_the_other_side_effects(monkeypatch, tmp
 def test_automation_without_a_topic_has_nothing_to_echo(monkeypatch, tmp_path):
     sent = _env(monkeypatch, tmp_path, pane=None)
 
-    result = cli.notify_topic(CFG, B, "automation", "k1", "build finished")
+    result = cli.notify_topic(CFG, B, "orchestra", "k1", "build finished")
 
     assert result["echo"] == "skipped"
     assert [thread for thread, _text in sent] == [B]

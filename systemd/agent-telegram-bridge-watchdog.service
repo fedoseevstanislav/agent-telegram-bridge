@@ -1,5 +1,5 @@
 [Unit]
-Description=Claude Telegram bridge model-identity watchdog
+Description=Agent Telegram bridge watchdog (alerts General topic if the daemon is down)
 
 [Service]
 # 0077: everything this daemon creates — inboxes, the registry, carry-forward files — is
@@ -9,4 +9,4 @@ Description=Claude Telegram bridge model-identity watchdog
 # Telegram, with the owner check never consulted (#245).
 UMask=0077
 Type=oneshot
-ExecStart=/usr/bin/python3 @@BRIDGE_ROOT@@/bridge/model_watchdog.py
+ExecStart=/usr/bin/python3 @@BRIDGE_ROOT@@/bridge/watchdog.py

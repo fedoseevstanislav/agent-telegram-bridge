@@ -219,13 +219,13 @@ def test_notify_mirror_appends_notify_outbox_record(tmp_path, monkeypatch):
     monkeypatch.setattr(
         cli,
         "read_registry",
-        lambda: {"77": {"name": "target", "pane": "%12", "engine": "codex"}},
+        lambda: {"77": {"name": "target", "pane": "%77", "engine": "codex"}},
     )
     monkeypatch.setattr(cli, "pane_alive", lambda _pane: True, raising=False)
     monkeypatch.setattr(cli, "maybe_nudge", lambda *_args: True, raising=False)
     calls = _api_recorder(monkeypatch)
 
-    result = cli.notify_topic(CFG, 77, "automation", "job-1", "finished")
+    result = cli.notify_topic(CFG, 77, "orchestra", "job-1", "finished")
 
     assert result["telegram"] == "posted"
     record, = _records(tmp_path, 77)
@@ -234,7 +234,7 @@ def test_notify_mirror_appends_notify_outbox_record(tmp_path, monkeypatch):
     assert record["content_sha256"] == hashlib.sha256(
         calls[0]["text"].encode("utf-8")
     ).hexdigest()
-    assert calls[0]["text"] == "automation: finished"
+    assert calls[0]["text"] == "orchestra: finished"
 
 
 def test_notify_journal_and_stderr_failures_still_report_posted(tmp_path, monkeypatch):
@@ -242,7 +242,7 @@ def test_notify_journal_and_stderr_failures_still_report_posted(tmp_path, monkey
     monkeypatch.setattr(
         cli,
         "read_registry",
-        lambda: {"77": {"name": "target", "pane": "%12", "engine": "codex"}},
+        lambda: {"77": {"name": "target", "pane": "%77", "engine": "codex"}},
     )
     monkeypatch.setattr(cli, "pane_alive", lambda _pane: True, raising=False)
     monkeypatch.setattr(cli, "maybe_nudge", lambda *_args: True, raising=False)
@@ -256,7 +256,7 @@ def test_notify_journal_and_stderr_failures_still_report_posted(tmp_path, monkey
     monkeypatch.setattr(cli, "sys", SimpleNamespace(stderr=broken_stderr))
 
     try:
-        result = cli.notify_topic(CFG, 77, "automation", "job-1", "finished")
+        result = cli.notify_topic(CFG, 77, "orchestra", "job-1", "finished")
     finally:
         outbox.chmod(0o600)
 

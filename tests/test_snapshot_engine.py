@@ -5,12 +5,13 @@ falsy — discarding an engine it had already determined. That is not hypothetic
 session has no session_id until it completes its first turn**, because it does not open its
 `rollout-*.jsonl` before then and `codex_session_id_for_pane` reads the id from that open fd.
 
-Repeated samples before a first turn returned `engine='codex' sid=None`; the first
-completed turn then produced an id promptly.
+Measured 2026-08-26 on a bare codex pane: eight samples over two minutes all returned
+`engine='codex' sid=None`, then one real turn produced an id within 10s.
 
-So a session killed before doing anything left `engine: null` behind, and every later decision
-about that topic guessed "claude". Reopening such a topic then failed because the bridge could
-not tell which engine the short-lived session had been.
+So every session killed before it did anything left `engine: null` behind — ten such entries
+were in the registry — and every later decision about that topic then guessed "claude".
+Topic 15569 was the one the owner hit: they killed a codex demo two minutes after spawning it,
+reopened the topic, and the bridge could not even tell which engine it had been.
 """
 
 import pytest
@@ -18,13 +19,13 @@ import pytest
 from bridge import daemon
 
 
-LIVE = {"name": "test-theme", "pane": "%14"}
+LIVE = {"name": "test-theme", "pane": "%162"}
 
 
 @pytest.fixture
 def snap(monkeypatch):
     """snapshot_once over one registry entry, with the pane probes stubbed."""
-    state = {"registry": {"4105": dict(LIVE)}, "writes": []}
+    state = {"registry": {"15569": dict(LIVE)}, "writes": []}
 
     def _update(fn):
         fn(state["registry"])
@@ -44,10 +45,10 @@ def test_engine_is_recorded_before_the_first_turn(snap, monkeypatch):
 
     daemon.snapshot_once()
 
-    assert snap["registry"]["4105"]["engine"] == "codex", (
+    assert snap["registry"]["15569"]["engine"] == "codex", (
         "threw away an engine it had already resolved, because no session id existed yet"
     )
-    assert snap["registry"]["4105"].get("session_id") is None, (
+    assert snap["registry"]["15569"].get("session_id") is None, (
         "invented a session id that codex has not created yet"
     )
 
@@ -73,7 +74,7 @@ def test_the_full_stamp_still_wins_once_the_session_id_appears(snap, monkeypatch
     monkeypatch.setattr(daemon, "session_id_for_pane", lambda pane, engine: "01a03dd8")
     daemon.snapshot_once()
 
-    entry = snap["registry"]["4105"]
+    entry = snap["registry"]["15569"]
     assert (entry["engine"], entry["session_id"], entry["boot_id"]) == (
         "codex", "01a03dd8", "boot-x")
 
@@ -86,15 +87,15 @@ def test_an_unrecognised_engine_is_not_recorded(snap, monkeypatch):
 
     daemon.snapshot_once()
 
-    assert snap["registry"]["4105"].get("engine") is None
+    assert snap["registry"]["15569"].get("engine") is None
     assert snap["writes"] == []
 
 
 def test_an_ended_or_feed_topic_is_never_stamped(snap, monkeypatch):
     monkeypatch.setattr(daemon, "engine_of_pane", lambda pane: "codex")
     monkeypatch.setattr(daemon, "session_id_for_pane", lambda pane, engine: None)
-    snap["registry"]["4105"]["ended"] = "2000-01-01T00:00:00+0000"
-    snap["registry"]["9999"] = {"pane": "%13", "feed": True}
+    snap["registry"]["15569"]["ended"] = "2026-08-26T11:24:22+0000"
+    snap["registry"]["9999"] = {"pane": "%99", "feed": True}
 
     daemon.snapshot_once()
 
@@ -106,13 +107,13 @@ def test_an_engine_change_is_not_stamped_over_an_existing_session_id(snap, monke
     lookup can be transient or stale. Writing the engine alone then pairs a NEW engine with
     the OLD engine's id, and `_resume_launch` builds `claude --resume <CODEX-SID>`. Half of an
     (engine, session_id) pair must never be replaced while the other half still stands."""
-    snap["registry"]["4105"].update({"engine": "codex", "session_id": "CODEX-SID"})
+    snap["registry"]["15569"].update({"engine": "codex", "session_id": "CODEX-SID"})
     monkeypatch.setattr(daemon, "engine_of_pane", lambda pane: "claude")
     monkeypatch.setattr(daemon, "session_id_for_pane", lambda pane, engine: None)
 
     daemon.snapshot_once()
 
-    entry = snap["registry"]["4105"]
+    entry = snap["registry"]["15569"]
     assert (entry["engine"], entry["session_id"]) == ("codex", "CODEX-SID"), (
         "paired a new engine with the previous engine's session id"
     )
@@ -130,14 +131,14 @@ def test_a_session_id_arriving_concurrently_blocks_the_engine_write(snap, monkey
 
     def racing(fn):
         # Another writer lands between the gate and the mutator.
-        snap["registry"]["4105"].update({"engine": "codex", "session_id": "CODEX-SID"})
+        snap["registry"]["15569"].update({"engine": "codex", "session_id": "CODEX-SID"})
         real_update(fn)
 
     monkeypatch.setattr(daemon, "update_registry", racing)
 
     daemon.snapshot_once()
 
-    entry = snap["registry"]["4105"]
+    entry = snap["registry"]["15569"]
     assert (entry["engine"], entry["session_id"]) == ("codex", "CODEX-SID"), (
         "wrote a new engine over a session id that arrived concurrently"
     )

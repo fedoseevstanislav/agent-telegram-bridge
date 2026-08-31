@@ -18,8 +18,8 @@ def _point_state(monkeypatch, tmp_path, name="autocf_exempt.json"):
 
 def test_exempt_returns_topic_ids_as_strings(monkeypatch, tmp_path):
     p = _point_state(monkeypatch, tmp_path)
-    p.write_text(json.dumps(["4108", 4110]))  # mixed str/int -> all coerced to str
-    assert daemon.load_autocf_exempt() == {"4108", "4110"}
+    p.write_text(json.dumps(["5935", 5927]))  # mixed str/int -> all coerced to str
+    assert daemon.load_autocf_exempt() == {"5935", "5927"}
 
 
 def test_exempt_missing_file_is_empty(monkeypatch, tmp_path):
@@ -35,7 +35,7 @@ def test_exempt_malformed_json_is_empty(monkeypatch, tmp_path):
 
 def test_exempt_non_list_is_empty(monkeypatch, tmp_path):
     p = _point_state(monkeypatch, tmp_path)
-    p.write_text(json.dumps({"4108": True}))  # a dict, not a list -> ignored
+    p.write_text(json.dumps({"5935": True}))  # a dict, not a list -> ignored
     assert daemon.load_autocf_exempt() == set()
 
 
@@ -62,12 +62,12 @@ def _patch_autocf_side_effects(monkeypatch):
 def test_process_autocf_exempt_never_fires_and_clears_armed(monkeypatch):
     rec = _patch_autocf_side_effects(monkeypatch)
     monkeypatch.setattr(daemon, "carry_forward_active", lambda tid: False)
-    autocf_fired = {"4108": True}  # pre-existing armed flag
-    # 95% context on a claude session would normally fire — but 4108 is exempt.
-    fired = daemon._process_autocf({}, "4108", {}, "%1", 95, "claude", {"4108"}, autocf_fired)
+    autocf_fired = {"5935": True}  # pre-existing armed flag
+    # 95% context on a claude session would normally fire — but 5935 is exempt.
+    fired = daemon._process_autocf({}, "5935", {}, "%1", 95, "claude", {"5935"}, autocf_fired)
     assert fired is False
     assert rec["cf"] == [] and rec["reply"] == 0
-    assert "4108" not in autocf_fired  # stale armed flag cleared for clean un-exempt
+    assert "5935" not in autocf_fired  # stale armed flag cleared for clean un-exempt
 
 
 def test_process_autocf_non_exempt_fires_at_threshold(monkeypatch):

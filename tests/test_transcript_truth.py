@@ -1,7 +1,7 @@
 """#157: the session's own transcript, not the rendered pane, is the daemon's ground truth.
 
-Every shape asserted here was verified against transcripts containing compactions before it
-was written down, so these are representations of Claude Code's actual output rather
+Every shape asserted here was verified against a real transcript carrying 19 compactions
+before it was written down, so these are recordings of Claude Code's actual output rather
 than a guess at it. That distinction is the whole point of the issue: #133 and #163 were both
 built against a synthetic model of the pane that could not contain the dominant production
 case, and both shipped broken.
@@ -178,7 +178,7 @@ def test_a_partial_trailing_line_is_PENDING_not_trusted_absence(tmp_path):
 
 
 def test_a_malformed_COMPLETE_line_is_unknown_not_trusted_absence(tmp_path):
-    """A large transcript contained a newline-terminated, NUL-bearing invalid line. The
+    """A real 72 MB transcript contains a newline-terminated, NUL-bearing invalid line. The
     permissive tail parser drops it silently, so the caller sees 'nothing new' and concludes
     the injection failed — when in truth the file recorded something unreadable. A complete
     line that will not parse is the definition of untrustworthy."""
@@ -240,7 +240,7 @@ def test_a_hook_refusal_is_returned_with_its_own_reason():
     part that differs between refusals — the constant head is what made a pane-side prefix
     probe collide across different refusals."""
     events = transcript.compact_events([_refusal(
-        "[bash /opt/example/hooks/pre-compact-check.sh]: PreCompact blocked: "
+        "[bash ~/.claude/hooks/pre-compact-issue-check.sh]: PreCompact blocked: "
         "no new carry-forward comment on #42")])
     assert events["refusal"] is not None
     assert "no new carry-forward comment on #42" in events["refusal"]
@@ -270,12 +270,12 @@ def test_only_the_measured_refusal_shape_counts(forgery, label):
     """A queued message that merely MENTIONS a past refusal must not abort a compaction that
     is proceeding normally. Substring matching across record types is exactly the
     pane-scraping false positive this module exists to remove, and round 1 reintroduced it.
-    Every genuine refusal inspected is system/local_command; none is user-shaped."""
+    All 19 genuine refusals in the real corpus are system/local_command; zero are user-shaped."""
     assert transcript.compact_events([forgery])["refusal"] is None, label
 
 
 def test_submitted_but_refused_is_distinguishable_from_submitted_and_done():
-    """A measured submissions/summaries gap in a transcript can be a refusal. Record
+    """The measured 19-submissions / 18-summaries gap in a real transcript IS a refusal. Record
     STRUCTURE separates them — no timing window, no prose matching."""
     submitted = _user("<command-name>/compact</command-name>")
     refused = transcript.compact_events([submitted, _refusal("[bash /x.sh]: nope")])
@@ -286,26 +286,26 @@ def test_submitted_but_refused_is_distinguishable_from_submitted_and_done():
     assert (done["submitted"], done["completed"], bool(done["refusal"])) == (True, True, False)
 
 
-def test_the_system_record_shape_is_recognised():
-    """A representative record with the exact structure Claude Code writes.
+def test_the_real_system_record_shape_is_recognised():
+    """The exact record Claude Code writes, copied from a real session transcript.
 
     A `system` record puts its content at the TOP LEVEL, not under `message` — unlike `user`
     and `assistant`. The first version of this module only looked under `message`, so it
-    returned zero refusals for a transcript containing refusals, and the fixtures
+    returned zero refusals for a transcript containing three real ones, and the fixtures
     (which used the `user` shape) all passed. Caught only by running the classifier over real
     data. That is the same failure mode as #133 and #163: a synthetic model of the input that
     could not contain the production case.
     """
-    record = {
+    real = {
         "type": "system",
         "subtype": "local_command",
         "level": "info",
         "content": "<local-command-stderr>Compaction blocked by PreCompact hook: "
-                   "[bash /opt/example/hooks/pre-compact-check.sh]: PreCompact blocked: "
+                   "[bash ~/.claude/hooks/pre-compact-issue-check.sh]: PreCompact blocked: "
                    "no new carry-forward comment on #42 (example-org/ops) since "
                    "session start on this issue.</local-command-stderr>",
     }
-    events = transcript.compact_events([record])
+    events = transcript.compact_events([real])
     assert events["refusal"] is not None
     assert "no new carry-forward comment on #42" in events["refusal"]
     assert events["completed"] is False
@@ -328,39 +328,39 @@ def test_a_submitted_payload_is_confirmed():
 
 
 def test_confirmation_survives_the_wrapping_the_pane_adds():
-    payload = "please drain topic 55 and act on it"
-    wrapped = _user("please drain topic 55\n  and act on it")
+    payload = "please drain topic 33 and act on it"
+    wrapped = _user("please drain topic 33\n  and act on it")
     assert transcript.payload_landed([wrapped], payload) is True
 
 
 def test_an_unsubmitted_payload_is_not_confirmed():
     """The measured fact this whole design rests on: text sitting in a composer writes NOTHING.
-    In the observed failure a briefing sat unsubmitted and the transcript gained no record until
-    Enter. So absence is meaningful, and it is what the #163 outage lacked: for an extended
-    period nothing could distinguish a correctly withheld Enter from a wrongly withheld one."""
+    Observed 2026-08-19 — a briefing sat unsubmitted for two minutes and the transcript gained
+    no record until the Enter. So absence is meaningful, and it is what the #163 outage lacked:
+    for 18 hours nothing could tell a correctly withheld Enter from a wrongly withheld one."""
     assert transcript.payload_landed([_user("something else entirely")], "our payload") is False
 
 
 def test_only_user_records_confirm_a_submission():
     """An assistant echoing the text back is not evidence that the user record was written."""
     echoed = {"type": "assistant", "message": {"content": [
-        {"type": "text", "text": "You asked me to drain topic 55"}]}}
-    assert transcript.payload_landed([echoed], "drain topic 55") is False
+        {"type": "text", "text": "You asked me to drain topic 33"}]}}
+    assert transcript.payload_landed([echoed], "drain topic 33") is False
 
 
 # ---- path resolution ---------------------------------------------------------
 
 def test_transcript_path_flattens_every_non_alphanumeric():
-    got = transcript.transcript_path("/home/user/claude-telegram-bridge/.worktrees/126-tg", "abc")
-    assert got.endswith("-home-user-claude-telegram-bridge--worktrees-126-tg/abc.jsonl")
+    got = transcript.transcript_path("/home/user/agent-telegram-bridge/.worktrees/126-tg", "abc")
+    assert got.endswith("-home-user-agent-telegram-bridge--worktrees-126-tg/abc.jsonl")
 
 
 # ---- synthetic records are not receipts --------------------------------------
 #
 # The hole Codex found with my own transcript. Claude writes compaction summaries as
 # `type: "user", isCompactSummary: true` — prose ABOUT the session, quoting payloads verbatim.
-# Many sampled summaries satisfy a `/compact` probe and some satisfy the carry-forward prefix;
-# none of them is a submission. One landing after the cursor while the
+# Across the real corpus 94 of 136 summaries satisfy a `/compact` probe and 15 satisfy the
+# carry-forward prefix; none of them is a submission. One landing after the cursor while the
 # real injection was swallowed forges precisely the receipt this module exists to provide.
 
 # Shape copied from a real compaction summary that discusses /compact and the
@@ -389,8 +389,8 @@ def test_a_compaction_summary_is_never_a_receipt(payload):
 def test_every_synthetic_user_shape_is_rejected(flag):
     """All three counted in real data: 135, 135 and 943 occurrences. They are written BY the
     client, so none of them proves anything was submitted."""
-    synthetic = _user("please drain topic 55 and act on it", **{flag: True})
-    assert transcript.payload_landed([synthetic], "drain topic 55") is False
+    synthetic = _user("please drain topic 33 and act on it", **{flag: True})
+    assert transcript.payload_landed([synthetic], "drain topic 33") is False
 
 
 @pytest.mark.parametrize("flag", ["isMeta", "isVisibleInTranscriptOnly"])
@@ -461,9 +461,9 @@ def test_an_unreadable_generation_window_is_unknown_not_an_exception(tmp_path, m
 
 
 def test_an_enormous_gap_is_refused_rather_than_read(tmp_path, monkeypatch):
-    """A transcript can be large. Pulling an unbounded gap into memory to answer a question
-    about one injection is a hazard, and UNKNOWN is already a state every caller must
-    handle."""
+    """A transcript in this corpus reaches 72 MB. Pulling an unbounded gap into memory to
+    answer a question about one injection is a hazard, and UNKNOWN is already a state every
+    caller must handle."""
     monkeypatch.setattr(transcript, "MAX_SINCE_BYTES", 200)
     p = str(tmp_path / "s.jsonl")
     _write(p, [_user("first")])
@@ -566,8 +566,8 @@ def test_the_documented_residual_is_real_and_is_not_pretended_away(tmp_path):
     every sampled interior window is NOT detected.
 
     This is deliberate, not an oversight. Closing it means hashing the full range, which was
-    measured on the order of a second for one large transcript and exceeded the useful poll
-    budget across a fleet. It is out of the threat model because Claude Code appends complete JSONL lines
+    measured at 822 ms for the 85 MB transcript in this corpus (~18 s across the fleet for one
+    poll each). It is out of the threat model because Claude Code appends complete JSONL lines
     and never seeks back to overwrite the middle. If that ever stops being true, this test is
     the one that should start failing on purpose.
     """
@@ -594,8 +594,8 @@ def test_the_documented_residual_is_real_and_is_not_pretended_away(tmp_path):
 
 
 def test_the_sample_is_constant_cost_not_proportional_to_size():
-    """The whole reason the residual exists: hashing a large transcript costs on the order of
-    a second. If the window count grew with size that trade would be lost."""
+    """The whole reason the residual exists: hashing the full range costs 822 ms on the 85 MB
+    transcript in this corpus. If the window count grew with size that trade would be lost."""
     small = transcript._sample_windows(10 * 1024)
     huge = transcript._sample_windows(85 * 1024 * 1024)
     assert len(huge) <= transcript.INTERIOR_SAMPLES + 2

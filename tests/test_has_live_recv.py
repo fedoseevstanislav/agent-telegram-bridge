@@ -49,8 +49,8 @@ def test_a_live_listener_is_found_through_the_shell_wrapper(monkeypatch):
 
 
 def test_a_live_listener_is_found_when_invoked_by_absolute_path(monkeypatch):
-    _pgrep(monkeypatch, BARE.format(tid=4101) + "\n")
-    assert daemon.has_live_recv(4101) is True
+    _pgrep(monkeypatch, BARE.format(tid=6258) + "\n")
+    assert daemon.has_live_recv(6258) is True
 
 
 def test_no_listener_returns_false_not_none(monkeypatch):
@@ -65,9 +65,9 @@ def test_no_listener_returns_false_not_none(monkeypatch):
 @pytest.mark.parametrize("running,asked", [
     (606, 6),        # the case named in the docstring
     (60, 6),
-    (4107, 129),
+    (12999, 129),
     (13130, 1313),
-    (4103, 190),
+    (1902, 190),
 ])
 def test_a_longer_topic_id_is_not_mistaken_for_a_shorter_one(monkeypatch, running, asked):
     # pgrep's own pattern is a substring match, so it hands back the 606 line when asked

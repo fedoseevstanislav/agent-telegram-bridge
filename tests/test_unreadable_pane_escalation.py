@@ -189,7 +189,7 @@ def test_the_lead_the_caller_passes_is_what_reaches_the_topic(monkeypatch):
     monkeypatch.setattr(daemon, "reply",
                         lambda cfg, tid, text: bool(sent.append(text)) or True)
 
-    assert daemon.report_blocked_pane(55, "%1", "a message", lead=daemon.UNREADABLE_LEAD)
+    assert daemon.report_blocked_pane(33, "%1", "a message", lead=daemon.UNREADABLE_LEAD)
     assert daemon.UNREADABLE_LEAD in sent[0]
     assert "waiting on a prompt" not in sent[0]
     assert "a message" in sent[0] and "some terminal" in sent[0]
@@ -205,6 +205,6 @@ def test_the_default_lead_is_still_the_modal_copy(monkeypatch):
     monkeypatch.setattr(daemon, "reply",
                         lambda cfg, tid, text: bool(sent.append(text)) or True)
 
-    assert daemon.report_blocked_pane(55, "%1", "a message")
+    assert daemon.report_blocked_pane(33, "%1", "a message")
     assert daemon.MODAL_LEAD in sent[0]
     assert "waiting on a prompt" in sent[0]

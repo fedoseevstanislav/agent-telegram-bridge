@@ -1,11 +1,11 @@
 [Unit]
-Description=Claude Telegram bridge daemon (getUpdates consumer)
+Description=Agent Telegram bridge daemon (getUpdates consumer)
 After=network-online.target
 # RestartSec=5 outpaces systemd's default 10s start-limit window, so a crash
 # loop would never reach 'failed' (and OnFailure would never fire) without this:
 StartLimitIntervalSec=120
 StartLimitBurst=5
-OnFailure=claude-telegram-bridge-watchdog.service
+OnFailure=agent-telegram-bridge-watchdog.service
 
 [Service]
 # 0077: everything this daemon creates — inboxes, the registry, carry-forward files — is

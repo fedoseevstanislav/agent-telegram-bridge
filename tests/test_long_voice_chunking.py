@@ -2,9 +2,13 @@
 
 whisper-1 has no output cap the way gpt-4o-mini-transcribe does, so the earlier fix (#117) —
 route anything long to whisper-1 — looked sufficient. It is not. On long audio whisper-1
-DEGENERATES: it repeats a phrase and pads the tail with a stock hallucination. In measured long
-recordings, chunking recovered 27% more words in one case and nearly three times as many in
-another; only the chunked output retained the closing sentence.
+DEGENERATES: it repeats a phrase, and pads the tail with a stock hallucination. Measured on two
+real notes:
+
+    588 s   352 words in one request   →  447 in pieces, and only the pieced version contains
+                                          the speaker's actual closing sentence
+    944 s   218 words in one request   →  620 in pieces, nearly three times the content; the
+                                          single-request version was mostly one phrase repeated
 
 Nothing failed, nothing raised, and the daemon logged a successful transcription both times.
 """
@@ -131,10 +135,10 @@ def test_unknown_duration_is_not_chunked_but_still_avoids_the_capped_model(monke
 
 
 @pytest.mark.parametrize("words,duration,marked", [
-    (450, 600, False),      # representative complete result — must NOT be marked
-    (600, 900, False),      # complete slow result above the conservative boundary
-    (200, 900, True),       # representative severe degeneration
+    (447, 588, False),      # measured, complete — must NOT be marked
+    (620, 944, False),      # measured, complete — the 0.7 gate marked this one
+    (218, 944, True),       # measured, lost two thirds of the note
     (10, 600, True),
 ])
-def test_the_incomplete_marker_is_calibrated_against_observed_boundaries(words, duration, marked):
+def test_the_incomplete_marker_is_calibrated_against_measured_notes(words, duration, marked):
     assert transcribe._looks_truncated(" ".join(["w"] * words), duration) is marked

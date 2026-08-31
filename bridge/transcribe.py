@@ -13,27 +13,29 @@ OPENAI_URL = "https://api.openai.com/v1/audio/transcriptions"
 PRIMARY_MODEL = "gpt-4o-mini-transcribe"
 FALLBACK_MODEL = "whisper-1"
 # At/above this, skip gpt-4o-mini-transcribe (which silently truncates near its ~2k output-token
-# cap) and use whisper-1 directly. Set below the observed cap: an eight-minute recording lost
-# roughly its final minute, so five minutes leaves about two minutes of measured margin.
+# cap) and use whisper-1 directly. Set below the observed cap: a real 8-min Russian voice truncated
+# after ~7 min of speech, and Cyrillic tokenizes densely, so 5 min leaves ~2 min of margin.
 LONG_AUDIO_THRESHOLD_S = 300
-# Marker threshold, deliberately below the slowest complete sample that prompted #227. A gate
-# close to natural slow speech marked a correct transcript even though its closing sentence was
-# present.
+# Marker threshold, deliberately below natural slow speech. Measured on the two notes that
+# prompted #227: read in pieces they come out at 0.76 and 0.66 words/sec and are COMPLETE —
+# they end on the speaker's own closing sentence — so a 0.7 gate marked a correct transcript.
 # A false alarm on a good transcript is worse than no alarm, because it teaches the reader to
-# ignore the one that matters. The threshold therefore catches only extreme degeneration.
+# ignore the one that matters. The failures this catches sat at 0.23. Two samples, so the gap
+# between 0.5 and 0.66 is margin rather than measurement.
 #
-# It cannot separate every bad result from every good one — a failed result can still have a
-# higher word rate than a complete slow recording. That is why chunking is the fix and this is
-# only a backstop: no word-rate gate can tell a slow speaker from a lost half of a note.
+# It cannot separate every bad result from every good one — one measured failure sat at 0.60,
+# between the two good ones. That is why chunking is the fix and this is only a backstop for
+# the extreme: no word-rate gate can tell a slow speaker from a lost half of a note.
 MIN_WORDS_PER_SEC = 0.5
 # Above this, transcribe in pieces rather than in one request. whisper-1 has no output cap the
 # way gpt-4o-mini-transcribe does, but it DEGENERATES on long audio: it falls into repeating a
 # phrase, and pads the tail with stock hallucinations ("İzlediğiniz için teşekkür ederim" —
 # "thanks for watching" — is the notorious one), losing most of what was actually said.
 #
-# In measured long recordings (#227), chunking recovered 27% more words in one case and nearly three
-# times as many in another; only the chunked output retained the speaker's closing sentence.
-# Those ratios, rather than the identity or provenance of the recordings, justify the split.
+# Measured on two real notes (#227). A 588 s note: 352 words in one request, 447 in chunks, and
+# only the chunked version contained the speaker's actual closing sentence. A 944 s note: 218
+# words in one request — most of it the same phrase repeated — against 620 in chunks. Nearly
+# three times the content, from splitting the file.
 #
 # 240 s pieces: comfortably inside where the degeneration starts, and few enough requests that a
 # long note still finishes in seconds.

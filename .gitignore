@@ -1,3 +1,5 @@
 __pycache__/
 *.pyc
 .worktrees/
+REVIEW-CLAUDE.md
+SEAT-REPORT.md

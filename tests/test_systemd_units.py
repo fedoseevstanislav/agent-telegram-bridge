@@ -17,13 +17,13 @@ def _service_directives(name):
 
 
 def test_bridge_service_only_kills_daemon_process_on_restart():
-    directives = _service_directives("claude-telegram-bridge.service")
+    directives = _service_directives("agent-telegram-bridge.service")
 
     assert directives.get("KillMode") == "process"
 
 
 def test_model_watchdog_service_runs_standalone_script():
-    directives = _service_directives("claude-telegram-bridge-model-watchdog.service")
+    directives = _service_directives("agent-telegram-bridge-model-watchdog.service")
 
     assert directives.get("Type") == "oneshot"
     assert directives.get("ExecStart") == (
@@ -32,7 +32,7 @@ def test_model_watchdog_service_runs_standalone_script():
 
 
 def test_model_watchdog_timer_runs_every_five_minutes():
-    directives = _service_directives("claude-telegram-bridge-model-watchdog.timer")
+    directives = _service_directives("agent-telegram-bridge-model-watchdog.timer")
 
     assert directives.get("OnBootSec") == "2min"
     assert directives.get("OnUnitActiveSec") == "5min"

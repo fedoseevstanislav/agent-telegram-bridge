@@ -94,15 +94,15 @@ def test_peer_mirror_is_signed_by_the_source_not_the_target(tmp_path, monkeypatc
 def test_automation_notify_keeps_the_notification_contract(tmp_path, monkeypatch):
     mirrored = _notify_env(monkeypatch, tmp_path, pane=None)
 
-    cli.notify_topic(CFG, B, "automation", "review-125-r1", "review seats finished")
+    cli.notify_topic(CFG, B, "orchestra", "review-125-r1", "review seats finished")
 
     record = _record(tmp_path)
-    assert record["from"] == "automation"
+    assert record["from"] == "orchestra"
     assert record["kind"] == "notification"
     assert "sender_topic_id" not in record              # no pane, no derived identity
     # Un-iconed: an icon means "a session is speaking", and this is machinery. It also drops
     # the pre-existing defect of signing automation with the target's icon.
-    assert mirrored == [(B, "automation: review seats finished")]
+    assert mirrored == [(B, "orchestra: review seats finished")]
 
 
 def test_automation_notify_still_requires_a_sender(tmp_path, monkeypatch):
@@ -131,12 +131,12 @@ def test_a_caller_whose_pane_does_not_answer_cannot_sign_as_that_session(
 
     with pytest.raises(SystemExit, match="--sender"):
         cli.notify_topic(CFG, B, None, "111->222:review:1", "please look at #138")
-    cli.notify_topic(CFG, B, "automation", "111->222:review:1", "please look at #138")
+    cli.notify_topic(CFG, B, "orchestra", "111->222:review:1", "please look at #138")
 
     record = _record(tmp_path)
     assert record["kind"] == "notification"
     assert "Alpha" not in record["from"] and "sender_topic_id" not in record
-    assert mirrored == [(B, "automation: please look at #138")]
+    assert mirrored == [(B, "orchestra: please look at #138")]
 
 
 def test_notify_parser_makes_sender_optional():
@@ -144,8 +144,8 @@ def test_notify_parser_makes_sender_optional():
     args = parser.parse_args(["notify", "--topic", "222", "--idempotency-key", "k"])
     assert args.sender is None
     assert parser.parse_args(
-        ["notify", "--topic", "222", "--idempotency-key", "k", "--sender", "automation"]
-    ).sender == "automation"
+        ["notify", "--topic", "222", "--idempotency-key", "k", "--sender", "orchestra"]
+    ).sender == "orchestra"
 
 
 def test_peer_records_render_their_kind_to_the_reading_agent(capsys):
@@ -198,7 +198,7 @@ def test_success_status_is_enqueued_not_delivered(tmp_path, monkeypatch, pane):
     and there is no acknowledgement, so the wire value must not claim delivery."""
     _notify_env(monkeypatch, tmp_path, pane=pane)
 
-    result = cli.notify_topic(CFG, B, "automation", "key-1", "an event")
+    result = cli.notify_topic(CFG, B, "orchestra", "key-1", "an event")
 
     # echo: "posted" from a resolvable caller, "skipped" when there is no sender topic (#140).
     assert result == {"status": "enqueued", "topic_id": B, "wake": "nudged",
@@ -229,7 +229,7 @@ def _fsync_spy(monkeypatch):
 
 
 def _local_record(key):
-    return {"ts": "2026-08-08T11:00:00+0000", "from": "automation", "kind": "notification",
+    return {"ts": "2026-08-08T11:00:00+0000", "from": "orchestra", "kind": "notification",
             "text": "an event", "provenance": "local-notify", "idempotency_key": key}
 
 

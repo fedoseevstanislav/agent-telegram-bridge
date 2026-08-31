@@ -5,7 +5,7 @@ entries. This CLI is the deliberate, operator-driven path for reviving already-`
 reboot victims — it is independent of the boot gate.
 
 Usage:
-    python -m bridge.restore_cli --topics 13,4111,606 [--fresh 55] \
+    python -m bridge.restore_cli --topics 13,212,606 [--fresh 33] \
         [--codex 2136:<session_uuid>]
     python -m bridge.restore_cli --list          # show revivable topics + resolved session_id
 

@@ -1,5 +1,5 @@
 [Unit]
-Description=Daily morning digest
+Description=Daily 06:00 UTC (09:00 UTC+3) morning digest
 
 [Timer]
 OnCalendar=*-*-* 06:00:00

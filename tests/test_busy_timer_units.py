@@ -10,9 +10,8 @@ turns worth not interrupting:
   * auto-carry-forward fires `/compact` into a live turn;
   * the revive path briefs a session that has not settled.
 
-An observed status line read `✢ Fiddle-faddling… (4m 18s · ↓ 1.5k tokens · thought for
-1s)` while `_cf_busy` reported idle. The duration is load-bearing because it crosses the
-one-minute rendering boundary; the pane identity is not.
+Found live on pane %24, whose status line read `✢ Fiddle-faddling… (4m 18s · ↓ 1.5k tokens ·
+thought for 1s)` while `_cf_busy` reported idle.
 
 The fix anchors on the ellipsis and the first unit (`…\\(\\d+[hms]`) rather than enumerating
 formats. Both directions are pinned below, because widening a busy-detector is exactly the
@@ -24,7 +23,7 @@ import pytest
 from bridge import daemon
 
 
-# Representative captures. The live ones are what the pane shows DURING a turn; frozen ones are
+# Real captures. The live ones are what the pane shows DURING a turn; the frozen ones are
 # scrollback residue that must never pin an idle pane to busy (#85 blocker 1).
 LIVE = [
     "✽ Mulling… (10s · ↓ 200 tokens)",
@@ -43,8 +42,8 @@ FROZEN_OR_IDLE = [
     '     2>&1) && { echo "$out"; break; }; done (1m 36s',              # wrapped continuation
     "     · 4 lines)",                                                 # its wrap tail
     "❯ ",
-    "  user • Example model • 4h55m 99% W47% • 11%",                  # status line durations
-    "  standard permissions · ← for agents",
+    "  user • Fable 5 • 4h55m 99% W47% • $32.38 • 11%",               # status line durations
+    "  ⏵⏵ bypass permissions on (shift+tab to cycle) · ← for agents",
     "new task? /clear to save 202.3k tokens",
 ]
 
@@ -64,7 +63,7 @@ def test_frozen_durations_and_chrome_never_read_as_busy(line):
 
 
 def test_the_minutes_case_specifically_is_not_lost_again():
-    # The whole defect in one assertion, using the observed minute-form status string.
+    # The whole defect in one assertion, on the exact string captured from pane %24.
     assert daemon._cf_text_is_busy(
         "  ⎿  Tip: Connect Claude to your IDE · /ide\n"
         "✢ Fiddle-faddling… (4m 18s · ↓ 592 tokens)\n"
@@ -89,7 +88,7 @@ def test_the_wrapped_tool_row_is_why_the_ellipsis_anchor_matters():
     # the pattern re-introduces the false positive silently.
     wrapped = (
         "  ⎿  $ for i in 1 2 3; do\n"
-        '     out=$(~/tools/example-client/bin/read-updates 123456)\n'
+        '     out=$(~/tools/telegram-client/scripts/tg read 100200300)\n'
         '     2>&1) && { echo "$out"; break; }; done (1m 36s\n'
         "     · 4 lines)\n"
         "❯ \n"

@@ -288,28 +288,28 @@ def test_recent_inbox_drop_none_when_absent(tmp_path, monkeypatch):
 # ---- daemon: dead_listener_nudge ---------------------------------------------
 
 def test_dead_listener_nudge_redelivers_last_message():
-    text = daemon.dead_listener_nudge(55, {"from": "Владелец", "text": "please pay the R1 invoice"})
+    text = daemon.dead_listener_nudge(33, {"from": "Владелец", "text": "please pay the R1 invoice"})
     assert "please pay the R1 invoice" in text          # the actual message is re-delivered
     assert "Владелец" in text                          # attributed to the sender
-    assert "topic 55" in text and "recv --topic 55" in text
+    assert "topic 33" in text and "recv --topic 33" in text
     assert "act on it now" in text
 
 
 def test_dead_listener_nudge_no_recap_without_record():
-    text = daemon.dead_listener_nudge(55, None)
+    text = daemon.dead_listener_nudge(33, None)
     assert "dropped a message" not in text              # no phantom recap
     assert "Drain with" in text                         # but still the re-arm instruction
 
 
 def test_dead_listener_nudge_no_recap_on_empty_text():
-    text = daemon.dead_listener_nudge(55, {"from": "A", "text": ""})
+    text = daemon.dead_listener_nudge(33, {"from": "A", "text": ""})
     assert "dropped a message" not in text
 
 
 def test_dead_listener_nudge_flags_truncation_of_long_message():
     # SHOULD-FIX (Codex #105 review): a >400-char message must be flagged as truncated, never
     # presented as if complete (its tail may be unrecoverable once the cursor has advanced).
-    text = daemon.dead_listener_nudge(55, {"from": "A", "text": "x" * 1000})
+    text = daemon.dead_listener_nudge(33, {"from": "A", "text": "x" * 1000})
     assert "x" * 400 in text
     assert "x" * 401 not in text                         # snippet capped at 400 chars
     assert "truncated" in text                           # and the cap is disclosed
@@ -317,7 +317,7 @@ def test_dead_listener_nudge_flags_truncation_of_long_message():
 
 def test_dead_listener_nudge_flattens_newlines():
     # the nudge is sent as a single tmux send-keys line; embedded newlines would break it
-    text = daemon.dead_listener_nudge(55, {"from": "A", "text": "line1\nline2"})
+    text = daemon.dead_listener_nudge(33, {"from": "A", "text": "line1\nline2"})
     assert "line1 line2" in text
     assert "line1\nline2" not in text
 
@@ -328,9 +328,9 @@ def test_sweep_nudge_text_dead_includes_fresh_message(tmp_path, monkeypatch):
     # Pins the real call site: idle_sweep_loop uses sweep_nudge_text(tid, flavor, now). A
     # fresh drop on the dead-listener flavor -> the message text is re-delivered.
     _patch_daemon_state(tmp_path, monkeypatch)
-    inbox = _write_inbox(tmp_path, 55, [json.dumps({"from": "S", "text": "just-dropped"}) + "\n"])
+    inbox = _write_inbox(tmp_path, 33, [json.dumps({"from": "S", "text": "just-dropped"}) + "\n"])
     os.utime(inbox, (1000, 1000))
-    text = daemon.sweep_nudge_text(55, "dead", now=1005)
+    text = daemon.sweep_nudge_text(33, "dead", now=1005)
     assert "just-dropped" in text
     assert "isn't running" in text                         # the dead-listener nudge, not "unread"
 
@@ -338,9 +338,9 @@ def test_sweep_nudge_text_dead_includes_fresh_message(tmp_path, monkeypatch):
 def test_sweep_nudge_text_dead_skips_stale_message(tmp_path, monkeypatch):
     # Same flavor, stale last message -> plain re-arm nudge, no recap.
     _patch_daemon_state(tmp_path, monkeypatch)
-    inbox = _write_inbox(tmp_path, 55, [json.dumps({"from": "S", "text": "handled-hours-ago"}) + "\n"])
+    inbox = _write_inbox(tmp_path, 33, [json.dumps({"from": "S", "text": "handled-hours-ago"}) + "\n"])
     os.utime(inbox, (1000, 1000))
-    text = daemon.sweep_nudge_text(55, "dead", now=9999)
+    text = daemon.sweep_nudge_text(33, "dead", now=9999)
     assert "handled-hours-ago" not in text
     assert "Drain with" in text
 

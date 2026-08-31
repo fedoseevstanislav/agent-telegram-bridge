@@ -1,9 +1,10 @@
 """#254: one swallowed nudge is not news; a pane that keeps swallowing is.
 
 `report_blocked_pane` used to fire on the FIRST swallowed injection. #250's logging then
-measured what a swallow usually is — the pane rendered the text only after the first decision,
-and the next sweep tick delivered it. So the owner was told the session was unreachable while
-the message was in fact about to arrive.
+measured what a swallow usually is — the pane rendered the text 0.9s to 2.1s after the 0.3s
+decision, and the next sweep tick delivered it a minute later. So the owner was told his
+session was unreachable while the message was in fact about to arrive, three times in one
+afternoon: "I don't care whether it's recovered or not, it's got the same message."
 
 The `failed` route already waited for `UNREADABLE_ESCALATE_AFTER` consecutive failures before
 escalating. These tests pin the same shape for `swallowed`, using the streak `type_line`
@@ -15,8 +16,8 @@ import pytest
 from bridge import daemon
 
 
-PANE = "%21"
-TOPIC = 4112
+PANE = "%290"
+TOPIC = 5935
 
 
 @pytest.fixture(autouse=True)

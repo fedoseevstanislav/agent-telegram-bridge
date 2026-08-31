@@ -15,7 +15,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from bridge.common import api, load_config, now_iso, secure_process_umask, state_path
 
-SERVICE = "claude-telegram-bridge.service"
+SERVICE = "agent-telegram-bridge.service"
 STATUS_EXCERPT_CHARS = 800
 
 

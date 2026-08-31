@@ -105,15 +105,15 @@ you sent the message before adding it. Send another message and retry.
 ## 4. Write the config
 
 ```bash
-mkdir -p ~/.config/claude-telegram-bridge
-cat > ~/.config/claude-telegram-bridge/config.json <<'EOF'
+mkdir -p ~/.config/agent-telegram-bridge
+cat > ~/.config/agent-telegram-bridge/config.json <<'EOF'
 {
   "bot_token": "123456789:AAE...",
   "chat_id": -1001234567890,
   "owner_id": 987654321
 }
 EOF
-chmod 600 ~/.config/claude-telegram-bridge/config.json
+chmod 600 ~/.config/agent-telegram-bridge/config.json
 ```
 
 `chat_id` and `owner_id` are **numbers, not strings** — no quotes. `owner_id` is a numeric user
@@ -152,6 +152,21 @@ reinstall.
 
 If `~/.local/bin` is not on your `PATH`, the installer says so. Add it and open a new shell.
 
+### Upgrading an old-name installation
+
+If your config or state is under `~/.config/claude-telegram-bridge` or
+`~/.local/share/claude-telegram-bridge`, use the new checkout's installer once:
+
+```bash
+./scripts/install.sh --force
+```
+
+It validates the whole move first, stops the old daemon and timers, moves config, state, units,
+and drop-ins to their `agent-telegram-bridge` names on the same filesystem, rewrites exact old
+paths inside the migrated unit overrides, then starts the new daemon and timers. It never runs
+the old and new daemon together. If an old and new path both exist, it stops before touching
+either and names the conflict; decide which tree is authoritative instead of merging them.
+
 ---
 
 ## 6. Prove it works
@@ -182,8 +197,8 @@ If both directions worked, you are done. Delete the test topic in Telegram whene
 Almost always the bot is not an administrator with Manage Topics. Confirm:
 
 ```bash
-TOKEN=$(python3 -c 'import json;print(json.load(open("'"$HOME"'/.config/claude-telegram-bridge/config.json"))["bot_token"])')
-CHAT=$(python3 -c 'import json;print(json.load(open("'"$HOME"'/.config/claude-telegram-bridge/config.json"))["chat_id"])')
+TOKEN=$(python3 -c 'import json;print(json.load(open("'"$HOME"'/.config/agent-telegram-bridge/config.json"))["bot_token"])')
+CHAT=$(python3 -c 'import json;print(json.load(open("'"$HOME"'/.config/agent-telegram-bridge/config.json"))["chat_id"])')
 BOT=$(curl -s "https://api.telegram.org/bot$TOKEN/getMe" | python3 -c 'import json,sys;print(json.load(sys.stdin)["result"]["id"])')
 curl -s "https://api.telegram.org/bot$TOKEN/getChatMember?chat_id=$CHAT&user_id=$BOT" | python3 -m json.tool
 ```
@@ -193,8 +208,8 @@ Want `"status": "administrator"` and `"can_manage_topics": true`.
 **The daemon will not stay running.**
 
 ```bash
-systemctl --user status claude-telegram-bridge.service
-journalctl --user -u claude-telegram-bridge.service -n 50
+systemctl --user status agent-telegram-bridge.service
+journalctl --user -u agent-telegram-bridge.service -n 50
 ```
 
 `config missing 'chat_id'` and friends mean step 4. A `409 Conflict` from Telegram means
@@ -212,7 +227,7 @@ and again on recovery, talking to the Bot API directly — the daemon cannot be 
 its own death. If that alert never arrives, the watchdog timer is not enabled:
 
 ```bash
-systemctl --user list-timers 'claude-telegram-bridge*'
+systemctl --user list-timers 'agent-telegram-bridge*'
 ```
 
 **Voice messages arrive as `[voice message — transcription failed: …]`.**
@@ -225,17 +240,17 @@ audio is not turned into text.
 ## Uninstall
 
 ```bash
-systemctl --user disable --now claude-telegram-bridge.service
-systemctl --user disable --now claude-telegram-bridge-watchdog.timer
-systemctl --user disable --now claude-telegram-bridge-digest.timer
-systemctl --user disable --now claude-telegram-bridge-model-watchdog.timer
-rm -f ~/.config/systemd/user/claude-telegram-bridge*
+systemctl --user disable --now agent-telegram-bridge.service
+systemctl --user disable --now agent-telegram-bridge-watchdog.timer
+systemctl --user disable --now agent-telegram-bridge-digest.timer
+systemctl --user disable --now agent-telegram-bridge-model-watchdog.timer
+rm -f ~/.config/systemd/user/agent-telegram-bridge*
 systemctl --user daemon-reload
 rm -f ~/.local/bin/tg-bridge ~/.claude/skills/tg-channel
 ```
 
-That leaves two things deliberately: `~/.config/claude-telegram-bridge/` (your token) and
-`~/.local/share/claude-telegram-bridge/` (every message ever sent or received, in plaintext).
+That leaves two things deliberately: `~/.config/agent-telegram-bridge/` (your token) and
+`~/.local/share/agent-telegram-bridge/` (every message ever sent or received, in plaintext).
 Remove them when you actually mean to.
 
 Delete the bot in BotFather with `/deletebot` if you are finished with it — otherwise the token

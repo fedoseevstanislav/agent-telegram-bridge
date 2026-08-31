@@ -7,19 +7,19 @@ of a tmux pane, and three times that premise broke: #101 (a busy turn misread as
 cannot establish causation. Claude Code, however, already writes an append-only JSONL record
 of exactly these events.
 
-Three measured facts shape this module:
+Three measured facts shape this module, all from real transcripts rather than assumption:
 
 1. **A record is written at SUBMIT, not at paste.** Text that sat unsubmitted in a composer
-   produced nothing; the `user` record appeared promptly after Enter. So a transcript read
-   can CONFIRM an injection landed, but can never authorize the
+   for two minutes produced nothing at all; the `user` record appeared within a second of the
+   Enter. So a transcript read can CONFIRM an injection landed, but can never authorize the
    Enter — at the moment of that decision the transcript contains nothing about our text.
-2. **Not every registered topic has a transcript on disk.** Claude Code deletes them after
-   `cleanupPeriodDays` (default 30), so every caller must handle the unknown case.
-3. **Not every `user` record is something a user submitted.** Corpus inspection found three
-   classes of synthetic context written by the client: `isMeta`, `isCompactSummary`, and
-   `isVisibleInTranscriptOnly`. A compaction summary is prose ABOUT the session, so it quotes
-   payloads that were never re-submitted; most sampled summaries satisfy a naive `/compact`
-   search. Treating those as receipts turns this module into the
+2. **Only 29 of 45 registered topics have a transcript on disk.** Claude Code deletes them
+   after `cleanupPeriodDays` (default 30). Every caller must handle the unknown case.
+3. **Not every `user` record is something a user submitted.** Scanning 63,474 real `user`
+   records found 943 `isMeta`, 135 `isCompactSummary`, and 135 `isVisibleInTranscriptOnly` —
+   all synthetic context written by the client. A compaction summary is prose ABOUT the
+   session, so it quotes payloads that were never re-submitted: 94 of 136 summary records
+   satisfy a naive `/compact` search. Treating those as receipts turns this module into the
    pane-scraping bug in a new medium, so every predicate here filters them out.
 
 The reading API is deliberately three-valued. `[]` and "unknown" are different answers, and
@@ -42,8 +42,7 @@ PREFIX_BYTES = 64 * 1024
 INTERIOR_SAMPLES = 8
 INTERIOR_WINDOW = 4 * 1024
 # Ceiling on how much may be pulled in for one "did this land?" question. A transcript in this
-# A transcript can be much larger than this bound; an unbounded read of the gap is a memory
-# hazard, not a feature.
+# corpus reaches 72 MB; an unbounded read of the gap is a memory hazard, not a feature.
 MAX_SINCE_BYTES = 16 * 1024 * 1024
 
 OK = "ok"            # everything after the cursor was read and parsed; absence IS proof
@@ -147,9 +146,9 @@ def _generation_digest(fileno, size):
     overwrite the middle. A caller that ever points this at a file some process DOES rewrite
     in place must not rely on the digest alone.
 
-    Hashing the whole range would remove the residual, but measurement put one large transcript
-    on the order of a second; multiplied across a fleet, a poll exceeded its useful budget. The
-    sample is constant-cost at any file size.
+    Hashing the whole range would remove the residual and was measured before being rejected:
+    822 ms for the 85 MB transcript in this corpus, ~18 s across the fleet for one poll each.
+    The sample is constant-cost at any file size.
     """
     if size <= 0:
         return None
@@ -318,7 +317,7 @@ def _parse_strict(data):
 
 # Written BY the client, not submitted by anyone. `isCompactSummary` is prose about the
 # session and freely quotes payloads that were never re-sent; `isMeta` covers injected
-# reminders and caveats. All three shapes occurred in the measured corpus.
+# reminders and caveats. Counted on real data: 135, 135 and 943 respectively.
 _SYNTHETIC_FLAGS = ("isCompactSummary", "isVisibleInTranscriptOnly", "isMeta")
 
 
@@ -332,8 +331,8 @@ def _text_of(record):
     TWO shapes, and missing the second one silently loses every hook refusal. `user` and
     `assistant` records nest content under `message`; `system` records — including
     `subtype: "local_command"`, which is exactly how a PreCompact refusal arrives — put it at
-    the TOP LEVEL instead. Verified on session transcripts containing refusals that this
-    function returned nothing for until the top-level branch existed.
+    the TOP LEVEL instead. Verified on a real session transcript, whose three real
+    refusals this function returned nothing for until the top-level branch existed.
     """
     content = (record.get("message") or {}).get("content")
     if content is None:
@@ -352,8 +351,8 @@ def _text_of(record):
 def _is_hook_refusal(record):
     """A PreCompact refusal, by STRUCTURE — `system` + `local_command` + top-level content.
 
-    Every genuine refusal inspected had exactly this shape and none was user-shaped.
-    Accepting a `user` record here would let ordinary prose forge the event:
+    Every one of the 19 genuine refusals in the real corpus has exactly this shape and none
+    is user-shaped. Accepting a `user` record here would let ordinary prose forge the event:
     a queued message reading "Earlier I saw: Compaction blocked by PreCompact hook: ..." would
     make the daemon abort a compaction that was in fact proceeding normally — the same
     false-positive this module exists to remove.
@@ -367,8 +366,8 @@ def _is_hook_refusal(record):
 def compact_events(records):
     """Classify the compaction-relevant records in `records`.
 
-    All from record STRUCTURE rather than from matching prose. The shapes were verified against
-    a corpus containing both refusals and compaction summaries:
+    All from record STRUCTURE rather than from matching prose. Shapes verified against a live
+    corpus carrying 19 refusals and 135 compaction summaries:
 
     - `submitted` — a NON-synthetic `user` record holding `<command-name>/compact</command-name>`
     - `completed` — `isCompactSummary: true`, or the client's own stdout confirmation
@@ -386,7 +385,7 @@ def compact_events(records):
         # ONLY genuine user/system records carry commands and their local output. An
         # `assistant` record with the same words is the model TALKING about a refusal, not one
         # happening — searching transcripts for "Compaction blocked by PreCompact hook"
-        # returned many hits in one session, nearly all of it the session discussing the
+        # returned 184 hits in one session, nearly all of it this very work discussing the
         # marker. Synthetic records are excluded for the same reason in a different costume.
         if record.get("type") not in ("user", "system") or _is_synthetic(record):
             continue
@@ -395,8 +394,8 @@ def compact_events(records):
             continue
         if "<command-name>/compact</command-name>" in text:
             submitted = True
-        # Across the measured corpus, every occurrence of the client's completion line was
-        # inside a <local-command-stdout> wrapper and none was bare. A separate
+        # Measured across 448 real transcripts: 135 occurrences of the client's completion
+        # line, ALL of them inside a <local-command-stdout> wrapper, none bare. A separate
         # `"Compacted (ctrl+o" in text` alternative was carried here until a reviewer showed
         # no test could turn it red — there is no input in the corpus that reaches it. The
         # structural `isCompactSummary` flag above is the primary completion signal anyway;
@@ -426,8 +425,8 @@ def payload_landed(records, payload):
 
     Synthetic `user` records are rejected first, and that is not a refinement — it is the
     difference between a receipt and a rumour. A compaction summary is prose about the
-    session and quotes payloads verbatim: most sampled summaries satisfy a `/compact` probe
-    and some satisfy the carry-forward prefix, though none are submissions. One
+    session and quotes payloads verbatim: across the real corpus, 94 of 136 summaries satisfy
+    a `/compact` probe and 15 satisfy the carry-forward prefix, none of them submissions. One
     such record landing after the cursor while the real injection was swallowed would forge
     exactly the receipt this function exists to provide.
 

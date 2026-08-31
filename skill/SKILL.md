@@ -7,7 +7,7 @@ description: Use when the user asks a session to talk to them via Telegram, repo
 
 ## Overview
 
-`tg-bridge` gives this session a private Telegram thread to the owner — a forum topic in the supergroup named by `~/.config/claude-telegram-bridge/config.json`, opened by the bot whose token is in that same file. A systemd daemon receives their replies — including voice messages, which arrive already transcribed to text — into a per-topic inbox the CLI reads.
+`tg-bridge` gives this session a private Telegram thread to the owner — a forum topic in the supergroup named by `~/.config/agent-telegram-bridge/config.json`, opened by the bot whose token is in that same file. A systemd daemon receives their replies — including voice messages, which arrive already transcribed to text — into a per-topic inbox the CLI reads.
 
 ## Setup (once per session)
 

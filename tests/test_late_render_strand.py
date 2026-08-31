@@ -2,10 +2,10 @@
 
 `type_line` types the wake line and presses Enter only on a strict rise in its probe between
 a capture taken before the keystrokes and one taken `settle` after (#133 — Enter on a modal
-accepts the highlighted option). One sample decides, so a busy pane that repaints later reads
-exactly like a modal, permanently: the first observation logged `literal=0->0`, a later look
-found the line plainly in its input box, and the topic was repeatedly told its session was
-unreachable.
+accepts the highlighted option). One 0.3s sample decides, so a pane that repaints later reads
+exactly like a modal, permanently: on 2026-08-30 pane %290 logged `literal=0->0` while nine
+minutes into a shell command, with the line plainly in its box afterwards, and the topic was
+told every thirty minutes that its session was unreachable.
 
 Acting on a later look was written twice and refused twice, for the same reason both times.
 The evidence is a COUNT of the text anywhere in the capture, standing in for "our text is in
@@ -29,8 +29,8 @@ CLAUDE_IDLE = """\
 ────────────────────────────────────────────────────────────────────────────
 ❯ {INPUT}
 ────────────────────────────────────────────────────────────────────────────
-  example-repo (main) • Example model • 40%
-  standard permissions · 1 shell"""
+  example-repo (main) • Opus 5 (1M context) • 37m 91% W78% • $12.34 • 70%
+  ⏵⏵ bypass permissions on · 1 shell"""
 
 # A picker has no input box at all: printable keys are swallowed, Enter takes the highlight.
 CODEX_RATE_LIMIT_MODAL = """\
@@ -40,8 +40,8 @@ CODEX_RATE_LIMIT_MODAL = """\
 › 1. Switch to gpt-5.6-luna
   2. Keep current model"""
 
-NUDGE = "[tg-bridge] New Telegram message in your topic — run `tg-bridge recv --topic 55` and act on it."
-PANE = "%21"
+NUDGE = "[tg-bridge] New Telegram message in your topic — run `tg-bridge recv --topic 33` and act on it."
+PANE = "%290"
 
 
 def _screen(text=""):

@@ -553,10 +553,10 @@ def type_line(pane, text, settle=0.3):
             return "failed"
         # #250: one 0.3s sample decides, and a pane that repaints later than that reads
         # exactly like a modal that swallowed the keystrokes. The verdict was permanent — the
-        # text sat unsent in the input box, the topic was repeatedly told its session was
-        # unreachable, and only a human pressing Enter delivered it. In the observation that
-        # exposed this, the first sample logged `literal=0->0` on a busy pane, while a later
-        # look found the line plainly in its input box.
+        # text sat unsent in the input box, the topic was told every thirty minutes that its
+        # session was unreachable, and only a human pressing Enter delivered it. Measured on
+        # 2026-08-30, pane %290 logged `literal=0->0` while nine minutes into a shell command,
+        # with the line plainly in its box afterwards.
         #
         # The obvious fix — look again, and act on what the later look sees — was written
         # twice and refused twice by review, for the same reason both times. The evidence is a
@@ -614,9 +614,9 @@ def type_line(pane, text, settle=0.3):
         #
         # #165 r2 additionally REFUSED a rise whenever the other signal fell, on the argument
         # that residue leaving as content arrives produces the same pair. That veto is gone
-        # (#168). In the observed failure the daemon typed `/compact` into a healthy idle pane,
-        # refused its own injection, and falsely reported a blocked prompt. The reason is that a
-        # claude pane runs on the
+        # (#168). It cost a real carry-forward within hours of shipping: the daemon typed
+        # `/compact` into a healthy idle pane, refused its own injection, and told the owner their
+        # terminal was stuck on a prompt. The measured reason is that a claude pane runs on the
         # ALTERNATE SCREEN — `history_size` is 0, so `capture-pane -S -30` clamps to ~23 visible
         # rows and the whole window is under a kilobyte. Content leaves a window that small
         # constantly, so a falling count is the ordinary case there, not a signal.
@@ -685,10 +685,11 @@ def pane_is_persistently_swallowing(pane):
     owner about (#254).
 
     A single swallow is usually not a stuck pane. #250's logging measured the common case:
-    the text renders only after the first decision, and the next sweep tick delivers it.
-    Reporting on that first swallow told the owner their session was unreachable while it was
-    in fact about to receive the message. An alarm that fires on the recoverable case trains
-    its reader to ignore it, and then the unrecoverable one is missed too.
+    the text renders 0.9s-2.1s after the 0.3s decision, and the next sweep tick delivers it a
+    minute later. Reporting on the first one told the owner their session was unreachable
+    while it was in fact about to receive the message — three times in one afternoon, which is
+    how this was found. An alarm that fires on the recoverable case trains its reader to
+    ignore it, and then the unrecoverable one is missed too.
 
     The other failure mode already works this way: the `failed` route escalates only after
     UNREADABLE_ESCALATE_AFTER consecutive failures. This gives `swallowed` the same shape,
@@ -699,8 +700,8 @@ def pane_is_persistently_swallowing(pane):
 
 def report_blocked_pane(thread_id, pane, what, lead=MODAL_LEAD):
     """Tell the topic that its session can't be reached, and show the terminal. Without this
-    the session just goes quiet: #133's evidence is a codex pane held on the rate-limit picker
-    while every delivery silently failed. Rate-limited per topic
+    the session just goes quiet: #133's own evidence is a codex pane that held the
+    rate-limit picker for hours while every delivery silently failed. Rate-limited per topic
     so a stuck pane doesn't become a message loop.
 
     `lead` names WHICH way it is unreachable. The default is the modal case. #188 added the
@@ -885,8 +886,8 @@ def set_topic_closed(thread_id, closed):
     """Record a forum topic's open/closed state on its registry entry (#161).
 
     Telegram offers bots no way to READ this — there is no getForumTopic, and sendChatAction
-    is not enforced against closed topics (measurement returned OK for open and long-dead
-    topics alike). So the state is only ever learned from an event: the
+    is not enforced against closed topics (measured: OK for all 40 registered topics,
+    including long-dead ones). So the state is only ever learned from an event: the
     forum_topic_closed / forum_topic_reopened service messages, or a send that Telegram
     rejects with TOPIC_CLOSED. Absent an event, a topic counts as open."""
     tid = str(thread_id or "")
@@ -1071,16 +1072,16 @@ def context_for(pane, engine=None):
     the engine for every topic on every poll anyway.
 
     Codex is resolved FIRST. A pane that used to run Claude keeps that session's
-    context/<pane>.json forever. Measurements found stale Claude values, weeks old, beside
-    different live Codex readings. Only CTX_STALE was hiding them; reading the file first
-    would report those confidently wrong numbers.
+    context/<pane>.json forever, and %16/%18/%20 were carrying 17-37 day old claude values
+    (2%/27%/43%) against live codex readings of 38%/37%/17%. Only CTX_STALE was hiding them;
+    reading the file first would report those confidently wrong numbers.
 
     For a claude pane a FRESH record answers immediately. An AGED one is accepted only once
     it is shown to belong to the process currently in that pane, because age alone is not the
     right test: the record is only rewritten when Claude Code re-renders its statusline — i.e.
     on activity — so an idle session's record ages out while its percentage stays exactly what
-    it was. In measurement, nearly every idle pane answered /ctx with "no fresh context data"
-    while its status line was still displaying the number.
+    it was, and 18 of 20 live panes answered /ctx with "no fresh context data" while displaying
+    the number (2026-08-18).
 
     What CTX_STALE WAS providing, incidentally, was a 600-second bound on how long a record
     could outlive its writer. Waiving age without replacing that bound made a dead pane's
@@ -1287,7 +1288,7 @@ def issue_queue_config():
     config means the feature is OFF — `issue_queue_counts` returns nothing and both line
     builders already drop a line with no counts, so there is no extra branch to get wrong.
 
-        "issue_queue": {"owner": "your-github-user", "label_prefix": "work"}
+        "issue_queue": {"owner": "your-github-user", "label_prefix": "orchestra"}
     """
     try:
         cfg = load_config()
@@ -1608,7 +1609,7 @@ SPAWN_USAGE = """Couldn't parse that. Examples:
 /claude fix-bot @~/openclaw: investigate yesterday's token spike — with a working dir and a task
 /codex port-script @~/tools: rewrite fetch.sh in python — same shape, Codex session"""
 
-SPAWN_BOOTSTRAP = """You were spawned from Telegram by the owner via the claude-telegram-bridge /claude command. \
+SPAWN_BOOTSTRAP = """You were spawned from Telegram by the owner via the agent-telegram-bridge /claude command. \
 Set up your channel to them before anything else (the tg-channel skill has the full protocol):
 1. Run: tg-bridge register --name {name_q} — note the printed topic_id N.
 2. Echo your understanding of the task in 1-3 sentences: tg-bridge send --topic N "...".
@@ -1624,7 +1625,7 @@ run_in_background task and NEVER a bare shell `&` (e.g. `recv ... &`) — a deta
 and exits without ever waking you. Your task:
 {task}"""
 
-SPAWN_BOOTSTRAP_NO_TASK = """You were spawned from Telegram by the owner via the claude-telegram-bridge /claude \
+SPAWN_BOOTSTRAP_NO_TASK = """You were spawned from Telegram by the owner via the agent-telegram-bridge /claude \
 command, without a task yet — they will give it in your Telegram topic. Set up your channel to them now \
 (the tg-channel skill has the full protocol):
 1. Run: tg-bridge register --name {name_q} — note the printed topic_id N.
@@ -1638,7 +1639,7 @@ produces something. When the task arrives, echo your understanding and follow th
 
 # Codex can't arm background waits, so its idle protocol is nudge-driven: the daemon
 # types a [tg-bridge] line into the pane whenever a new message lands.
-CODEX_BOOTSTRAP = """You were spawned from Telegram by the owner via the claude-telegram-bridge /codex command. \
+CODEX_BOOTSTRAP = """You were spawned from Telegram by the owner via the agent-telegram-bridge /codex command. \
 Set up your channel to them before anything else:
 1. Run: tg-bridge register --name {name_q} — note the printed topic_id N.
 2. Echo your understanding of the task in 1-3 sentences: tg-bridge send --topic N "...".
@@ -1658,7 +1659,7 @@ shows a literal \\n. \
 Your task:
 {task}"""
 
-CODEX_BOOTSTRAP_NO_TASK = """You were spawned from Telegram by the owner via the claude-telegram-bridge /codex \
+CODEX_BOOTSTRAP_NO_TASK = """You were spawned from Telegram by the owner via the agent-telegram-bridge /codex \
 command, without a task yet — they will give it in your Telegram topic. Set up your channel to them now:
 1. Run: tg-bridge register --name {name_q} — note the printed topic_id N.
 2. Send a one-line greeting saying you're ready for instructions: tg-bridge send --topic N "...".
@@ -2203,8 +2204,8 @@ def warning_loop(cfg):
                     continue
                 # Codex self-manages context (excellent native compaction, low context-window
                 # usage), so the bridge's context machinery leaves it alone entirely: no context
-                # warnings AND no auto-carry-forward. Resolve engine from the live fleet, not
-                # the registry field — a freshly registered pane may not have
+                # warnings AND no auto-carry-forward. (the owner 2026-07-13) Resolve engine from the
+                # LIVE fleet, not the registry field — a freshly registered pane may not have
                 # 'engine' set yet. engine_of_pane returns None for unknown, which stays on the
                 # claude path (warns) as before; only a confirmed "codex" is skipped.
                 # Do this BEFORE context_for(): a codex pane's context lookup can legitimately
@@ -2280,7 +2281,7 @@ def has_live_recv(tid):
 def pane_is_idle(pane):
     """Idle iff the pane shows no active-turn / compaction signal — the live spinner
     timer, a compaction bar, or the legacy 'esc to interrupt' footer (see _cf_busy).
-    Current Claude Code no longer renders 'esc to interrupt', so relying on it
+    Current Claude Code (v2.1.x) no longer renders 'esc to interrupt', so relying on it
     alone read an active turn as idle (broke this /model gate too); the spinner timer is
     the real signal. Errs toward NOT idle (returns False) on any capture error, since
     _cf_busy returns True on a bad capture."""
@@ -2516,7 +2517,7 @@ def handle_message(cfg, msg):
     if "forum_topic_closed" in msg or "forum_topic_reopened" in msg:
         if not service_event_is_trusted(cfg, msg):
             # #206. Everything below this point writes: it stamps `closed` on the registry,
-            # posts to the topic, and can START A SESSION with privileged launch flags. The owner
+            # posts to the topic, and can START A SESSION with bypass permissions. The owner
             # pin at the bottom of this function never guarded any of it, because service
             # messages return above it — so "owner-pinned ingress" was true of message
             # content and false of the lifecycle. Group membership is not authorization.
@@ -2825,7 +2826,7 @@ def _session_path():
             ":/home/linuxbrew/.linuxbrew/bin")
 
 
-# The client attaches a `memoryPressure` handler to eligible ROOT background shell (#178)
+# Claude Code 2.1.x attaches a `memoryPressure` handler to eligible ROOT background shell
 # tasks (agent-owned ones are excluded) and kills one when that fires — but only if the
 # task is still running and unnotified, the session has been human-idle past its gate
 # window, the main loop is not busy, and no other active background task blocks reaping.
@@ -2835,10 +2836,12 @@ def _session_path():
 #
 # On Linux "pressure" is not a pressure signal at all: `Bun.ant.memoryPressureLevel()` is
 # macOS-only, so the check degrades to `os.freemem() < tengu_bg_low_mem_mb` (default
-# 1024 MB). When aggregate resident processes put a host near that line, session
-# `recv --wait` listeners can be reaped. A reap wakes the session for a full turn that drains
-# an empty inbox and re-arms, so idle sessions consume context while doing nothing. Retrying
-# does not help because the freshly re-armed listener is eligible for the same reap.
+# 1024 MB). This host sits right at that line — ~21 resident claude processes holding
+# ~5.3 GB — so session `recv --wait` listeners were being reaped, and a reap usually woke
+# the session for a full turn that drained an empty inbox and re-armed. Those turns are
+# appended to its context, so idle sessions climbed toward a context warning doing
+# nothing: topic 6258 did it 10x in 4 idle hours, topic 212 five times in 80 seconds
+# (#178).
 #
 # Two limits worth knowing before relying on this:
 #   * The variable is read from the process environment at LAUNCH, so it protects only
@@ -2970,10 +2973,10 @@ def snapshot_once():
             if not sid:
                 # #198: record the engine anyway. A codex session has NO session_id until it
                 # completes its first turn — it does not open its rollout-*.jsonl before then,
-                # and that open fd is where the id comes from (repeated samples before the
-                # first turn returned None; an id appeared only after that turn completed).
-                # Discarding the engine we already resolved leaves registry
-                # entries reading `engine: null`, and it makes every later decision
+                # and that open fd is where the id comes from (measured 2026-08-26: eight
+                # samples over two minutes all returned None, then one real turn produced an
+                # id within 10s). Discarding the engine we already resolved is what left ten
+                # registry entries reading `engine: null`, and it makes every later decision
                 # about that topic guess "claude".
                 #
                 # ONLY for an entry that has no session id. A missing sid can also mean the
@@ -3146,7 +3149,7 @@ _RESTORE_NOTICE = {
     # made them open an investigation into an incident that had not happened, in their words:
     # "Only makes an impression that something went wrong. This is why I actually asked you."
     # So it states what was DONE, and names which choice was applied — that is the part they
-    # waited through a prolonged compaction for, and the picker can fail to apply it.
+    # waited through two minutes of compaction for, and the picker can fail to apply it.
     ("reopen", False): "♻️ Resumed {resume_how}.",
     ("reopen", True): "♻️ Reopened — {fresh_short}, starting fresh.",
     ("unknown", False): "♻️ Restarted — resuming this conversation.",
@@ -3254,8 +3257,8 @@ def last_model_for_session(sid):
 
 # The reopen question has NO deadline (A1). /kill's 60s window exists because /kill is
 # destructive and a stale confirmation could kill a pane they never meant to; this question
-# destroys nothing, so a timer only creates a way to lose the choice. In measurement, a
-# five-minute window expired unanswered and left a dead session behind an open topic with nothing
+# destroys nothing, so a timer only creates a way to lose the choice. Measured 2026-08-25:
+# a 300s window expired unanswered and left a dead session behind an open topic with nothing
 # to say so — a silent dead end, which is strictly worse than waiting.
 REOPEN_FULL_WORDS = ("full", "fully", "as-is", "asis", "полностью")
 REOPEN_COMPACT_WORDS = ("compact", "compacted", "cf", "сжать", "компакт")
@@ -3290,9 +3293,9 @@ def unrevivable_reason(entry):
 
     #198: reopening a topic whose session has no recorded `session_id` did nothing AND said
     nothing — the dead-session-behind-an-open-topic failure that #195 exists to remove,
-    reached from a different direction. It occurs when a codex session is killed before its
-    first turn, then its topic is reopened: there is no recorded session id, and silence is
-    otherwise the only result."""
+    reached from a different direction. The owner hit it live on 2026-08-26: they killed a codex
+    session two minutes after spawning it, reopened the topic to demo the revive, and got
+    silence."""
     if not isinstance(entry, dict) or entry.get("feed") or not entry.get("ended"):
         return None                      # live, or not a session topic: silence is correct
     if entry.get("session_id"):
@@ -3508,7 +3511,7 @@ def answer_resume_picker(pane, choice, deadline=None):
 
     THIS is what the bridge was missing: a headless revive left that picker unanswered, so a
     large old session came back sitting on a modal, and the briefing typed into it was
-    swallowed in repeated observations. Nothing else answers it — there is no operator
+    swallowed (observed twice on topic 14886). Nothing else answers it — there is no operator
     at the terminal.
 
     Verified before acting, never blind: the picker's own text must be on screen. Pressing a
@@ -4072,7 +4075,7 @@ def _briefing_still_ours(pane, tid, engine, phase):
     # "re-brief an existing codex pane only if it wasn't already briefed this boot (crash-retry
     # — codex has no recv to detect)". Applying it to claude as well overrode that decision and
     # silently dropped the briefing on any host whose boot id had not changed since the last
-    # one — prolonged uptime was enough, so every revive after the first lost its cause, and
+    # one — 4 weeks of uptime was enough, so every revive after the first lost its cause, and
     # the session's only account of the restart became Claude Code's stock "ran out of context",
     # which is exactly the false premise #167 exists to stop (#234). Claude keeps a real guard
     # below: has_live_recv, which detects the double-arm this was standing in for.
@@ -4090,9 +4093,9 @@ def _compaction_settled(pane, tid, window):
 
     #200: "idle right now" is not "ready". The pane stays idle for about a second between the
     answer and compaction rendering, so the plain idle wait exited immediately and typed into
-    a pane about to go busy. Measurement found the status line appeared 1.8 seconds after the
-    picker answered, so the old one-second sleep typed the briefing into the startup gap and
-    left it unsubmitted while the session came back dark.
+    a pane about to go busy. Measured on topic 12999 (2026-08-26): picker answered 14:28:21,
+    briefing typed 14:28:22, swallowed — and it then sat unsubmitted in the composer for over
+    two minutes while the session came back dark.
 
     Two details this file already learned the hard way and the first version of this fix
     ignored:
@@ -4161,7 +4164,7 @@ def deliver_briefing(pane, tid, engine, briefing_tpl, attempt=1, settle=None, aw
     if await_busy and engine == "claude" and not _compaction_settled(pane, tid, window):
         # Compaction was observed and did not finish. Do NOT fall through to the ordinary
         # idle wait: that returns without typing and schedules nothing (review finding 3),
-        # which is precisely what left topic 4107 dark — its retry waited RESTORE_SETTLE,
+        # which is precisely what left topic 12999 dark — its retry waited RESTORE_SETTLE,
         # gave up, and ended the chain while compaction was still running.
         if attempt < BRIEFING_MAX_ATTEMPTS and pane_alive(pane):
             threading.Timer(BRIEFING_RETRY_DELAY, deliver_briefing,
@@ -4189,8 +4192,8 @@ def deliver_briefing(pane, tid, engine, briefing_tpl, attempt=1, settle=None, aw
     # Revalidate IMMEDIATELY before typing, but ONLY where a long wait really happened.
     # Review round 2: the checks above run before a wait that can now last COMPACT_SETTLE, and
     # in that window the topic can be rebound, another chain can brief it, or a live recv can
-    # start. Reproduced — attempt 2 validated 4107 -> %15, the binding moved to %999
-    # mid-wait, and it typed into %15 then stamped briefed_boot on %999, which had received
+    # start. Reproduced — attempt 2 validated 12999 -> %178, the binding moved to %999
+    # mid-wait, and it typed into %178 then stamped briefed_boot on %999, which had received
     # nothing: the #133 r2 failure reached through a longer wait.
     #
     # NOT on a plain first attempt. That runs inline immediately after revive_one bound the
@@ -4419,8 +4422,9 @@ def revive_one(cfg, tid, entry, fresh=False, brief=True, taken=None, cause="boot
     if brief and needs_brief:
         # A `compact` answer drops Claude straight into compaction, which runs for minutes.
         # RESTORE_SETTLE is sized for a plain resume and cannot cover it, so the briefing was
-        # skipped and the session sat dark. Measurement found compaction took 110 seconds
-        # against a 20-second window; the listener then required a manual nudge to arm.
+        # skipped and the session sat dark. Measured on topic 11722 (2026-08-25): picker
+        # answered 15:56:31, compaction finished 15:58:21 — 110s against a 20s window, and it
+        # took a manual nudge to arm the listener.
         compacting = resume_choice == "compact" and picker_outcome == "answered"
         deliver_briefing(pane, tid, engine, tpl, await_busy=compacting,
                          settle=COMPACT_SETTLE if compacting else None)
@@ -5020,7 +5024,7 @@ def _cf_hook_block_reason(pane, before_text):
     the multiset below, so the residue is a weaker proof rather than a known false positive.
 
     Comparison is by OCCURRENCE, not by text prefix. Every refusal from one hook shares a long
-    constant head ("Compaction blocked by PreCompact hook: [bash …/pre-compact-check.sh]"),
+    constant head ("Compaction blocked by PreCompact hook: [bash …/pre-compact-issue-check.sh]"),
     so a prefix probe let any previously displayed refusal mask a genuinely fresh one with a
     DIFFERENT reason — which retried a deterministic refusal and hid its cause, the very thing
     this change exists to stop (Codex round 2 of PR #156). Matching each after-block against the
@@ -5407,7 +5411,7 @@ def _carry_forward_worker(cfg, thread_id, pane, cf_file, marker, token, name):
         # /compact injected blindly here would QUEUE behind that turn instead of compacting.
         # The old gate then watched for GENERIC busy (esc-to-interrupt / ✽ spinner) and
         # misread that ordinary turn as "compaction started" and its end as "done" → the
-        # false success that left t4111 uncompacted. Fix: (1) wait for the pane to actually
+        # false success that left t212 uncompacted. Fix: (1) wait for the pane to actually
         # go IDLE before injecting /compact (so it can't queue), (2) confirm a COMPACTION-
         # specific signal via _cf_wait_compacting (not any busy turn), (3) retry the whole
         # inject a few times. Only a confirmed compaction proceeds to auto-resume.

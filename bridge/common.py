@@ -16,8 +16,8 @@ import urllib.request
 from contextlib import contextmanager
 from dataclasses import dataclass
 
-CONFIG_PATH = os.path.expanduser("~/.config/claude-telegram-bridge/config.json")
-STATE_DIR = os.path.expanduser("~/.local/share/claude-telegram-bridge")
+CONFIG_PATH = os.path.expanduser("~/.config/agent-telegram-bridge/config.json")
+STATE_DIR = os.path.expanduser("~/.local/share/agent-telegram-bridge")
 OPENCLAW_CONFIG = os.path.expanduser("~/.openclaw/openclaw.json")
 # OpenClaw's file-backed secret provider — the sanctioned source since their #706 migration.
 OPENCLAW_SECRETS = os.path.expanduser("~/.openclaw/secrets.json")
@@ -30,9 +30,9 @@ class WakeClaim:
     cursor: int
 
 
-# Some resolver/network combinations return an unusable IPv6 route to Telegram before a
-# working IPv4 route. Prefer A records for Telegram so resolver order cannot park a request
-# on that dead route. The override is scoped to Telegram; every other host is untouched.
+# api.telegram.org over IPv6 is unreachable from this host (connect refused) while IPv4
+# works. Prefer A records for telegram so a flipped resolver order can never park a
+# request on the dead IPv6 route. Scoped to telegram — every other host is untouched.
 _real_getaddrinfo = socket.getaddrinfo
 
 
@@ -106,9 +106,9 @@ def secure_process_umask():
 
     `UMask=0077` in the unit files is the same fix one layer out, and it is the layer that does
     not arrive on upgrade: the units are installed files, so `git pull` and a release cut both
-    leave a running deployment on whatever umask it already had. A mixed-version deployment
-    demonstrated the failure: units without the directive inherited a permissive umask and
-    created group-writable state next to state the daemon had just narrowed.
+    leave a running deployment on whatever umask it already had. On the host this was written
+    for, one of four bridge units had the directive and the other three ran at `0002`, quietly
+    creating group-writable state next to state the daemon had just narrowed.
 
     Called at every entry point rather than at import, because import-time side effects reach
     anything that merely reads this module — including the test suite, which would then be
@@ -247,7 +247,7 @@ SECRET_PATTERN = re.compile(r"sk-[A-Za-z0-9_\-]{8,}")
 def redact_secrets(text):
     """Blank out anything key-shaped in text that is about to be logged or persisted.
 
-    Defence in depth for a reproduced leak path: a key containing CR/LF makes
+    Defence in depth for the leak path proved on 2026-08-11: a key containing CR/LF makes
     http.client raise `ValueError: Invalid header value b'Bearer sk-…'` — the exception
     carries the whole key — and the transcription except-block writes that message into
     `inbox.jsonl` and mirrors it to Telegram. `_clean_secret` stops such a key being used
@@ -347,15 +347,15 @@ def openai_api_key():
     other machine voice transcription simply raised, and the operator learned that as
     `[voice message — transcription failed: no OpenAI key: …]` in their inbox (#204).
 
-    1. `openai_api_key` in `~/.config/claude-telegram-bridge/config.json`.
+    1. `openai_api_key` in `~/.config/agent-telegram-bridge/config.json`.
     2. `~/.openclaw/secrets.json` — OpenClaw's sanctioned secret provider.
     3. `openclaw.json` env.vars — a rollout fallback kept only until (2) is proven live (#146).
 
     env.vars is not merely a third location: it injects the secret into the environment of
     every process OpenClaw spawns, where it reaches child environments, `ps e` and crash
     dumps. OpenClaw's #706 migration moved static secrets out of it for that reason, which
-    silently broke voice transcription during a secret-store migration because this function
-    read only that path. No error below ever includes the value.
+    silently broke voice transcription here on 2026-08-11 because this function read only that
+    path. No error below ever includes the value.
     """
     key, own_rejection = _key_from_bridge_config()
     if key:

@@ -28,7 +28,7 @@ ROOT = pathlib.Path(__file__).resolve().parent.parent
 INSTALL = ROOT / "scripts/install.sh"
 
 RUNTIME = ("bridge/cli.py", "bridge/daemon.py", "bin/tg-bridge",
-           "systemd/claude-telegram-bridge.service", "skill/SKILL.md",
+           "systemd/agent-telegram-bridge.service", "skill/SKILL.md",
            # Nested, because the first version of the gate globbed `bridge/*.py` while the
            # manifest deliberately recurses, and a module one directory down is executed exactly
            # like a top-level one (#231 review r2).
@@ -108,12 +108,12 @@ def test_a_world_writable_tree_is_refused(tmp_path):
 
 
 def _gids_by_sharing():
-    """The current user's groups, split by whether anyone else is in them.
+    """This host's groups for the current user, split by whether anyone else is in them.
 
     Both halves are found from the real group database rather than assumed, because the whole
     point of the gate is that 0664 means different things in different groups — and the
-    assumption can be wrong on ordinary hosts: a primary group may contain a peer account,
-    so its apparently "private" group is not private at all.
+    assumption is wrong even here: the machine this was written on has `www-data` in the
+    author's own primary group, so its "private" group is not private at all.
     """
     import grp
     import pwd

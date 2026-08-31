@@ -1,15 +1,15 @@
 """#178 — every pane the bridge launches must opt out of background-shell reaping.
 
-The client attaches a `memoryPressure` handler to each backgrounded shell and kills it when
-that fires. On Linux the check is `os.freemem() < tengu_bg_low_mem_mb` (default 1024 MB) —
-`Bun.ant.memoryPressureLevel()` is macOS-only — so a host near the threshold can reap waits.
+Claude Code 2.1.x attaches a `memoryPressure` handler to each backgrounded shell and kills
+it when that fires. On Linux the check is `os.freemem() < tengu_bg_low_mem_mb` (default
+1024 MB) — `Bun.ant.memoryPressureLevel()` is macOS-only — and this host sits at that line.
 Every session parks `tg-bridge recv --wait 86400` as a background task, so the listeners
 were being reaped, and each reap woke the session for a turn that drained an empty inbox
 and re-armed. Those turns land in its context: idle sessions climbed to a context warning
 doing nothing.
 
-The diagnosis was confirmed by moving memory above the threshold: repeated listener kills
-stopped in the following observation window.
+Confirmed by prediction: killing one 963 MB session pushed MemFree over the threshold and
+listener kills went from 13 in 45 minutes to 0 in the following 35.
 
 The variable is read at launch, so it protects only sessions started afterwards. That makes
 `launch_pane` the one place it belongs — and the one place a regression can silently undo
@@ -33,7 +33,7 @@ def launched(monkeypatch):
 
     def _tmux(argv, **kw):
         calls.append(argv)
-        return type("R", (), {"returncode": 0, "stdout": "%12\n", "stderr": ""})()
+        return type("R", (), {"returncode": 0, "stdout": "%77\n", "stderr": ""})()
 
     monkeypatch.setattr(daemon, "_tmux", _tmux)
 
@@ -43,7 +43,7 @@ def launched(monkeypatch):
             kw.get("launch", "claude --dangerously-skip-permissions"),
             kw.get("prompt"),
         )
-        assert (pane, err) == ("%12", "")
+        assert (pane, err) == ("%77", "")
         return calls[-1][-1]                 # the shell command is tmux's last argument
 
     return run

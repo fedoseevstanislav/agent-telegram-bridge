@@ -479,7 +479,7 @@ def outbound_echo(cfg, caller, target_id, target_name, text):
     """Show the sender's own topic what it just sent. Telegram only — never an inbox record.
 
     The target's mirror alone leaves each thread holding only the half it received: the
-    first real peer exchange (topics 4101 ↔ 4102) put four questions in one topic and their
+    first real peer exchange (topics 6258 ↔ 8713) put four questions in one topic and their
     four answers in the other, so neither read as a conversation. This posts the outbound
     half where the sender's own thread already carries its icon.
 
@@ -673,9 +673,10 @@ def timeout_notice(armed_at, waited):
     clock between turns — the only duration signal it gets is how far apart two records sit
     in its own transcript. For a long wait that signal is exactly backwards: the longer the
     wait really was, the fewer events happened during it, so the arm and the timeout end up
-    ADJACENT and it reads as an instant failure. In the failure that motivated this field, a
-    session mistook a completed long listener for an immediate timeout and stopped re-arming.
-    Stating the elapsed time makes that conclusion refutable from the text itself."""
+    ADJACENT and it reads as an instant failure. A real session concluded its 24h listener
+    was "returning exit 2 almost immediately every time", stopped re-arming on that basis,
+    and went dark for a day. Stating the elapsed time makes that conclusion refutable from
+    the text itself."""
     return (f"(no reply within timeout — waited {_fmt_duration(waited)}, "
             f"armed {time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime(armed_at))})")
 
@@ -743,7 +744,7 @@ def cmd_ask(cfg, args):
 
 def cmd_status(cfg, args):
     result = subprocess.run(
-        ["systemctl", "--user", "is-active", "claude-telegram-bridge.service"],
+        ["systemctl", "--user", "is-active", "agent-telegram-bridge.service"],
         capture_output=True, text=True,
     )
     print(f"daemon: {result.stdout.strip() or result.stderr.strip()}")

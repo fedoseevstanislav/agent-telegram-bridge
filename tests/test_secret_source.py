@@ -1,8 +1,8 @@
 """Where the OpenAI key comes from, and what happens when that source is unsafe (#146).
 
-Voice transcription broke during a secret-hygiene migration because this key was read from one
-place — `openclaw.json` `env.vars` — and the migration removed it from there. Failures stayed
-silent long enough for messages to be lost.
+Voice transcription broke on 2026-08-11 because this key was read from one place —
+`openclaw.json` `env.vars` — and OpenClaw's secret-hygiene migration removed it from there.
+Every voice message failed for ~40 minutes and two were lost before anyone noticed.
 
 `env.vars` is not just a second location: OpenClaw injects it into the environment of every
 process it spawns, so the value reaches child environments, `ps e` and crash dumps. The

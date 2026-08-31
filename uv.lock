@@ -61,7 +61,7 @@ wheels = [
 ]
 
 [[package]]
-name = "claude-telegram-bridge"
+name = "agent-telegram-bridge"
 version = "0.1.0"
 source = { virtual = "." }
 

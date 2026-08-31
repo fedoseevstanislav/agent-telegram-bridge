@@ -153,23 +153,23 @@ def test_state_directories_are_created_private(tmp_path, monkeypatch):
     monkeypatch.setattr(common, "STATE_DIR", str(tmp_path / "state"))
     old = os.umask(0)
     try:
-        common.state_path("topics", "55", "inbox.jsonl")
+        common.state_path("topics", "33", "inbox.jsonl")
     finally:
         os.umask(old)
-    made = pathlib.Path(common.STATE_DIR) / "topics" / "55"
+    made = pathlib.Path(common.STATE_DIR) / "topics" / "33"
     assert stat.S_IMODE(made.stat().st_mode) == 0o700
 
 
 def _tree(tmp_path, monkeypatch, root_mode=0o775):
     """A state tree as `umask 002` would have left it before any of this existed."""
     root = tmp_path / "state"
-    (root / "topics" / "55").mkdir(parents=True)
-    inbox = root / "topics" / "55" / "inbox.jsonl"
+    (root / "topics" / "33").mkdir(parents=True)
+    inbox = root / "topics" / "33" / "inbox.jsonl"
     inbox.write_text('{"text": "hello"}\n')
     # chmod, not mkdir(mode=): mkdir's mode is masked by the umask, so on a runner with
     # umask 022 the fixture arrived already safe and the assertion proved nothing.
     inbox.chmod(0o664)
-    (root / "topics" / "55").chmod(0o775)
+    (root / "topics" / "33").chmod(0o775)
     (root / "topics").chmod(0o775)
     root.chmod(root_mode)
     monkeypatch.setattr(common, "STATE_DIR", str(root))
@@ -181,7 +181,7 @@ def test_the_state_root_loses_group_and_other_write(tmp_path, monkeypatch):
     changed, before, after = common.secure_state_tree()
     assert before == "0o775" and after == "0o755"
     assert not stat.S_IMODE(root.stat().st_mode) & 0o022
-    assert changed == 4      # root, topics, topics/55, inbox.jsonl
+    assert changed == 4      # root, topics, topics/33, inbox.jsonl
 
 
 def test_everything_inside_the_tree_loses_it_too(tmp_path, monkeypatch):
@@ -189,7 +189,7 @@ def test_everything_inside_the_tree_loses_it_too(tmp_path, monkeypatch):
     # and it sat at 0664 underneath a root that had just been reported as fixed (#245 review).
     root, inbox = _tree(tmp_path, monkeypatch)
     common.secure_state_tree()
-    for path in (root / "topics", root / "topics" / "55", inbox):
+    for path in (root / "topics", root / "topics" / "33", inbox):
         assert not stat.S_IMODE(path.stat().st_mode) & 0o022, f"{path} is still writable"
 
 
@@ -417,8 +417,8 @@ def test_a_destination_others_can_write_is_refused(tmp_path, mode):
 
 
 def test_the_refusal_names_who_else_could_write(tmp_path):
-    # "Writable by others" is abstract; naming the peer group members makes the exposure
-    # concrete without assuming that a user's primary group has no other members.
+    # "Writable by others" is abstract; a group with a service account in it is not. The
+    # exposure on the machine this was found on was `www-data` in the owner's own group.
     result = _run_check(tmp_path, 0o775)
     assert "Group members besides you" in result.stderr
 
@@ -451,9 +451,9 @@ def test_the_check_runs_before_the_directory_is_made(tmp_path):
 def test_the_installer_checks_every_destination_it_writes_to():
     source = INSTALL.read_text()
     calls = re.findall(r'check_destination "\$(?:\(dirname "\$)?(\w+)', source)
-    assert set(calls) == {"PREFIX", "UNIT_DIR", "SKILL_LINK"}, (
-        "the launcher directory, the unit directory and the skill directory are the three "
-        f"places a peer account can change what runs as you; found checks for {calls}")
+    assert set(calls) == {"PREFIX", "UNIT_DIR", "CONFIG_DIR", "STATE_PARENT", "SKILL_LINK"}, (
+        "the launcher, units, migrated config/state, and skill are the five destinations "
+        f"where a peer account can change what runs or what the bridge reads; found {calls}")
 
 
 def test_every_check_precedes_every_write():
@@ -625,8 +625,8 @@ def test_an_unreadable_ancestor_stops_the_walk_without_raising(tmp_path, monkeyp
 
 def test_the_process_creates_private_files_whatever_umask_it_inherited(tmp_path):
     # UMask=0077 lives in the unit files, and unit files are not replaced by `git pull` or by
-    # a release cut — so a code-only upgrade can leave older units inheriting a permissive
-    # umask. This is the same guarantee one layer in, where the upgrade actually reaches.
+    # a release cut — so a code-only upgrade left three of four bridge units at 0002. This is
+    # the same guarantee one layer in, where the upgrade actually reaches.
     old = os.umask(0o002)
     try:
         assert common.secure_process_umask() == 0o002
@@ -658,8 +658,8 @@ def _entry_points_that_touch_state():
 @pytest.mark.parametrize("entry", _entry_points_that_touch_state())
 def test_every_entry_point_secures_its_own_umask(entry):
     # Several processes write state, not one. The daemon having it is not the deployment
-    # having it — a mixed-version unit set demonstrated that one hardened process can coexist
-    # with other writers inheriting a permissive umask.
+    # having it — on the host this was found on, the digest, watchdog and model-watchdog
+    # units all ran at 0002 while the daemon ran at 0077.
     module = __import__(f"bridge.{entry}", fromlist=["main"])
     assert callable(getattr(module, "secure_process_umask", None)), (
         f"bridge/{entry}.py calls secure_process_umask() but never imported it — the call "

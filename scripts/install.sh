@@ -30,10 +30,36 @@ done
 
 ROOT=$(cd -- "$(dirname -- "$(readlink -f -- "${BASH_SOURCE[0]}")")/.." && pwd)
 UNIT_DIR="$HOME/.config/systemd/user"
-CONFIG="$HOME/.config/claude-telegram-bridge/config.json"
+CONFIG_DIR="$HOME/.config"
+STATE_PARENT="$HOME/.local/share"
+CONFIG="$CONFIG_DIR/agent-telegram-bridge/config.json"
+LEGACY_CONFIG="$CONFIG_DIR/claude-telegram-bridge/config.json"
+MIGRATOR="$ROOT/scripts/migrate_identity.py"
 
 die() { printf 'install.sh: %s\n' "$*" >&2; exit 1; }
 step() { printf '\n== %s\n' "$*"; }
+
+migrate_legacy_install () {
+    local plan needed suffix unit
+    # The complete conflict/symlink check runs before systemd is touched. Stopping the old
+    # daemon and only then discovering that both state roots exist turns a safe refusal into
+    # an outage, which is exactly the ordering this helper exists to make hard to regress.
+    plan=$("$PYTHON" "$MIGRATOR" --check --home "$HOME")
+    needed=$("$PYTHON" -c \
+        'import json, sys; print(1 if json.load(sys.stdin)["needed"] else 0)' <<<"$plan")
+    [[ $needed == 1 ]] || return 0
+
+    # The daemon is the sole getUpdates consumer. It must be stopped before state moves, and
+    # the new daemon is started only after this function returns — never run both identities.
+    for suffix in .service -watchdog.service -watchdog.timer -digest.service -digest.timer \
+                  -model-watchdog.service -model-watchdog.timer; do
+        unit="claude-telegram-bridge${suffix}"
+        if systemctl --user cat "$unit" >/dev/null 2>&1; then
+            systemctl --user disable --now "$unit"
+        fi
+    done
+    "$PYTHON" "$MIGRATOR" --apply --home "$HOME"
+}
 
 # --- checks that must pass before anything is written ------------------------------------
 
@@ -62,10 +88,16 @@ printf '  systemd   user instance reachable\n'
 
 # The config is the one thing this script will not invent for you: it holds a credential and
 # two identifiers that only you can supply. See docs/INSTALL.md step 1.
-[[ -f $CONFIG ]] || die "no config at $CONFIG
+if [[ -f $CONFIG ]]; then
+    CONFIG_SOURCE=$CONFIG
+elif [[ -f $LEGACY_CONFIG ]]; then
+    CONFIG_SOURCE=$LEGACY_CONFIG
+else
+    die "no config at $CONFIG
     Create it first — docs/INSTALL.md step 1 walks through getting each value:
         {\"bot_token\": \"...\", \"chat_id\": -100…, \"owner_id\": …}"
-"$PYTHON" - "$CONFIG" <<'PY' || die "config is not usable (see the message above)"
+fi
+"$PYTHON" - "$CONFIG_SOURCE" <<'PY' || die "config is not usable (see the message above)"
 import json, os, stat, sys
 path = sys.argv[1]
 mode = stat.S_IMODE(os.stat(path).st_mode)
@@ -312,23 +344,36 @@ check_destination () {
 }
 
 # Every destination, before the first write. Checking each one just before its own write is
-# how a refusal on the LAST of them leaves a half-installed system behind: a group-writable
-# skill parent let a run write the launcher and units before the final destination check died —
-# a shadowing launcher on PATH and rewritten units, with no daemon-reload. A check that can
-# refuse must refuse before anything is on disk.
+# how a refusal on the LAST of them leaves a half-installed system behind: on the host this was
+# found on, `~/.claude/skills` was 0775, so the run wrote the launcher, rewrote the units, and
+# then died — a shadowing launcher on PATH and rewritten units, with no daemon-reload. A check
+# that can refuse must refuse before anything is on disk.
 step "Checking where this will be written"
 check_destination "$PREFIX" "The tg-bridge launcher"
 check_destination "$UNIT_DIR" "The systemd units"
+check_destination "$CONFIG_DIR" "The bridge config migration"
+check_destination "$STATE_PARENT" "The bridge state migration"
 SKILL_LINK="$HOME/.claude/skills/tg-channel"
 if [[ -d $HOME/.claude ]]; then
     check_destination "$(dirname "$SKILL_LINK")" "The agent skill link"
 fi
 printf '  every destination is yours and no other account can write its path\n'
 
-step "Installing the launcher"
-mkdir -p "$PREFIX"
+# All overwrite refusals precede the migration too. An upgrade without --force must not move
+# its state and stop its daemon only to discover that the existing launcher blocks the run.
 LAUNCHER="$PREFIX/tg-bridge"
 guard "$LAUNCHER"
+for unit in "$ROOT"/systemd/*.service "$ROOT"/systemd/*.timer; do
+    name=$(basename "$unit")
+    guard "$UNIT_DIR/$name"
+done
+
+step "Migrating the legacy product name"
+migrate_legacy_install
+CONFIG="$HOME/.config/agent-telegram-bridge/config.json"
+
+step "Installing the launcher"
+mkdir -p "$PREFIX"
 # -u so a session's backgrounded `recv` writes each message to its output file immediately;
 # block-buffered stdout can hold an inbound message while the read cursor has already moved.
 printf '#!/usr/bin/env bash\nexec %q -u %q/bridge/cli.py "$@"\n' "$PYTHON" "$ROOT" > "$LAUNCHER"
@@ -343,10 +388,6 @@ esac
 
 step "Installing systemd user units"
 mkdir -p "$UNIT_DIR"
-for unit in "$ROOT"/systemd/*.service "$ROOT"/systemd/*.timer; do
-    name=$(basename "$unit")
-    guard "$UNIT_DIR/$name"
-done
 # The units ship with a `@@BRIDGE_ROOT@@` placeholder in ExecStart. Rewrite it to wherever this
 # clone actually lives, and the interpreter to the python3 just verified.
 #
@@ -435,32 +476,32 @@ fi
 
 step "Starting the daemon"
 systemctl --user daemon-reload
-systemctl --user enable --now claude-telegram-bridge.service
+systemctl --user enable --now agent-telegram-bridge.service
 # All three timers, not just the watchdog. The documentation describes the morning digest and
 # the model check as things that happen; installing the units but leaving them disabled makes
 # the docs wrong for every fresh install, and the absence is invisible until someone wonders
 # why no digest ever arrived.
 for timer in watchdog digest model-watchdog; do
-    systemctl --user enable --now "claude-telegram-bridge-$timer.timer"
-    printf '  claude-telegram-bridge-%s.timer enabled\n' "$timer"
+    systemctl --user enable --now "agent-telegram-bridge-$timer.timer"
+    printf '  agent-telegram-bridge-%s.timer enabled\n' "$timer"
 done
 sleep 2
-if ! systemctl --user is-active --quiet claude-telegram-bridge.service; then
+if ! systemctl --user is-active --quiet agent-telegram-bridge.service; then
     printf '\nThe daemon did not stay up. Its own log says why:\n\n'
-    systemctl --user --no-pager status claude-telegram-bridge.service || true
-    printf '\n  journalctl --user -u claude-telegram-bridge.service -n 50\n'
+    systemctl --user --no-pager status agent-telegram-bridge.service || true
+    printf '\n  journalctl --user -u agent-telegram-bridge.service -n 50\n'
     exit 1
 fi
-printf '  claude-telegram-bridge.service active\n'
+printf '  agent-telegram-bridge.service active\n'
 
 cat <<EOF
 
 Installed. Four locations — all under \$HOME unless --prefix moved the launcher:
 
   $LAUNCHER
-  $UNIT_DIR/claude-telegram-bridge*.{service,timer}
+  $UNIT_DIR/agent-telegram-bridge*.{service,timer}
   $CONFIG                (you wrote this; it holds your bot token)
-  $HOME/.local/share/claude-telegram-bridge/   (state: topics, inboxes, media)
+  $HOME/.local/share/agent-telegram-bridge/   (state: topics, inboxes, media)
 
 Prove it end to end — from a tmux pane, so the daemon can find you:
 

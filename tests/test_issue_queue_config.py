@@ -31,8 +31,8 @@ def config_file(tmp_path, monkeypatch):
 
 
 def test_a_well_formed_queue_is_accepted(config_file):
-    config_file(issue_queue={"owner": "octo-cat", "label_prefix": "work"})
-    assert daemon.issue_queue_config() == ("octo-cat", "work")
+    config_file(issue_queue={"owner": "octo-cat", "label_prefix": "orchestra"})
+    assert daemon.issue_queue_config() == ("octo-cat", "orchestra")
 
 
 @pytest.mark.parametrize("owner", [
@@ -48,7 +48,7 @@ def test_a_well_formed_queue_is_accepted(config_file):
     None, 7, True, ["x"], {"owner": "x"},
 ])
 def test_a_malformed_owner_turns_the_feature_off(config_file, owner):
-    config_file(issue_queue={"owner": owner, "label_prefix": "work"})
+    config_file(issue_queue={"owner": owner, "label_prefix": "orchestra"})
     assert daemon.issue_queue_config() is None
     assert daemon.issue_queue_counts() == {}
 
@@ -94,7 +94,7 @@ def test_the_accepted_query_contains_nothing_but_the_configured_names(config_fil
     """The whole point: what reaches GitHub is one owner and one label, and nothing else."""
     from urllib.parse import unquote
 
-    config_file(issue_queue={"owner": "octo-cat", "label_prefix": "work"})
+    config_file(issue_queue={"owner": "octo-cat", "label_prefix": "orchestra"})
     owner, prefix = daemon.issue_queue_config()
     query = f'user:{owner} is:issue is:open label:"{prefix}:ready"'
 

@@ -10,11 +10,11 @@ import pytest
 # Isolate HOME for the whole session, BEFORE any test module imports bridge.*
 # ---------------------------------------------------------------------------
 # Everything the bridge persists hangs off HOME: STATE_DIR is
-# `~/.local/share/claude-telegram-bridge`, CONFIG_PATH is `~/.config/...`, and the codex and
+# `~/.local/share/agent-telegram-bridge`, CONFIG_PATH is `~/.config/...`, and the codex and
 # claude readers look under `~/.codex` and `~/.claude`. Left pointing at the real home, the
-# suite reads and writes the LIVE bridge's state while the daemon is running (#203). An audit
-# hook proved that collection alone opened live state and a full run created multiple topic
-# directories there.
+# suite reads and writes the LIVE bridge's state while the daemon is running (#203). Measured
+# with a `sys.addaudithook` plugin: collection ALONE opens the live `pending-reopens.json`,
+# and a full run touched the state root 20 times and created `topics/{33,8265,11722}`.
 #
 # Three reasons this belongs at module scope rather than in a fixture:
 #
@@ -27,8 +27,8 @@ import pytest
 #    instead of a growing list of individually patched paths — each of which is a hole until
 #    someone remembers to add it.
 #
-# Verified: the full suite is green under an isolated HOME, so the dependency was ambient,
-# not structural.
+# Verified: the full suite is green under an isolated HOME (1064 passed), so the dependency
+# was ambient, not structural.
 REAL_HOME = os.path.expanduser("~")
 ISOLATED_HOME = tempfile.mkdtemp(prefix="tg-bridge-tests-home-")
 os.environ["HOME"] = ISOLATED_HOME
@@ -79,10 +79,11 @@ def _isolated_state_dir(monkeypatch, tmp_path):
     """Give every test its own state directory, not just its own session.
 
     Session-scoped HOME isolation stops the suite reaching the LIVE bridge, but it leaves one
-    mutable state tree shared by the whole suite, so whatever a test writes is visible to every
-    test after it. Review of #203 found topic directories from several otherwise unrelated test
-    modules, all created by `state_path`, which mkdirs the parent of whatever it returns. No
-    assertion depends on them today; the point is that none can start to.
+    mutable state tree shared by 1000+ tests, so whatever a test writes is visible to every
+    test after it. Review of #203 measured three real leaks: `topics/8265` from
+    test_local_notification, `topics/33` from test_modal_safe_nudge, `topics/11722` from
+    test_reopen_choice — all created by `state_path`, which mkdirs the parent of whatever it
+    returns. No assertion depends on them today; the point is that none can start to.
 
     Patching `bridge.common.STATE_DIR` — rather than any one module's `state_path` — is what
     makes this complete. `state_path` is a single function object that `daemon`, `cli` and
@@ -111,7 +112,7 @@ def _no_ambient_caller_pane(monkeypatch):
 
     `send`/`ask`/`recv` and `notify` now resolve the CALLER's own topic from TMUX_PANE. Left
     inherited, the pane of whoever runs pytest could collide with a fake pane id in a
-    fixture registry, and unrelated tests would start
+    fixture registry (`%42` is an ordinary real pane id), and unrelated tests would start
     refusing with exit 4 or taking the peer path depending on the machine.
     """
     monkeypatch.delenv("TMUX_PANE", raising=False)

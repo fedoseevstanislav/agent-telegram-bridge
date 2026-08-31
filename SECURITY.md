@@ -16,7 +16,7 @@ allowed to put text into that pipe, and what is the program on the other end per
 
 ## The trust boundary is one number
 
-`owner_id` in `~/.config/claude-telegram-bridge/config.json` is a Telegram user id. It is the
+`owner_id` in `~/.config/agent-telegram-bridge/config.json` is a Telegram user id. It is the
 whole authorization model. A message is acted on when its sender id equals that number.
 
 Consequences worth stating plainly:
@@ -124,7 +124,7 @@ Stated so you are not surprised:
 - **Multi-user use.** One owner. There are no roles, no per-topic permissions, and no audit
   trail designed to be shown to anyone but you.
 - **The host — and anyone who shares a group with you on it.** Files under
-  `~/.local/share/claude-telegram-bridge/` hold the full message history in plaintext. Anyone
+  `~/.local/share/agent-telegram-bridge/` hold the full message history in plaintext. Anyone
   with your user account can read them, and that much is by design.
 
   What is *not* by design, and is worth checking on a shared machine: the owner pin governs

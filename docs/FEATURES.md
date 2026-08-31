@@ -132,7 +132,7 @@ not reach it — and worse, `recv` there would eat the backlog it was waiting fo
 refuse with **exit 4** and print the right one:
 
 ```bash
-tg-bridge notify --topic 4109 --idempotency-key 'review:1' <<'EOF'
+tg-bridge notify --topic 8265 --idempotency-key 'review:1' <<'EOF'
 corr: X7
 Seats finished for issue #125. Reply with: notify --topic <mine> --idempotency-key "X7:reply"
 EOF

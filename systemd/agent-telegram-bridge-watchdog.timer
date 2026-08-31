@@ -1,5 +1,5 @@
 [Unit]
-Description=Periodic model-identity check for Claude Telegram bridge sessions
+Description=Periodic liveness check for the Agent Telegram bridge daemon
 
 [Timer]
 OnBootSec=2min

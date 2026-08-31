@@ -7,8 +7,8 @@ model. The message isn't delivered either. Same hazard for approval/update/resum
 and for claude's own dialogs.
 
 The guard is behavioural, not cosmetic: type, confirm the text actually rendered in the
-input box, and only then press Enter. These tests pin that contract against representative
-pane geometry from both engines, because the load-bearing constant is
+input box, and only then press Enter. These tests pin that contract against the REAL pane
+geometry of both engines (captured from live panes), because the load-bearing constant is
 how far above the bottom each engine draws its input line.
 """
 
@@ -21,9 +21,9 @@ import pytest
 from bridge import daemon
 
 
-# ---- representative pane fixtures -------------------------------------------
-# Derived from observed pane geometry, with scrollback prose and status lines replaced by
-# neutral text. What has to survive that substitution is the
+# ---- real pane fixtures ------------------------------------------------------
+# Captured from live panes on 2026-08-13, with the scrollback prose and the statusline's
+# project and cost replaced by neutral text. What has to survive that substitution is the
 # SHAPE: the number of lines below `{INPUT}` and the fact that a modal has no input line at
 # all. The detector does not read only those lines — `type_line` squashes the whole capture
 # and requires a strict rise in the count of the injected text — so keep the line count and
@@ -36,14 +36,14 @@ CLAUDE_IDLE = """\
 ────────────────────────────────────────────────────────────────────────────
 ❯ {INPUT}
 ────────────────────────────────────────────────────────────────────────────
-  example-repo (main) • Example model • context available
-  standard permissions · 1 shell"""
+  example-repo (main) • Opus 5 (1M context) • 37m 91% W78% • $12.34 • 70%
+  ⏵⏵ bypass permissions on · 1 shell · ⇥ for agents"""
 
 CODEX_IDLE = """\
 ─ Worked for 1m 27s ─────────────────────────────────────────────────────────
-⚠ Optional integrations unavailable (example-search, example-tasks)
+⚠ MCP startup incomplete (failed: Parallel-Search-MCP, Parallel-Task-MCP)
 › {INPUT}
-  example-model high · Context available"""
+  gpt-5.6-sol xhigh · Context 87% left · week… Goal blocked (/goal resume)"""
 
 # The picker from #133. There is no input box at all — printable keys are swallowed and
 # Enter accepts the highlighted option.
@@ -64,7 +64,7 @@ CODEX_APPROVAL_MODAL = """\
   2. Yes, and don't ask again for this command in this session
   3. No, and tell Codex what to do differently"""
 
-NUDGE = "[tg-bridge] New Telegram message in your topic — run `tg-bridge recv --topic 55` and act on it."
+NUDGE = "[tg-bridge] New Telegram message in your topic — run `tg-bridge recv --topic 33` and act on it."
 
 # Captured before any fixture patches it. `_no_sleep` patches daemon.time.sleep, which IS
 # the shared time module, so a fake that called time.sleep() would be silenced along with
@@ -492,34 +492,34 @@ def test_an_interrupt_writes_under_the_pane_lock(monkeypatch):
     long input. Written inside another injection's capture→type→capture window it raises that
     injection's chip count and authorises ITS Enter — onto whatever the interrupt brought up."""
     trace = _lock_trace(monkeypatch)
-    monkeypatch.setattr(daemon, "read_registry", lambda: {"55": {"pane": "%1"}})
+    monkeypatch.setattr(daemon, "read_registry", lambda: {"33": {"pane": "%1"}})
     monkeypatch.setattr(daemon, "pane_alive", lambda _p: True)
     monkeypatch.setattr(daemon, "reply", lambda *_a, **_k: True)
 
-    daemon.interrupt_session({}, 55, "please stop and " + "explain yourself " * 40)
+    daemon.interrupt_session({}, 33, "please stop and " + "explain yourself " * 40)
     assert _writes_are_locked(trace), trace
 
 
 def test_the_command_relay_writes_under_the_pane_lock(monkeypatch):
     trace = _lock_trace(monkeypatch)
-    monkeypatch.setattr(daemon, "read_registry", lambda: {"55": {"pane": "%1"}})
+    monkeypatch.setattr(daemon, "read_registry", lambda: {"33": {"pane": "%1"}})
     monkeypatch.setattr(daemon, "pane_alive", lambda _p: True)
     monkeypatch.setattr(daemon, "reply", lambda *_a, **_k: True)
 
-    daemon.handle_command({}, 55, "/status")
+    daemon.handle_command({}, 33, "/status")
     assert _writes_are_locked(trace), trace
 
 
 def test_the_model_switch_writes_under_the_pane_lock(monkeypatch):
     trace = _lock_trace(monkeypatch)
-    monkeypatch.setattr(daemon, "read_registry", lambda: {"55": {"pane": "%1"}})
+    monkeypatch.setattr(daemon, "read_registry", lambda: {"33": {"pane": "%1"}})
     monkeypatch.setattr(daemon, "pane_alive", lambda _p: True)
     monkeypatch.setattr(daemon, "engine_of_pane", lambda _p: "claude")
     monkeypatch.setattr(daemon, "pane_is_idle", lambda _p: True)
     monkeypatch.setattr(daemon, "reply", lambda *_a, **_k: True)
-    daemon._pending_model["55"] = "opus"
+    daemon._pending_model["33"] = "opus"
 
-    daemon._try_send_model({}, 55, "opus", "%1", "claude", 1)
+    daemon._try_send_model({}, 33, "opus", "%1", "claude", 1)
     assert _writes_are_locked(trace), trace
 
 
@@ -689,8 +689,8 @@ def test_a_short_command_lands_on_a_churning_alternate_screen_pane(monkeypatch):
     prompt — for a pane with no modal on it at all.
 
     `/compact` is also the pathological probe: `_echo_probe` returns the whole eight-character
-    string, which occurs in ordinary conversation. The observed pane already contained multiple
-    occurrences. The literal signal cannot be payload-specific here, which is
+    string, which occurs in ordinary conversation. Measured on the live pane at the time: three
+    pre-existing occurrences. The literal signal cannot be payload-specific here, which is
     exactly why refusing on any fall is unaffordable.
 
     What this pins is the transition the veto blocked: the typed text collapses into a chip
@@ -820,9 +820,9 @@ def test_cf_clear_modal_takes_the_pane_lock_and_rechecks(monkeypatch):
 
     monkeypatch.setattr(daemon, "_pane_lock", traced)
     monkeypatch.setattr(daemon, "_tmux", fake)
-    monkeypatch.setattr(daemon, "_pending_cf", {"55": {"token": "tok"}})
+    monkeypatch.setattr(daemon, "_pending_cf", {"33": {"token": "tok"}})
 
-    assert daemon._cf_clear_modal("55", "tok", "%1") is True
+    assert daemon._cf_clear_modal("33", "tok", "%1") is True
     steps = [s for s, _ in order]
     assert steps == ["lock", "capture", "Enter", "unlock"], order
     # and the capture must be the visible screen only: a ❯-block left in scrollback from
@@ -847,13 +847,24 @@ def test_maybe_nudge_reports_a_pane_that_keeps_swallowing(monkeypatch):
     reported = []
     monkeypatch.setattr(daemon, "report_blocked_pane",
                         lambda tid, p, what: reported.append((tid, p, what)))
-    assert daemon.maybe_nudge(55, "%1") is False
+
+    assert daemon.maybe_nudge(33, "%1") is False
     assert pane.enters == 0
     assert reported == []            # one swallow is not yet news
 
-    while not daemon.pane_is_persistently_swallowing("%1"):
-        assert daemon.maybe_nudge(55, "%1") is False
-    assert reported and reported[0][0] == 55
+    # Bounded on purpose. An unbounded `while not persistently_swallowing` hangs the suite
+    # the moment that predicate stops becoming true — a mutation run proved it, turning a
+    # test that should FAIL into one that never returns. A test that can hang is worse than
+    # the bug it guards.
+    for _ in range(daemon.SWALLOW_MAX_ATTEMPTS + 2):
+        if daemon.pane_is_persistently_swallowing("%1"):
+            break
+        assert daemon.maybe_nudge(33, "%1") is False
+    else:
+        raise AssertionError(
+            "the pane never reached the cap: type_line stopped counting swallows, "
+            "so this test can no longer prove the report still fires")
+    assert reported and reported[0][0] == 33
     assert pane.enters == 0          # and still no Enter on the picker
 
 
@@ -865,7 +876,7 @@ def test_maybe_nudge_is_silent_on_a_normal_pane(monkeypatch):
     reported = []
     monkeypatch.setattr(daemon, "report_blocked_pane",
                         lambda *a: reported.append(a))
-    assert daemon.maybe_nudge(55, "%1") is True
+    assert daemon.maybe_nudge(33, "%1") is True
     assert pane.enters == 1
     assert reported == []
 
@@ -876,8 +887,8 @@ def test_blocked_report_is_rate_limited(monkeypatch):
     sent = []
     monkeypatch.setattr(daemon, "reply",
                         lambda cfg, tid, text: bool(sent.append(text)) or True)
-    assert daemon.report_blocked_pane(55, "%1", "a message") is True
-    assert daemon.report_blocked_pane(55, "%1", "a message") is False   # cooldown
+    assert daemon.report_blocked_pane(33, "%1", "a message") is True
+    assert daemon.report_blocked_pane(33, "%1", "a message") is False   # cooldown
     assert len(sent) == 1
 
 
@@ -895,8 +906,8 @@ def test_a_failed_report_does_not_buy_30_minutes_of_silence(monkeypatch):
         return True                      # reply() reports delivery since #161
 
     monkeypatch.setattr(daemon, "reply", flaky)
-    assert daemon.report_blocked_pane(55, "%1", "a message") is False
-    assert daemon.report_blocked_pane(55, "%1", "a message") is True   # not suppressed
+    assert daemon.report_blocked_pane(33, "%1", "a message") is False
+    assert daemon.report_blocked_pane(33, "%1", "a message") is True   # not suppressed
     assert len(attempts) == 2
 
 
@@ -914,7 +925,7 @@ def test_swallowed_briefing_is_retried(monkeypatch):
                         lambda delay, fn, args=(): timers.append((delay, args)) or
                         types.SimpleNamespace(start=lambda: None))
 
-    daemon.deliver_briefing("%1", "4109", "codex", "brief {tid}")
+    daemon.deliver_briefing("%1", "8265", "codex", "brief {tid}")
     assert marked == []                                   # never marked briefed
     assert len(timers) == 1
     assert timers[0][0] == daemon.BRIEFING_RETRY_DELAY
@@ -928,11 +939,11 @@ def test_a_retry_abandons_a_rebound_pane(monkeypatch):
     typed = []
     monkeypatch.setattr(daemon, "pane_alive", lambda _p: True)
     monkeypatch.setattr(daemon, "type_line", lambda p, t, **k: typed.append((p, t)) or "sent")
-    monkeypatch.setattr(daemon, "read_registry", lambda: {"4109": {"pane": "%new"}})
+    monkeypatch.setattr(daemon, "read_registry", lambda: {"8265": {"pane": "%new"}})
     marked = []
     monkeypatch.setattr(daemon, "update_registry", lambda fn: marked.append(fn))
 
-    daemon.deliver_briefing("%old", "4109", "codex", "brief {tid}", attempt=2)
+    daemon.deliver_briefing("%old", "8265", "codex", "brief {tid}", attempt=2)
     assert typed == []          # nothing typed into the pane that now serves someone else
     assert marked == []         # and the topic is not falsely marked briefed
 
@@ -945,10 +956,10 @@ def test_a_retry_abandons_a_topic_already_briefed(monkeypatch):
     monkeypatch.setattr(daemon, "type_line", lambda p, t, **k: typed.append((p, t)) or "sent")
     monkeypatch.setattr(daemon, "current_boot_id", lambda: "boot-1")
     monkeypatch.setattr(daemon, "read_registry",
-                        lambda: {"4109": {"pane": "%1", "briefed_boot": "boot-1"}})
+                        lambda: {"8265": {"pane": "%1", "briefed_boot": "boot-1"}})
     monkeypatch.setattr(daemon, "update_registry", lambda fn: None)
 
-    daemon.deliver_briefing("%1", "4109", "codex", "brief {tid}", attempt=2)
+    daemon.deliver_briefing("%1", "8265", "codex", "brief {tid}", attempt=2)
     assert typed == []
 
 
@@ -962,8 +973,8 @@ def test_first_attempt_does_not_consult_the_registry(monkeypatch):
     monkeypatch.setattr(daemon, "update_registry", lambda fn: None)
     monkeypatch.setattr(daemon, "current_boot_id", lambda: "boot-1")
 
-    daemon.deliver_briefing("%1", "4109", "codex", "brief {tid}")
-    assert typed == [("%1", "brief 4109")]
+    daemon.deliver_briefing("%1", "8265", "codex", "brief {tid}")
+    assert typed == [("%1", "brief 8265")]
 
 
 def test_giving_up_on_a_briefing_forces_the_escalation(monkeypatch):
@@ -971,7 +982,7 @@ def test_giving_up_on_a_briefing_forces_the_escalation(monkeypatch):
     empty inbox the sweep is not a fallback — so the last attempt must not go quiet."""
     monkeypatch.setattr(daemon, "pane_alive", lambda _p: True)
     monkeypatch.setattr(daemon, "type_line", lambda *a, **k: "swallowed")
-    monkeypatch.setattr(daemon, "read_registry", lambda: {"4109": {"pane": "%1"}})
+    monkeypatch.setattr(daemon, "read_registry", lambda: {"8265": {"pane": "%1"}})
     monkeypatch.setattr(daemon, "update_registry", lambda fn: None)
     monkeypatch.setattr(daemon, "current_boot_id", lambda: "boot-1")
     monkeypatch.setattr(daemon.threading, "Timer",
@@ -980,11 +991,11 @@ def test_giving_up_on_a_briefing_forces_the_escalation(monkeypatch):
     monkeypatch.setattr(daemon, "report_blocked_pane",
                         lambda tid, p, what: reports.append(what))
 
-    daemon._blocked_reported["4109"] = time.time()          # inside the normal cooldown
-    daemon.deliver_briefing("%1", "4109", "codex", "brief {tid}",
+    daemon._blocked_reported["8265"] = time.time()          # inside the normal cooldown
+    daemon.deliver_briefing("%1", "8265", "codex", "brief {tid}",
                             attempt=daemon.BRIEFING_MAX_ATTEMPTS)
     assert len(reports) == 1 and "final attempt" in reports[0]
-    assert "4109" not in daemon._blocked_reported            # cooldown cleared to force it
+    assert "8265" not in daemon._blocked_reported            # cooldown cleared to force it
 
 
 def test_briefing_retries_are_bounded(monkeypatch):
@@ -997,7 +1008,7 @@ def test_briefing_retries_are_bounded(monkeypatch):
                         lambda delay, fn, args=(): timers.append(args) or
                         types.SimpleNamespace(start=lambda: None))
 
-    daemon.deliver_briefing("%1", "4109", "codex", "brief {tid}",
+    daemon.deliver_briefing("%1", "8265", "codex", "brief {tid}",
                             attempt=daemon.BRIEFING_MAX_ATTEMPTS)
     assert timers == []                                   # gives up instead of looping
 
@@ -1010,14 +1021,14 @@ def test_carry_forward_inject_is_verified(monkeypatch):
     reported = []
     monkeypatch.setattr(daemon, "report_blocked_pane",
                         lambda tid, p, what: reported.append((tid, what)))
-    daemon._pending_cf["4109"] = {"token": "tok", "pane": "%1"}
+    daemon._pending_cf["8265"] = {"token": "tok", "pane": "%1"}
     try:
-        assert daemon._cf_inject_owned("4109", "tok", "%1", "carry-forward prompt") is False
+        assert daemon._cf_inject_owned("8265", "tok", "%1", "carry-forward prompt") is False
         assert pane.enters == 0
-        assert reported and reported[0][0] == "4109"
-        assert "4109" in daemon._pending_cf          # flow not released on a failed inject
+        assert reported and reported[0][0] == "8265"
+        assert "8265" in daemon._pending_cf          # flow not released on a failed inject
     finally:
-        daemon._pending_cf.pop("4109", None)
+        daemon._pending_cf.pop("8265", None)
 
 
 def test_blocked_report_shows_the_prompt_and_fences_it(monkeypatch):
@@ -1027,7 +1038,7 @@ def test_blocked_report_shows_the_prompt_and_fences_it(monkeypatch):
     sent = []
     monkeypatch.setattr(daemon, "reply",
                         lambda cfg, tid, text: bool(sent.append(text)) or True)
-    daemon.report_blocked_pane(55, "%1", "a new Telegram message")
+    daemon.report_blocked_pane(33, "%1", "a new Telegram message")
     body = sent[0]
     assert "Switch to gpt-5.6-luna" in body          # The owner sees the actual prompt
     assert body.count("```") == 2                    # a backtick in the capture can't break out
@@ -1046,7 +1057,7 @@ def _always_current():
 #
 # The pane never renders the text, so the literal tail probe could not match and #133
 # withheld Enter on every long injection — every carry-forward broke the moment it went
-# live. Observed examples rendered numbered paste placeholders in the input line.
+# live. Measured on live panes %44/%46: "❯ [Pasted text #1]", "❯ [Pasted text #5]".
 
 def _chip_tmux(states):
     """tmux stub whose capture-pane returns states.pop(0) each time, recording send-keys."""
@@ -1248,12 +1259,12 @@ def test_cf_clear_modal_refuses_enter_on_dont_ask_me_again(monkeypatch):
         return types.SimpleNamespace(returncode=0, stdout="", stderr="")
 
     monkeypatch.setattr(daemon, "_tmux", fake)
-    monkeypatch.setattr(daemon, "_pending_cf", {"55": {"token": "tok"}})
+    monkeypatch.setattr(daemon, "_pending_cf", {"33": {"token": "tok"}})
     reported = []
     monkeypatch.setattr(daemon, "report_blocked_pane",
                         lambda tid, pane, what: reported.append(what))
 
-    assert daemon._cf_clear_modal("55", "tok", "%1") is False
+    assert daemon._cf_clear_modal("33", "tok", "%1") is False
     assert keys == [], "pressed Enter on 'Don't ask me again' — that is permanent (A2)"
     assert reported and "permanently" in reported[0], "refused silently"
 
@@ -1275,7 +1286,7 @@ def test_cf_clear_modal_still_clears_an_ordinary_modal(monkeypatch):
         return types.SimpleNamespace(returncode=0, stdout="", stderr="")
 
     monkeypatch.setattr(daemon, "_tmux", fake)
-    monkeypatch.setattr(daemon, "_pending_cf", {"55": {"token": "tok"}})
+    monkeypatch.setattr(daemon, "_pending_cf", {"33": {"token": "tok"}})
 
-    assert daemon._cf_clear_modal("55", "tok", "%1") is True
+    assert daemon._cf_clear_modal("33", "tok", "%1") is True
     assert keys == ["Enter"]

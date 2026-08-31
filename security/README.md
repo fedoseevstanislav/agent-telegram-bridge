@@ -16,6 +16,7 @@ test suite on pull requests, main, and weekly. If a third-party runtime import
 is intentionally added, declare the package in `pyproject.toml`, regenerate the
 lock, and extend the manifest generator in the same reviewed change.
 
-External host tools are not PyPI dependencies and this repository does not pretend to
-hash-lock their package-manager artifacts; host patching and base-system provenance remain
-separate operational controls.
+`deployed-runtime-20260811.json` is a dated, sanitized inventory of the current
+Linux host. External host tools are not PyPI dependencies and this repository
+does not pretend to hash-lock their package-manager artifacts; host patching and
+base-system provenance remain separate operational controls.

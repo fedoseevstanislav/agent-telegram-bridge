@@ -1,6 +1,6 @@
 # Configuration
 
-Everything this project owns lives in one file: `~/.config/claude-telegram-bridge/config.json`.
+Everything this project owns lives in one file: `~/.config/agent-telegram-bridge/config.json`.
 
 (Two exceptions, both for one optional key: `openai_api_key` also has legacy fallback sources,
 described with that key below. Nothing else reads anything outside this file.)
@@ -19,7 +19,7 @@ the permissions are looser than that.
     "claude": "--dangerously-skip-permissions",
     "codex": "--dangerously-bypass-approvals-and-sandbox"
   },
-  "issue_queue": {"owner": "your-github-user", "label_prefix": "work"},
+  "issue_queue": {"owner": "your-github-user", "label_prefix": "orchestra"},
   "carry_forward_repo": "your-github-user/your-repo"
 }
 ```
@@ -106,7 +106,7 @@ Adds a work-queue line to the pinned dashboard and the morning digest, counting 
 lifecycle label across one GitHub owner's repositories.
 
 ```json
-"issue_queue": {"owner": "your-github-user", "label_prefix": "work"}
+"issue_queue": {"owner": "your-github-user", "label_prefix": "orchestra"}
 ```
 
 It counts `<label_prefix>:ready`, `:claimed`, `:running`, `:review`, `:human-review`,
@@ -132,8 +132,8 @@ copy for you.
 ## Environment variables
 
 All but one of these are read **once, when the daemon starts**, so changing one needs a
-`systemctl --user restart claude-telegram-bridge.service`. Set those in a systemd drop-in
-(`systemctl --user edit claude-telegram-bridge.service`), not in your shell profile — the daemon
+`systemctl --user restart agent-telegram-bridge.service`. Set those in a systemd drop-in
+(`systemctl --user edit agent-telegram-bridge.service`), not in your shell profile — the daemon
 does not inherit your shell.
 
 `TG_BRIDGE_TOPIC` is the exception: it is read by the **CLI**, per invocation. It goes in the
@@ -143,7 +143,7 @@ environment of the session running `tg-bridge`, and the daemon never sees it.
 |---|---|---|
 | `TG_BRIDGE_SPAWN_MODEL` | `claude-opus-4-8[1m]` | Model for spawned claude sessions. Spawning with no explicit model rides the account default, which is how one model's disablement once broke every session at once. |
 | `TG_BRIDGE_CODEX_MODEL` | `0` | Set to `1` to let `/model <alias>` switch a running **codex** session. It gates typing the slash command into the pane; it adds no process argument. Off by default because the switch is not verified against every codex build. |
-| `TG_BRIDGE_TZ_OFFSET` | `3` | Hours from UTC for displayed times; a compatibility default, so set it for your audience. |
+| `TG_BRIDGE_TZ_OFFSET` | `3` | Hours from UTC for times shown to you. |
 | `TG_BRIDGE_AUTOCF_PCT` | `60` | Context percentage at which a session is asked to carry forward before compaction. |
 | `TG_BRIDGE_TOPIC` | unset | Pin the CLI to one topic. Resolution order is `--topic`, then this, then a `.tg-bridge-topic` file in the working directory — there is no `TMUX_PANE` fallback here; that is a separate mechanism the daemon uses to find a pane. **Read by the `tg-bridge` CLI on every invocation, not by the daemon** — so it belongs in the environment of whatever runs `tg-bridge`, and restarting the daemon neither sets it nor is needed to change it. |
 | `TG_BRIDGE_DASH_POLL` | `60` | Seconds between fleet-dashboard rebuilds. |
@@ -152,13 +152,13 @@ environment of the session running `tg-bridge`, and the daemon never sees it.
 | `TG_BRIDGE_SNAPSHOT_POLL` | `60` | Seconds between session snapshots. |
 
 Run the daemon with none of them set until something specifically bothers you. The defaults are
-safe starting points; set the timezone offset to match the audience for displayed times.
+what this has been running on.
 
 ---
 
 ## Where state lives
 
-`~/.local/share/claude-telegram-bridge/`:
+`~/.local/share/agent-telegram-bridge/`:
 
 | Path | Contents |
 |---|---|
@@ -168,6 +168,6 @@ safe starting points; set the timezone offset to match the audience for displaye
 | `topics/<id>/media/` | Downloaded images |
 | `registry.json` | Topic → session bindings |
 
-**Nothing here is rotated or archived.** Measured growth has been modest, so automatic pruning
-has not been worth the added machinery; the absence is stated so you are not surprised by it
-later. Everything is plaintext and readable by your user account.
+**Nothing here is rotated or archived.** After two and a half months of continuous use the
+whole directory was 32 MB, so this has not been worth solving; it is stated so you are not
+surprised by it in a year. Everything is plaintext and readable by your user account.

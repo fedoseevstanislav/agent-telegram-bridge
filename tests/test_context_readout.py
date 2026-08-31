@@ -1,7 +1,7 @@
 """Unit tests for the unified context readout (#158).
 
-Measured across idle registered panes: nearly every one answered /ctx with "no fresh context
-data" while its status line displayed the number the whole time. statusline.sh
+Measured 2026-08-18: 18 of 20 live registered panes answered /ctx with "no fresh context
+data" while their statuslines were displaying the number the whole time. statusline.sh
 rewrites context/<pane>.json on every RENDER — each turn, not only when the number changes —
 so `ts` measures activity. An idle session's record stops being rewritten while its
 percentage stays exactly what it was, and CTX_STALE was discarding it as if it were wrong.
@@ -84,8 +84,8 @@ def test_missing_and_malformed_files_are_none(tmp_path, monkeypatch):
 # ---- context_for ordering ----------------------------------------------------
 
 def test_codex_pane_never_reads_the_claude_record(monkeypatch):
-    # THE regression this ordering exists for: codex panes can retain weeks-old Claude records
-    # whose percentages differ from live Codex readings. CTX_STALE was
+    # THE regression this ordering exists for: %16/%18/%20 are codex panes still holding
+    # 17-37 day old claude records (2%/27%/43%) against live codex readings. CTX_STALE was
     # the only thing hiding them, so accepting records at any age without this would report
     # the wrong engine's number with full confidence.
     monkeypatch.setattr(daemon, "read_context",
@@ -121,7 +121,7 @@ def test_supplied_engine_skips_the_fleet_lookup(monkeypatch):
     monkeypatch.setattr(daemon, "engine_of_pane", boom)
     monkeypatch.setattr(daemon, "read_context", lambda pane, max_age=None: {"pct": 31})
 
-    assert daemon.context_for("%7", "claude") == {"pct": 31}
+    assert daemon.context_for("%27", "claude") == {"pct": 31}
 
 
 def test_no_record_is_no_data(monkeypatch):
@@ -137,7 +137,7 @@ def test_unknown_engine_stays_on_the_claude_path(monkeypatch):
     monkeypatch.setattr(daemon, "read_context", lambda pane, max_age=None: {"pct": 31})
     monkeypatch.setattr(daemon, "_codex_ctx_dict", lambda pane: {"pct": 77})
 
-    assert daemon.context_for("%7") == {"pct": 31}
+    assert daemon.context_for("%27") == {"pct": 31}
 
 
 # ---- the snapshot loop must NOT inherit the relaxed rule ----------------------

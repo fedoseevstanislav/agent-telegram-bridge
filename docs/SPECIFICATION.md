@@ -1,8 +1,8 @@
-# claude-telegram-bridge — Specification
+# agent-telegram-bridge — Specification
 
 ## Architecture Overview
 
-The **claude-telegram-bridge** lets headless AI coding sessions (`claude` and `codex` CLIs running in tmux) hold a two-way conversation with a single human over one Telegram forum supergroup — one *session topic* per live session, voice transcribed and images downloaded. A single **daemon** is the sole Telegram `getUpdates` consumer: it routes inbound messages into per-topic inboxes, handles owner commands, spawns and monitors sessions, and renders a fleet dashboard. Each session drives its own side through the **`tg-bridge` CLI**. Secrets live only in chmod-600 config and an external OpenClaw config — never in code or logs.
+The **agent-telegram-bridge** lets headless AI coding sessions (`claude` and `codex` CLIs running in tmux) hold a two-way conversation with a single human over one Telegram forum supergroup — one *session topic* per live session, voice transcribed and images downloaded. A single **daemon** is the sole Telegram `getUpdates` consumer: it routes inbound messages into per-topic inboxes, handles owner commands, spawns and monitors sessions, and renders a fleet dashboard. Each session drives its own side through the **`tg-bridge` CLI**. Secrets live only in chmod-600 config and an external OpenClaw config — never in code or logs.
 
 **System context** — the external boundaries the bridge operates within:
 
@@ -10,7 +10,7 @@ The **claude-telegram-bridge** lets headless AI coding sessions (`claude` and `c
 flowchart TB
     human["Human (owner)<br/>Telegram client"]
     tg["Telegram Bot API<br/>(forum supergroup)"]
-    bridge["claude-telegram-bridge<br/><i>(daemon + CLI + units)</i>"]
+    bridge["agent-telegram-bridge<br/><i>(daemon + CLI + units)</i>"]
     tmux["tmux<br/>(session host)"]
     claude["claude CLI"]
     codex["codex CLI"]
@@ -66,13 +66,13 @@ bridge/digest.py
 bridge/watchdog.py
 bin/tg-bridge
 skill/SKILL.md
-systemd/claude-telegram-bridge.service
-systemd/claude-telegram-bridge-watchdog.service
-systemd/claude-telegram-bridge-watchdog.timer
-systemd/claude-telegram-bridge-model-watchdog.service
-systemd/claude-telegram-bridge-model-watchdog.timer
-systemd/claude-telegram-bridge-digest.service
-systemd/claude-telegram-bridge-digest.timer
+systemd/agent-telegram-bridge.service
+systemd/agent-telegram-bridge-watchdog.service
+systemd/agent-telegram-bridge-watchdog.timer
+systemd/agent-telegram-bridge-model-watchdog.service
+systemd/agent-telegram-bridge-model-watchdog.timer
+systemd/agent-telegram-bridge-digest.service
+systemd/agent-telegram-bridge-digest.timer
 ```
 
 **Requirement Coverage:** no upstream PRD exists, so there are no `REQ-`/`QB-` IDs to disposition. `unaccounted: []`. Traceability is to the source code (`file:line`) throughout.
@@ -119,7 +119,7 @@ erDiagram
     }
 ```
 
-### 3.1 Config — `~/.config/claude-telegram-bridge/config.json` (chmod 600)
+### 3.1 Config — `~/.config/agent-telegram-bridge/config.json` (chmod 600)
 
 | Field | Type | Required | Constraints | Description |
 |---|---|---|---|---|
@@ -173,7 +173,7 @@ Append-only JSONL, one record per line.
 
 A record with empty `text` is never written (`daemon.py`). Telegram ingress writes the original six fields. Local ingress writes the normal reader-facing four-field core (`ts`, `from`, `kind`, `text`) plus `provenance` and `idempotency_key`, and for a `peer` record also `sender_topic_id`; readers already tolerate additional/missing provenance fields. A `peer` record's `from` is `"<sender topic name> (topic <id>)"`, composed from the registry — `--sender` cannot set it. The inbox record itself is the notification idempotency ledger—there is no second event state model.
 
-### 3.4 Other state files (under `~/.local/share/claude-telegram-bridge/`)
+### 3.4 Other state files (under `~/.local/share/agent-telegram-bridge/`)
 
 | Path | Format | Role |
 |---|---|---|
@@ -181,7 +181,7 @@ A record with empty `text` is never written (`daemon.py`). Telegram ingress writ
 | `topics/<id>/cursor` | int | Read position; **unread = inbox line count − cursor**. |
 | `topics/<id>/media/<message_id>.<ext>` | binary | Downloaded photos/image documents. |
 | `dashboard.json` | `{message_id}` | The pinned dashboard message id. |
-| `digest-snapshot.json` | `{ts_iso, costs, orchestra}` | Previous digest values for deltas. `orchestra` is a legacy on-disk compatibility key for the generic issue queue, not a required integration name. |
+| `digest-snapshot.json` | `{ts_iso, costs, orchestra}` | Previous digest values for deltas. |
 | `warnings.json` | `{topic_id: threshold}` | Context-warning high-water mark (`warning_loop`). |
 | `autocf.json` | `{topic_id: bool}` | Auto-carry-forward armed/fired flag per episode (`warning_loop`, §6.6). |
 | `autocf_exempt.json` | `[topic_id, …]` | Operator-set list of topics exempt from auto-carry-forward (#119); daemon-**read** only, hot-reloaded per poll (`daemon.py`). |
@@ -339,7 +339,7 @@ On an HTTP 200 carrying `ok: false`, `api()` raises `RuntimeError` with the Tele
 
 ### 6.2 IPv4 pinning (`common.py`)
 
-On import, `socket.getaddrinfo` is wrapped to return only IPv4 (A) records for hosts ending `telegram.org` (other hosts untouched). Some resolver/network combinations return an unusable IPv6 route first; pinning prevents requests parking on that dead route. The wrapper is idempotent (guards against double-wrapping).
+On import, `socket.getaddrinfo` is wrapped to return only IPv4 (A) records for hosts ending `telegram.org` (other hosts untouched). `api.telegram.org` over IPv6 is unreachable from this host; pinning prevents requests parking on the dead route. The wrapper is idempotent (guards against double-wrapping).
 
 ### 6.3 Idle nudge gates (`maybe_nudge` `daemon.py`, `schedule_nudge` `daemon.py`)
 
@@ -452,11 +452,11 @@ Bytes are read to EOF rather than trusting `st_size`, so a file being appended t
 
 Audio longer than `CHUNK_ABOVE_S` (240 s) is cut into `CHUNK_SECONDS` pieces with ffmpeg (stream copy, timestamps reset per piece), transcribed one request per piece with `whisper-1`, and joined with a space. The pieces are deleted in a `finally`.
 
-This is not an optimisation. `whisper-1` has no output cap — that was `gpt-4o-mini-transcribe`'s failure, fixed in #117 — but it **degenerates** on long audio: it repeats a phrase and pads the tail with a stock hallucination, and most of the content is simply absent. In measured long recordings (#227), chunking recovered 27% more words in one case and nearly three times as many in another; only the chunked output retained the closing sentence. Nothing failed and the daemon logged a successful transcription both times.
+This is not an optimisation. `whisper-1` has no output cap — that was `gpt-4o-mini-transcribe`'s failure, fixed in #117 — but it **degenerates** on long audio: it repeats a phrase and pads the tail with a stock hallucination, and most of the content is simply absent. Measured on two real notes (#227): 588 s gave 352 words in one request against 447 in pieces, and only the pieced transcript contained the speaker's closing sentence; 944 s gave 218 against 617, most of the single-request result being one phrase repeated. Nothing failed and the daemon logged a successful transcription both times.
 
 Falls back to a single request when ffmpeg cannot segment the file, or when segmenting yields one piece (which is the whole file again). Audio of unknown duration is **not** chunked — an absent `ffprobe` is not evidence of length — but still avoids the capped model.
 
-`_looks_truncated` appends `[transcript may be incomplete — audio Ns, W words]` below `MIN_WORDS_PER_SEC` (0.5). The gate cannot separate every bad result from every good one: a failed result can have a higher word rate than a complete slow recording. It is a backstop for the extreme, not the mechanism — a threshold close to natural slow speech marked a correct transcript, and a false alarm teaches the reader to ignore the real one.
+`_looks_truncated` appends `[transcript may be incomplete — audio Ns, W words]` below `MIN_WORDS_PER_SEC` (0.5). The gate cannot separate every bad result from every good one: measured, a complete note sat at 0.66 words/s and a failed one at 0.60. It is a backstop for the extreme, not the mechanism — 0.7 marked a correct transcript, and a false alarm teaches the reader to ignore the real one.
 
 ### 6.14 OpenAI key resolution (`openai_api_key`, `common.py`)
 
@@ -502,7 +502,7 @@ What this does not establish: an ACL can grant write access the group bit does n
 | Voice transcription failure | Placeholder note `[<kind> message — transcription failed: <e>]` is inboxed; temp file always removed. Order is duration-routed: audio < `LONG_AUDIO_THRESHOLD_S` (300 s) tries `gpt-4o-mini-transcribe` then `whisper-1`; audio ≥ 300 s or of unknown duration goes to `whisper-1` first (it avoids the mini model's silent truncation); either way an ffmpeg→mp3 retry is last. A result that still looks truncated is re-tried on `whisper-1` and, if still short, flagged inline `[transcript may be truncated …]` (#117/#118). 300 s request timeout. |
 | `owner_id` absent, null, boolean, non-integer, or non-positive | Configuration load fails and the bridge does not start. |
 | Pane dies | `lifecycle_loop` stamps `ended`, posts a notice, closes the topic; nudges/warnings/sweeps suppressed. |
-| Claude Code reaps the session's `recv --wait` listener | The client attaches a `memoryPressure` handler to eligible **root** background shell tasks (agent-owned ones excluded) and kills one when that fires — subject to further gates: still running and unnotified, session human-idle past its window, main loop not busy, no other active background task blocking. A kill is `killed` / "was stopped" with an **empty** output file, which is what distinguishes it from a real timeout (`(no reply within timeout)`, exit 2). On Linux the check is `os.freemem() < tengu_bg_low_mem_mb` (default 1024 MB); `Bun.ant.memoryPressureLevel()` is macOS-only. A reap usually wakes the session for a turn that drains an empty inbox and re-arms, appended to its context, so an idle session climbs toward a context warning doing nothing. Mitigated by launching panes with `CLAUDE_CODE_DISABLE_BG_SHELL_PRESSURE_REAP=1` (`SPAWN_ENV`, in `launch_pane`). **Partial by construction:** read at launch, so pre-existing panes stay reapable, including one that `revive_one` reuses rather than relaunches; and the switch is per-process, so it also stops reaping unrelated root background jobs in that session. (#178) |
+| Claude Code reaps the session's `recv --wait` listener | Claude Code 2.1.x attaches a `memoryPressure` handler to eligible **root** background shell tasks (agent-owned ones excluded) and kills one when that fires — subject to further gates: still running and unnotified, session human-idle past its window, main loop not busy, no other active background task blocking. A kill is `killed` / "was stopped" with an **empty** output file, which is what distinguishes it from a real timeout (`(no reply within timeout)`, exit 2). On Linux the check is `os.freemem() < tengu_bg_low_mem_mb` (default 1024 MB); `Bun.ant.memoryPressureLevel()` is macOS-only. A reap usually wakes the session for a turn that drains an empty inbox and re-arms, appended to its context, so an idle session climbs toward a context warning doing nothing. Mitigated by launching panes with `CLAUDE_CODE_DISABLE_BG_SHELL_PRESSURE_REAP=1` (`SPAWN_ENV`, in `launch_pane`). **Partial by construction:** read at launch, so pre-existing panes stay reapable, including one that `revive_one` reuses rather than relaunches; and the switch is per-process, so it also stops reaping unrelated root background jobs in that session. (#178) |
 | Detached `&` recv | Consumes a reply and exits without waking the session → dark. The `dead-listener` sweep flavor and the skill's `&` prohibition exist to close this. |
 | Auth/credential outage | Sweep detects the dark session but a nudge cannot restore auth; surfaced for manual recovery. |
 | Daemon down | Watchdog alerts General directly (not via the daemon), once per down-transition, with a recovery notice on return. |
@@ -546,7 +546,7 @@ What this does not establish: an ACL can grant write access the group bit does n
 | Model-watchdog settle / burst | 5 s / 1 s (`CODEX_SETTLE_SECONDS` / `CODEX_BURST_SECONDS`) | — |
 | Send attempts / chunk size | 3 total (`retries=3`; sleeps 0.3 s, then 0.6 s, on refused/DNS only) / 3800 chars (`_TG_HTML_LIMIT`, newline-aware) | — |
 | Transcription request timeout | 300 s; long-audio threshold 300 s (`LONG_AUDIO_THRESHOLD_S`) | — |
-| Display timezone | UTC+3 compatibility default (`TZ_OFFSET`) | `TG_BRIDGE_TZ_OFFSET` |
+| Display timezone | UTC+3 (`TZ_OFFSET`) | `TG_BRIDGE_TZ_OFFSET` |
 | Spawn model | `claude-opus-4-8[1m]` (claude only) | `TG_BRIDGE_SPAWN_MODEL` |
 
 ## 10. Configuration Schema

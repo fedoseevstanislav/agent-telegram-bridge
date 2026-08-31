@@ -1,6 +1,6 @@
 """Morning digest: one deterministic daily summary to the group's General topic.
 
-Run on the schedule configured by claude-telegram-bridge-digest.timer. Zero
+Run by agent-telegram-bridge-digest.timer (06:00 UTC = 09:00 the owner time). Zero
 model tokens: everything comes from tmux, the bridge registry/state, the gh
 search API, and the statusline usage cache. Deltas are computed against a
 snapshot saved on the previous run.
@@ -163,9 +163,10 @@ def main():
     if ended:
         body.append(ended)
 
-    # The snapshot key is "orchestra" only for on-disk compatibility with earlier releases.
-    # Renaming it would discard one digest interval's deltas for no behavioral gain; no reader
-    # outside this compatibility boundary sees the key.
+    # The snapshot key is "orchestra" for one reason: that is what it was called before the
+    # feature was renamed to issue_queue, and a running deployment's digest-snapshot.json still
+    # holds it. Renaming it would cost one morning's deltas for nothing — the file is internal
+    # state that never ships, and no reader outside this line ever sees the name.
     orch_line, orch_counts = issue_queue_digest_line(snap.get("orchestra"))
     body.append("")
     if orch_line:
@@ -176,7 +177,7 @@ def main():
         body.append(usage)
 
     daemon_state = subprocess.run(
-        ["systemctl", "--user", "is-active", "claude-telegram-bridge.service"],
+        ["systemctl", "--user", "is-active", "agent-telegram-bridge.service"],
         capture_output=True, text=True,
     ).stdout.strip()
     body.append(f"Bridge daemon: {daemon_state}")

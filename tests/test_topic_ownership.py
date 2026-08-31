@@ -229,7 +229,7 @@ def test_recv_at_an_ended_topic_is_allowed(tmp_path, monkeypatch, capsys):
 @pytest.mark.parametrize(
     ("pane", "registry", "target", "why"),
     [
-        (None, None, B, "outside tmux: automation, cron and headless callers keep working"),
+        (None, None, B, "outside tmux: Orchestra, cron and headless callers keep working"),
         ("%unregistered", None, B, "an unregistered pane cannot be attributed to a topic"),
         (CALLER_PANE,
          {"111": {"name": "Alpha", "pane": CALLER_PANE},

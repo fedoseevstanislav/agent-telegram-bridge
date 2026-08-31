@@ -432,7 +432,7 @@ def test_digest_row_degrades_when_a_pane_lookup_fails(monkeypatch):
     monkeypatch.setattr(digest, "pane_cwd", lambda pane: "/home/user")
     monkeypatch.setattr(digest, "fleet_panes", lambda: [("%16", "s", "t", "codex")])
     monkeypatch.setattr(digest, "registry_by_pane",
-                        lambda: {"%16": ("4109", {"name": "agents-cleanup"})})
+                        lambda: {"%16": ("8265", {"name": "agents-cleanup"})})
     monkeypatch.setattr(digest, "unread_count", lambda tid: 0)
 
     lines = digest.session_lines({}, {})

@@ -157,7 +157,7 @@ def test_progress_bar_without_phrase_is_not_compacting():
 def test_ordinary_busy_turn_is_not_compacting():
     # The crux of #101: an ordinary active turn (or a /compact QUEUED behind one) is
     # GENERIC-busy but must NOT read as compacting — that misread was the false success
-    # that left t4111 uncompacted. Each of these is busy, yet none is a compaction.
+    # that left t212 uncompacted. Each of these is busy, yet none is a compaction.
     for line in ("✻ Working… (12s · ↑ 1.2k tokens · esc to interrupt)",
                  "✽ Mulling… (10s · ↓ 97 tokens)",
                  "✢ Baking… (4s · thinking with xhigh effort)",
@@ -551,7 +551,7 @@ def test_leading_whitespace_command_is_not_passive():
     assert not daemon.is_passive_status_command("\t/help")
 
 
-def _cf_msg(text, thread_id=55):
+def _cf_msg(text, thread_id=33):
     return {"chat": {"id": 1}, "from": {"id": 5},
             "message_thread_id": thread_id, "text": text}
 
@@ -636,11 +636,11 @@ def test_worker_disarms_kill_switch_after_successful_resume(monkeypatch):
     replies = []
     monkeypatch.setattr(daemon, "reply", lambda cfg, tid, text: replies.append(text))
     monkeypatch.setattr(daemon, "_pending_cf",
-                        {"55": {"token": "t", "pane": "%0", "phase": "write"}})
+                        {"33": {"token": "t", "pane": "%0", "phase": "write"}})
 
-    daemon._carry_forward_worker({}, 55, "%0", "/x/cf.md", "/x/cf.md.done", "t", "sess")
+    daemon._carry_forward_worker({}, 33, "%0", "/x/cf.md", "/x/cf.md.done", "t", "sess")
 
-    assert not daemon.carry_forward_active(55)                 # kill-switch disarmed
+    assert not daemon.carry_forward_active(33)                 # kill-switch disarmed
     assert any("Carry-forward complete" in r for r in replies) # resume confirmation sent
     assert not any("halted" in r.lower() for r in replies)     # no spurious halt
 
@@ -650,7 +650,7 @@ def test_worker_aborts_when_busy_but_not_compacting(monkeypatch):
     # actually starts compacting (it queued behind the session's own turn / was mangled),
     # so _cf_wait_compacting always times out. The worker MUST retry then abort — NOT report
     # success and resume. Under the OLD generic-busy gate this returned "busy" and the flow
-    # falsely resumed an uncompacted session (the t4111 bug). Uses the REAL _cf_release.
+    # falsely resumed an uncompacted session (the t212 bug). Uses the REAL _cf_release.
     monkeypatch.setattr(daemon.time, "sleep", lambda *a, **k: None)
     monkeypatch.setattr(daemon, "_cf_cleanup_marker", lambda *a, **k: None)
     monkeypatch.setattr(daemon, "_cf_wait_idle", lambda *a, **k: "idle")
@@ -675,11 +675,11 @@ def test_worker_aborts_when_busy_but_not_compacting(monkeypatch):
     replies = []
     monkeypatch.setattr(daemon, "reply", lambda cfg, tid, text: replies.append(text))
     monkeypatch.setattr(daemon, "_pending_cf",
-                        {"55": {"token": "t", "pane": "%0", "phase": "write"}})
+                        {"33": {"token": "t", "pane": "%0", "phase": "write"}})
 
-    daemon._carry_forward_worker({}, 55, "%0", "/x/cf.md", "/x/cf.md.done", "t", "sess")
+    daemon._carry_forward_worker({}, 33, "%0", "/x/cf.md", "/x/cf.md.done", "t", "sess")
 
-    assert not daemon.carry_forward_active(55)                        # flow released on abort
+    assert not daemon.carry_forward_active(33)                        # flow released on abort
     assert injected.count("/compact") == daemon.CF_COMPACT_TRIES      # retried, didn't give up early
     assert any("didn't start compacting" in r for r in replies)      # honest abort message
     assert not any("Carry-forward complete" in r for r in replies)   # NO false success
@@ -689,7 +689,7 @@ def test_worker_aborts_when_busy_but_not_compacting(monkeypatch):
 
 # ---- PreCompact hook refusal (#155) ------------------------------------------
 #
-# Observed shape: Claude Code answers a hook-blocked
+# Real shape, measured on a real session: Claude Code answers a hook-blocked
 # /compact in under a second, tmux hard-wraps the stderr at the pane width, and the daemon
 # used to re-inject /compact twice more before replying with a generic timeout.
 
@@ -698,7 +698,7 @@ _HOOK_BLOCK_CAPTURE = (
     "\n"
     "> /compact\n"
     "  ⎿  <local-command-stderr>Compaction blocked by PreCompact hook:\n"
-    "     [bash /opt/example/hooks/pre-compact-check.sh]: PreCompact blocked: no new\n"
+    "     [bash ~/.claude/hooks/pre-compact-issue-check.sh]: PreCompact blocked: no new\n"
     "     carry-forward comment on #42 (example-org/ops) since session start on\n"
     "     this issue.\n"
     "\n"
@@ -709,7 +709,7 @@ def test_hook_block_text_extracts_wrapped_reason():
     got = daemon._cf_hook_block_text(_HOOK_BLOCK_CAPTURE)
     assert got is not None
     assert "\n" not in got                                   # one readable line for Telegram
-    assert "pre-compact-check.sh" in got               # unwrapped across the tmux break
+    assert "pre-compact-issue-check.sh" in got               # unwrapped across the tmux break
     assert "no new carry-forward comment on #42" in got     # the reason itself survived
     assert "<local-command-stderr>" not in got               # pseudo-tag stripped
 
@@ -864,12 +864,12 @@ def test_worker_stops_at_once_when_a_precompact_hook_refuses(monkeypatch):
     replies = []
     monkeypatch.setattr(daemon, "reply", lambda cfg, tid, text: replies.append(text))
     monkeypatch.setattr(daemon, "_pending_cf",
-                        {"55": {"token": "t", "pane": "%0", "phase": "write"}})
+                        {"33": {"token": "t", "pane": "%0", "phase": "write"}})
 
-    daemon._carry_forward_worker({}, 55, "%0", "/x/cf.md", "/x/cf.md.done", "t", "sess")
+    daemon._carry_forward_worker({}, 33, "%0", "/x/cf.md", "/x/cf.md.done", "t", "sess")
 
     assert injected.count("/compact") == 1                            # no pointless retries
-    assert not daemon.carry_forward_active(55)                        # flow released
+    assert not daemon.carry_forward_active(33)                        # flow released
     assert any("refused by a PreCompact hook" in r for r in replies)
     assert any("no new carry-forward comment on #42" in r for r in replies)  # the real reason
     assert not any("didn't start compacting" in r for r in replies)   # not the generic message
@@ -913,9 +913,9 @@ def test_worker_still_retries_when_a_displayed_refusal_is_not_ours(monkeypatch):
     replies = []
     monkeypatch.setattr(daemon, "reply", lambda cfg, tid, text: replies.append(text))
     monkeypatch.setattr(daemon, "_pending_cf",
-                        {"55": {"token": "t", "pane": "%0", "phase": "write"}})
+                        {"33": {"token": "t", "pane": "%0", "phase": "write"}})
 
-    daemon._carry_forward_worker({}, 55, "%0", "/x/cf.md", "/x/cf.md.done", "t", "sess")
+    daemon._carry_forward_worker({}, 33, "%0", "/x/cf.md", "/x/cf.md.done", "t", "sess")
 
     assert injected.count("/compact") == 2                             # the retry was not stolen
     assert any("Carry-forward complete" in r for r in replies)         # it recovered
@@ -956,9 +956,9 @@ def test_worker_snapshots_the_pane_before_injecting_compact(monkeypatch):
     replies = []
     monkeypatch.setattr(daemon, "reply", lambda cfg, tid, text: replies.append(text))
     monkeypatch.setattr(daemon, "_pending_cf",
-                        {"55": {"token": "t", "pane": "%0", "phase": "write"}})
+                        {"33": {"token": "t", "pane": "%0", "phase": "write"}})
 
-    daemon._carry_forward_worker({}, 55, "%0", "/x/cf.md", "/x/cf.md.done", "t", "sess")
+    daemon._carry_forward_worker({}, 33, "%0", "/x/cf.md", "/x/cf.md.done", "t", "sess")
 
     assert events[:2] == ["capture", "inject"]                  # snapshot precedes the inject
     assert any("refused by a PreCompact hook" in r for r in replies)

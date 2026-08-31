@@ -9,15 +9,15 @@ Four services and three timers, all as **your user**, none as root.
 
 | Unit | Type | What it is |
 |---|---|---|
-| `claude-telegram-bridge.service` | long-running | The daemon. The **only** thing that polls Telegram. |
-| `claude-telegram-bridge-watchdog.service` + `.timer` | oneshot, every 5 min | Alerts General if the daemon is down, and again when it recovers. |
-| `claude-telegram-bridge-digest.service` + `.timer` | oneshot, daily 06:00 UTC | The morning digest. `Persistent=true`, so a missed run fires at next boot. |
-| `claude-telegram-bridge-model-watchdog.service` + `.timer` | oneshot, every 5 min | Notices when a session's model is not what it was started with. |
+| `agent-telegram-bridge.service` | long-running | The daemon. The **only** thing that polls Telegram. |
+| `agent-telegram-bridge-watchdog.service` + `.timer` | oneshot, every 5 min | Alerts General if the daemon is down, and again when it recovers. |
+| `agent-telegram-bridge-digest.service` + `.timer` | oneshot, daily 06:00 UTC | The morning digest. `Persistent=true`, so a missed run fires at next boot. |
+| `agent-telegram-bridge-model-watchdog.service` + `.timer` | oneshot, every 5 min | Notices when a session's model is not what it was started with. |
 
 ```bash
-systemctl --user status claude-telegram-bridge.service
-systemctl --user list-timers 'claude-telegram-bridge*'
-journalctl --user -u claude-telegram-bridge.service -f
+systemctl --user status agent-telegram-bridge.service
+systemctl --user list-timers 'agent-telegram-bridge*'
+journalctl --user -u agent-telegram-bridge.service -f
 ```
 
 Two things in the main unit are deliberate and should not be "cleaned up":
@@ -62,10 +62,18 @@ to the Bot API directly and never goes through the daemon.
 
 ## Upgrading
 
+An installation still using `claude-telegram-bridge` paths or units needs the one-time identity
+migration first: update to the new checkout and run `./scripts/install.sh --force`. The installer
+preflights conflicts, stops the old daemon, atomically moves its config/state and unit overrides,
+and only then starts `agent-telegram-bridge`. See the detailed
+[install guide](INSTALL.md#upgrading-an-old-name-installation).
+
+After that one-time migration, ordinary code upgrades are:
+
 ```bash
 cd /path/to/your/clone
 git pull
-systemctl --user restart claude-telegram-bridge.service
+systemctl --user restart agent-telegram-bridge.service
 ```
 
 Two things to know before you do it:
@@ -84,7 +92,7 @@ separate acts, which is worth the ceremony once more than one person depends on 
 
 ## State, backup, and size
 
-Everything is under `~/.local/share/claude-telegram-bridge/`. [CONFIGURATION.md](CONFIGURATION.md)
+Everything is under `~/.local/share/agent-telegram-bridge/`. [CONFIGURATION.md](CONFIGURATION.md)
 covers the paths you are likely to look at and [SPECIFICATION.md](SPECIFICATION.md) §3 adds the
 daemon's own bookkeeping files; neither is exhaustive — the daemon creates state as features
 need it, so read the directory, not a list. The parts worth knowing:
@@ -96,9 +104,9 @@ need it, so read the directory, not a list. The parts worth knowing:
   messages.
 - `offset` — the Telegram ack cursor. Losing it replays or skips recent updates.
 
-**Nothing here is rotated, archived, or pruned.** Measured growth has been modest, so pruning
-has not been worth the added machinery; it is stated here so you are not surprised later. If
-you do prune, prune whole `topics/<id>/` directories for sessions that ended — never
+**Nothing here is rotated, archived, or pruned.** Two and a half months of continuous daily use
+came to 32 MB, so it has not been worth building; it is stated here so you are not surprised in
+a year. If you do prune, prune whole `topics/<id>/` directories for sessions that ended — never
 truncate an `inbox.jsonl`, whose line count the sibling `cursor` file indexes into.
 
 To back up: stop the daemon, copy the directory, start it again. It is all plain files.

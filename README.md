@@ -86,14 +86,13 @@ Full detail in [docs/FEATURES.md](docs/FEATURES.md).
 
 ---
 
-## A note on the name
+## One product name
 
-The repository is `agent-telegram-bridge`; everything it installs is called
-`claude-telegram-bridge` — the config directory, the state directory, the systemd units. That is
-not a mistake to be tidied up later. The project was Claude-only when it was written, grew Codex
-support, and outgrew its name; renaming the paths now would break every existing install for a
-cosmetic gain. New installs are unaffected either way, so the paths stay as they are and the
-repository carries the accurate name.
+The repository, package, config and state directories, and systemd units are all named
+`agent-telegram-bridge`. The command stays `tg-bridge`, and the Python package stays `bridge`:
+both already describe the interface rather than one agent engine. Installs made before this
+rename are migrated once by `scripts/install.sh --force`; see the upgrade note in
+[docs/INSTALL.md](docs/INSTALL.md#upgrading-an-old-name-installation).
 
 ---
 

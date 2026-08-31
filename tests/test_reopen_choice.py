@@ -2,7 +2,7 @@
 
 #192 made a reopen revive the session outright. On a large session that is the most expensive
 thing the bridge can do unprompted: a full resume re-reads the entire context (the session
-this was measured on sat at 360,000 tokens, 36% of its window), and the token cost lands
+this was measured on sat at 352,556 tokens, 35% of its window), and the token cost lands
 before they have decided they even wants it back. So the reopen now states the size and offers `full` vs `compact`.
 
 Mirrors the /kill confirmation deliberately, including its hardest-won property: **arm only
@@ -61,7 +61,7 @@ def _age(path, minutes):
 
 
 ENTRY = {"name": "api-refactor", "engine": "claude", "session_id": "SID",
-         "cwd": "/home/user", "pane": "%9", "ended": "2026-08-22T19:06:55+0000"}
+         "cwd": "/home/user", "pane": "%9", "ended": "2026-08-22T19:06:33+0000"}
 
 
 @pytest.fixture
@@ -76,9 +76,9 @@ def sent(monkeypatch):
 def test_context_size_comes_from_the_last_usage_record(tmp_path, monkeypatch):
     _transcript(tmp_path, monkeypatch, [
         {"input_tokens": 5, "cache_creation_input_tokens": 100, "cache_read_input_tokens": 900},
-        {"input_tokens": 6, "cache_creation_input_tokens": 50, "cache_read_input_tokens": 359_944},
+        {"input_tokens": 6, "cache_creation_input_tokens": 50, "cache_read_input_tokens": 352_500},
     ])
-    assert daemon.session_context_tokens("SID", "/home/user") == 360_000
+    assert daemon.session_context_tokens("SID", "/home/user") == 352_556
 
 
 def test_the_last_record_wins_even_when_it_is_smaller(tmp_path, monkeypatch):
@@ -98,10 +98,10 @@ def test_an_unknown_size_is_None_not_zero(tmp_path, monkeypatch):
 
 def test_the_question_states_the_size_and_both_options(tmp_path, monkeypatch, sent):
     _transcript(tmp_path, monkeypatch, [
-        {"input_tokens": 6, "cache_creation_input_tokens": 50, "cache_read_input_tokens": 359_944}])
-    assert daemon.offer_reopen_choice({}, 4106, ENTRY) is True
+        {"input_tokens": 6, "cache_creation_input_tokens": 50, "cache_read_input_tokens": 352_500}])
+    assert daemon.offer_reopen_choice({}, 11722, ENTRY) is True
     text = sent[0]
-    assert "360,000" in text and "36%" in text
+    assert "352,556" in text and "35%" in text
     assert "`full`" in text and "`compact`" in text
     # C2: the message must describe what the code DOES. It promised a carry-forward long
     # after that implementation was deleted, and only the owner reading it caught that. Asserting
@@ -114,7 +114,7 @@ def test_the_question_states_the_size_and_both_options(tmp_path, monkeypatch, se
 
 def test_an_unknown_size_is_admitted_not_invented(tmp_path, monkeypatch, sent):
     monkeypatch.setattr(transcript, "PROJECTS_DIR", str(tmp_path))
-    assert daemon.offer_reopen_choice({}, 4106, ENTRY) is True
+    assert daemon.offer_reopen_choice({}, 11722, ENTRY) is True
     assert "size unknown" in sent[0]
     assert "0 tokens" not in sent[0]
 
@@ -124,7 +124,7 @@ def test_an_unknown_size_is_admitted_not_invented(tmp_path, monkeypatch, sent):
 def test_the_choice_is_not_armed_when_the_question_cannot_be_delivered(tmp_path, monkeypatch):
     _transcript(tmp_path, monkeypatch, [{"input_tokens": 1}])
     monkeypatch.setattr(daemon, "reply", lambda cfg, tid, text: False)   # closed/deleted topic
-    assert daemon.offer_reopen_choice({}, 4106, ENTRY) is False
+    assert daemon.offer_reopen_choice({}, 11722, ENTRY) is False
     assert daemon.pending_reopens == {}, (
         "a live choice behind an undelivered question — the #162 r2 failure"
     )
@@ -132,8 +132,8 @@ def test_the_choice_is_not_armed_when_the_question_cannot_be_delivered(tmp_path,
 
 def test_asking_twice_does_not_re_arm(tmp_path, monkeypatch, sent):
     _transcript(tmp_path, monkeypatch, [{"input_tokens": 1}])
-    assert daemon.offer_reopen_choice({}, 4106, ENTRY) is True
-    assert daemon.offer_reopen_choice({}, 4106, ENTRY) is False
+    assert daemon.offer_reopen_choice({}, 11722, ENTRY) is True
+    assert daemon.offer_reopen_choice({}, 11722, ENTRY) is False
     assert len(sent) == 1
 
 
@@ -141,8 +141,8 @@ def test_no_question_while_a_revive_is_already_running(tmp_path, monkeypatch, se
     # revive_one reopens the topic before clearing `ended`, so its own service message would
     # otherwise come straight back here and ask again mid-revive.
     _transcript(tmp_path, monkeypatch, [{"input_tokens": 1}])
-    monkeypatch.setattr(daemon, "_auto_reviving", {"4106"})
-    assert daemon.offer_reopen_choice({}, 4106, ENTRY) is False
+    monkeypatch.setattr(daemon, "_auto_reviving", {"11722"})
+    assert daemon.offer_reopen_choice({}, 11722, ENTRY) is False
     assert sent == []
 
 
@@ -153,10 +153,10 @@ def answer(monkeypatch, sent):
     calls = {"full": [], "compact": []}
     monkeypatch.setattr(daemon, "_revive_with_choice",
                         lambda cfg, tid, entry, choice: calls[choice].append(str(tid)) or True)
-    monkeypatch.setattr(daemon, "read_registry", lambda: {"4106": dict(ENTRY)})
+    monkeypatch.setattr(daemon, "read_registry", lambda: {"11722": dict(ENTRY)})
 
     def _arm():
-        daemon.pending_reopens["4106"] = {"entry": dict(ENTRY), "tokens": 360_000, "state": "delivered"}
+        daemon.pending_reopens["11722"] = {"entry": dict(ENTRY), "tokens": 352_556, "state": "delivered"}
     return _arm, calls
 
 
@@ -164,16 +164,16 @@ def answer(monkeypatch, sent):
 def test_full_resumes_as_is(answer, word):
     arm, calls = answer
     arm()
-    assert daemon.check_pending_reopen({}, 4106, word) is True
-    assert calls["full"] == ["4106"] and calls["compact"] == []
+    assert daemon.check_pending_reopen({}, 11722, word) is True
+    assert calls["full"] == ["11722"] and calls["compact"] == []
 
 
 @pytest.mark.parametrize("word", ["compact", "COMPACT", "cf", "сжать"])
 def test_compact_relays_the_summary_choice(answer, word):
     arm, calls = answer
     arm()
-    assert daemon.check_pending_reopen({}, 4106, word) is True
-    assert calls["compact"] == ["4106"] and calls["full"] == []
+    assert daemon.check_pending_reopen({}, 11722, word) is True
+    assert calls["compact"] == ["11722"] and calls["full"] == []
 
 
 def test_an_unrelated_message_re_asks_and_is_still_delivered(answer, sent):
@@ -182,19 +182,19 @@ def test_an_unrelated_message_re_asks_and_is_still_delivered(answer, sent):
     typed, so they lose neither the question nor the sentence."""
     arm, calls = answer
     arm()
-    assert daemon.check_pending_reopen({}, 4106, "actually, what did we decide on F2?") is False
+    assert daemon.check_pending_reopen({}, 11722, "actually, what did we decide on F2?") is False
     assert calls["full"] == [] and calls["compact"] == []
     assert "Reply `compact`" in sent[-1], "the question was not asked again"
-    assert "4106" in daemon.pending_reopens, "the question was dropped by a non-answer"
+    assert "11722" in daemon.pending_reopens, "the question was dropped by a non-answer"
 
 
 def test_offer_stores_no_deadline(tmp_path, monkeypatch, sent):
     """A1, at the source. Asserting on a dict the test fixture built proves nothing about
     what offer_reopen_choice stores — a reintroduced deadline survived exactly that gap."""
-    _transcript(tmp_path, monkeypatch, [{"cache_read_input_tokens": 360_000}])
-    assert daemon.offer_reopen_choice({}, 4106, ENTRY) is True
-    assert "deadline" not in daemon.pending_reopens["4106"]
-    assert set(daemon.pending_reopens["4106"]) == {"entry", "tokens", "state"}
+    _transcript(tmp_path, monkeypatch, [{"cache_read_input_tokens": 352_000}])
+    assert daemon.offer_reopen_choice({}, 11722, ENTRY) is True
+    assert "deadline" not in daemon.pending_reopens["11722"]
+    assert set(daemon.pending_reopens["11722"]) == {"entry", "tokens", "state"}
 
 
 def test_the_question_has_no_deadline(answer):
@@ -203,22 +203,22 @@ def test_the_question_has_no_deadline(answer):
     comes."""
     arm, calls = answer
     arm()
-    assert "deadline" not in daemon.pending_reopens["4106"]
-    assert daemon.check_pending_reopen({}, 4106, "compact") is True
-    assert calls["compact"] == ["4106"]
+    assert "deadline" not in daemon.pending_reopens["11722"]
+    assert daemon.check_pending_reopen({}, 11722, "compact") is True
+    assert calls["compact"] == ["11722"]
 
 
 def test_the_choice_is_consumed_once(answer):
     arm, calls = answer
     arm()
-    assert daemon.check_pending_reopen({}, 4106, "full") is True
-    assert daemon.check_pending_reopen({}, 4106, "full") is False
-    assert calls["full"] == ["4106"]
+    assert daemon.check_pending_reopen({}, 11722, "full") is True
+    assert daemon.check_pending_reopen({}, 11722, "full") is False
+    assert calls["full"] == ["11722"]
 
 
 def test_no_pending_choice_is_a_clean_no(answer):
     arm, calls = answer
-    assert daemon.check_pending_reopen({}, 4106, "full") is False
+    assert daemon.check_pending_reopen({}, 11722, "full") is False
     assert calls["full"] == []
 
 
@@ -235,7 +235,7 @@ def test_the_compact_answer_drives_a_revive_that_answers_the_picker(monkeypatch)
     monkeypatch.setattr(daemon.threading, "Thread",
                         lambda target=None, daemon=None, **kw: type(
                             "T", (), {"start": lambda self: target()})())
-    daemon._revive_with_choice({}, 4106, dict(ENTRY), "compact")
+    daemon._revive_with_choice({}, 11722, dict(ENTRY), "compact")
     assert seen.get("resume_choice") == "compact"
 
 
@@ -246,7 +246,7 @@ def test_the_full_answer_relays_full(monkeypatch):
     monkeypatch.setattr(daemon.threading, "Thread",
                         lambda target=None, daemon=None, **kw: type(
                             "T", (), {"start": lambda self: target()})())
-    daemon._revive_with_choice({}, 4106, dict(ENTRY), "full")
+    daemon._revive_with_choice({}, 11722, dict(ENTRY), "full")
     assert seen.get("resume_choice") == "full"
 
 
@@ -270,7 +270,7 @@ def pane(monkeypatch):
     return keys, screen
 
 
-PICKER = ("This session is 2d 3h old and 360k tokens.\n"
+PICKER = ("This session is 2d 3h old and 352k tokens.\n"
           "1. Resume from summary (recommended)\n"
           "2. Resume full session as-is\n"
           "3. Don't ask me again\n")
@@ -314,7 +314,7 @@ def test_an_unknown_choice_presses_nothing(pane):
 # ---- ask only when Claude will actually offer the choice -----------------------
 
 def test_the_picker_is_predicted_with_claude_s_own_thresholds(tmp_path, monkeypatch):
-    _transcript(tmp_path, monkeypatch, [{"cache_read_input_tokens": 360_000}])
+    _transcript(tmp_path, monkeypatch, [{"cache_read_input_tokens": 352_000}])
     monkeypatch.setattr(daemon, "session_age_minutes", lambda sid, cwd: 200.0)
     assert daemon.resume_picker_expected("SID", "/home/user") is True
 
@@ -328,7 +328,7 @@ def test_a_small_session_is_not_asked_about(tmp_path, monkeypatch):
 
 
 def test_a_recent_session_is_not_asked_about(tmp_path, monkeypatch):
-    _transcript(tmp_path, monkeypatch, [{"cache_read_input_tokens": 360_000}])
+    _transcript(tmp_path, monkeypatch, [{"cache_read_input_tokens": 352_000}])
     monkeypatch.setattr(daemon, "session_age_minutes", lambda sid, cwd: 5.0)
     assert daemon.resume_picker_expected("SID", "/home/user") is False
 
@@ -344,7 +344,7 @@ def test_revive_one_actually_answers_the_picker(tmp_path, monkeypatch):
     being fixed (a headless revive leaving the modal up and the briefing swallowed)."""
     answered = []
     monkeypatch.setattr(daemon, "launch_pane",
-                        lambda tmux_name, cwd, launch, prompt=None: ("%12", ""))
+                        lambda tmux_name, cwd, launch, prompt=None: ("%77", ""))
     monkeypatch.setattr(daemon, "_tmux",
                         lambda *a, **kw: type("R", (), {"returncode": 1, "stdout": "", "stderr": ""})())
     monkeypatch.setattr(daemon, "answer_resume_picker",
@@ -356,11 +356,11 @@ def test_revive_one_actually_answers_the_picker(tmp_path, monkeypatch):
 
     entry = {"engine": "claude", "session_id": "SID", "cwd": str(tmp_path), "pane": "%1"}
     try:
-        daemon.revive_one({}, "4106", entry, resume_choice="compact")
+        daemon.revive_one({}, "11722", entry, resume_choice="compact")
     except RuntimeError:
         pass                      # everything past the picker is out of scope
 
-    assert answered == [("%12", "compact")], (
+    assert answered == [("%77", "compact")], (
         "revive_one launched without answering the resume picker — the session comes back "
         "sitting on a modal and its briefing is swallowed"
     )
@@ -370,7 +370,7 @@ def test_a_revive_with_no_choice_does_not_touch_the_picker(tmp_path, monkeypatch
     # Boot restore and the plain on-message revive pass no choice; they must not press keys.
     answered = []
     monkeypatch.setattr(daemon, "launch_pane",
-                        lambda tmux_name, cwd, launch, prompt=None: ("%12", ""))
+                        lambda tmux_name, cwd, launch, prompt=None: ("%77", ""))
     monkeypatch.setattr(daemon, "_tmux",
                         lambda *a, **kw: type("R", (), {"returncode": 1, "stdout": "", "stderr": ""})())
     monkeypatch.setattr(daemon, "answer_resume_picker",
@@ -383,7 +383,7 @@ def test_a_revive_with_no_choice_does_not_touch_the_picker(tmp_path, monkeypatch
 
     entry = {"engine": "claude", "session_id": "SID", "cwd": str(tmp_path), "pane": "%1"}
     try:
-        daemon.revive_one({}, "4106", entry)
+        daemon.revive_one({}, "11722", entry)
     except RuntimeError:
         pass
     # With no choice it may only DETECT a picker, never press: answer_resume_picker is not
@@ -401,9 +401,9 @@ def test_an_inbound_message_does_not_revive_while_a_question_is_open(monkeypatch
     monkeypatch.setattr(daemon, "revive_one",
                         lambda cfg, tid, entry, **kw: revived.append(str(tid)) or ("resumed", None))
     monkeypatch.setattr(daemon, "read_registry",
-                        lambda: {"4106": dict(ENTRY)})
-    daemon.pending_reopens["4106"] = {"entry": dict(ENTRY), "tokens": 1, "state": "delivered"}
-    daemon.maybe_auto_revive({}, 4106)
+                        lambda: {"11722": dict(ENTRY)})
+    daemon.pending_reopens["11722"] = {"entry": dict(ENTRY), "tokens": 1, "state": "delivered"}
+    daemon.maybe_auto_revive({}, 11722)
     assert revived == []
 
 
@@ -411,7 +411,7 @@ def _auto_revive_harness(monkeypatch):
     revived = []
     monkeypatch.setattr(daemon, "revive_one",
                         lambda cfg, tid, entry, **kw: revived.append(str(tid)) or ("resumed", None))
-    monkeypatch.setattr(daemon, "read_registry", lambda: {"4106": dict(ENTRY)})
+    monkeypatch.setattr(daemon, "read_registry", lambda: {"11722": dict(ENTRY)})
     monkeypatch.setattr(daemon.threading, "Thread",
                         lambda target=None, daemon=None, **kw: type(
                             "T", (), {"start": lambda self: target()})())
@@ -425,26 +425,26 @@ def test_once_answered_a_cheap_session_revives_without_asking_again(tmp_path, mo
     _transcript(tmp_path, monkeypatch, [{"cache_read_input_tokens": 20_000}])
     revived = _auto_revive_harness(monkeypatch)
 
-    daemon.maybe_auto_revive({}, 4106)
+    daemon.maybe_auto_revive({}, 11722)
 
-    assert revived == ["4106"]
+    assert revived == ["11722"]
 
 
 def test_a_lost_question_does_not_become_a_silent_full_resume(tmp_path, monkeypatch, sent):
     """Round 2, finding 2 — the strongest one. A3 was enforced only by the in-memory pending
     key, so it lasted exactly as long as that key: after a crash, a failed write, or any
-    restart, the next ordinary message to the still-open topic resumed the entire 360k
+    restart, the next ordinary message to the still-open topic resumed the entire 352k
     context with no question at all. That is the unapproved spend the whole feature exists
     to prevent, reachable by simply typing 'hi'."""
-    _age(_transcript(tmp_path, monkeypatch, [{"cache_read_input_tokens": 360_000}]), 1440)
+    _age(_transcript(tmp_path, monkeypatch, [{"cache_read_input_tokens": 352_556}]), 1440)
     revived = _auto_revive_harness(monkeypatch)
     assert daemon.pending_reopens == {}, "fixture must start with the question already lost"
 
-    daemon.maybe_auto_revive({}, 4106)
+    daemon.maybe_auto_revive({}, 11722)
 
-    assert revived == [], "revived a 360k session without asking, because the record was gone"
-    assert "360,000" in sent[0] and "`compact`" in sent[0]
-    assert daemon.pending_reopens["4106"]["state"] == "delivered"
+    assert revived == [], "revived a 352k session without asking, because the record was gone"
+    assert "352,556" in sent[0] and "`compact`" in sent[0]
+    assert daemon.pending_reopens["11722"]["state"] == "delivered"
 
 
 def test_an_unaskable_large_session_is_not_revived_unasked(tmp_path, monkeypatch):
@@ -453,15 +453,15 @@ def test_an_unaskable_large_session_is_not_revived_unasked(tmp_path, monkeypatch
     Round 2 deliberately revived here, to avoid stranding the session, and wrote a test that
     REQUIRED it — so the suite was green precisely because the prohibition was broken. That
     is the second time a test of mine has enshrined the defect it was meant to catch. A
-    closed or deleted topic has nobody waiting on the session, so the 360k buys nothing, and
+    closed or deleted topic has nobody waiting on the session, so the 352k buys nothing, and
     A3 says "including on restart or ANY error path"."""
-    _age(_transcript(tmp_path, monkeypatch, [{"cache_read_input_tokens": 360_000}]), 1440)
+    _age(_transcript(tmp_path, monkeypatch, [{"cache_read_input_tokens": 352_556}]), 1440)
     revived = _auto_revive_harness(monkeypatch)
     monkeypatch.setattr(daemon, "reply", lambda cfg, tid, text: False)
 
-    daemon.maybe_auto_revive({}, 4106)
+    daemon.maybe_auto_revive({}, 11722)
 
-    assert revived == [], "spent 360k unasked because the question bounced"
+    assert revived == [], "spent 352k unasked because the question bounced"
     assert daemon.pending_reopens == {}, "armed a choice behind a question they never received"
 
 
@@ -475,14 +475,14 @@ def test_a_pending_question_survives_a_restart(tmp_path, monkeypatch):
     monkeypatch.setattr(daemon, "state_path", lambda *p: str(store))
     monkeypatch.setattr(daemon, "_save_pending_reopens", _REAL_SAVE)
     monkeypatch.setattr(daemon, "pending_reopens",
-                        {"4106": {"entry": dict(ENTRY), "tokens": 360_000, "state": "delivered"}})
+                        {"11722": {"entry": dict(ENTRY), "tokens": 352_556, "state": "delivered"}})
 
     daemon._save_pending_reopens()                       # daemon writes it
     assert store.exists(), "the question was never persisted"
 
     monkeypatch.setattr(daemon, "pending_reopens", {})   # daemon restarts
     assert daemon._load_pending_reopens() == {
-        "4106": {"entry": dict(ENTRY), "tokens": 360_000, "state": "delivered"}}
+        "11722": {"entry": dict(ENTRY), "tokens": 352_556, "state": "delivered"}}
 
 
 def _real_worker(tmp_path, monkeypatch, status):
@@ -494,14 +494,14 @@ def _real_worker(tmp_path, monkeypatch, status):
     store = tmp_path / "pending-reopens.json"
     monkeypatch.setattr(daemon, "state_path", lambda *p: str(store))
     monkeypatch.setattr(daemon, "_save_pending_reopens", _REAL_SAVE)
-    monkeypatch.setattr(daemon, "read_registry", lambda: {"4106": dict(ENTRY)})
+    monkeypatch.setattr(daemon, "read_registry", lambda: {"11722": dict(ENTRY)})
     monkeypatch.setattr(daemon, "revive_one",
                         lambda cfg, tid, entry, **kw: (status, None))
     monkeypatch.setattr(daemon.threading, "Thread",
                         lambda target=None, daemon=None, **kw: type(
                             "T", (), {"start": lambda self: target()})())
     monkeypatch.setattr(daemon, "pending_reopens",
-                        {"4106": {"entry": dict(ENTRY), "tokens": 1, "state": "delivered"}})
+                        {"11722": {"entry": dict(ENTRY), "tokens": 1, "state": "delivered"}})
     _REAL_SAVE()                                  # the question is on disk to begin with
     assert daemon._load_pending_reopens() != {}, "fixture did not persist anything"
     return store
@@ -511,7 +511,7 @@ def test_answering_clears_the_persisted_question(tmp_path, monkeypatch, sent):
     # Otherwise a restart after an answer would re-ask a question already acted on.
     _real_worker(tmp_path, monkeypatch, "resumed")
 
-    assert daemon.check_pending_reopen({}, 4106, "compact") is True
+    assert daemon.check_pending_reopen({}, 11722, "compact") is True
     assert daemon.pending_reopens == {}
     assert daemon._load_pending_reopens() == {}, (
         "answered, but the question is still on disk — a restart would re-ask it"
@@ -526,11 +526,11 @@ def test_a_revive_that_fails_inside_the_worker_gives_the_question_back(tmp_path,
     "Resuming…" they could not act on. Answerability must survive a failed worker, on disk."""
     _real_worker(tmp_path, monkeypatch, "failed")
 
-    assert daemon.check_pending_reopen({}, 4106, "compact") is True
-    assert daemon.pending_reopens["4106"]["state"] == "delivered", (
+    assert daemon.check_pending_reopen({}, 11722, "compact") is True
+    assert daemon.pending_reopens["11722"]["state"] == "delivered", (
         "the question is not answerable again after a failed revive"
     )
-    assert daemon._load_pending_reopens()["4106"]["state"] == "delivered", (
+    assert daemon._load_pending_reopens()["11722"]["state"] == "delivered", (
         "re-armed in memory only — a restart would still lose it"
     )
     assert any("still down" in m for m in sent), "failed silently"
@@ -558,7 +558,7 @@ def test_a_large_old_session_is_asked_about(tmp_path, monkeypatch):
     """The True side of the gate, with a REAL age rather than a stubbed one. Every other
     large-session test stubs session_age_minutes or bypasses the gate entirely, so a
     prediction that silently said "no picker" would have gone unnoticed."""
-    _age(_transcript(tmp_path, monkeypatch, [{"cache_read_input_tokens": 360_000}]), 1440)
+    _age(_transcript(tmp_path, monkeypatch, [{"cache_read_input_tokens": 352_556}]), 1440)
     assert daemon._reopen_needs_asking(dict(ENTRY)) is True
 
 
@@ -576,10 +576,10 @@ def test_a_stale_answer_does_not_relaunch_a_replaced_session(monkeypatch, sent):
     monkeypatch.setattr(daemon, "_revive_with_choice",
                         lambda cfg, tid, entry, choice: revived.append(choice) or True)
     monkeypatch.setattr(daemon, "read_registry",
-                        lambda: {"4106": dict(ENTRY, session_id="SID-B")})
-    daemon.pending_reopens["4106"] = {"entry": dict(ENTRY), "tokens": 1, "state": "delivered"}
+                        lambda: {"11722": dict(ENTRY, session_id="SID-B")})
+    daemon.pending_reopens["11722"] = {"entry": dict(ENTRY), "tokens": 1, "state": "delivered"}
 
-    assert daemon.check_pending_reopen({}, 4106, "compact") is True
+    assert daemon.check_pending_reopen({}, 11722, "compact") is True
     assert revived == [], "relaunched a session the topic is no longer bound to"
     assert "no longer the dead session" in sent[-1]
     assert daemon.pending_reopens == {}
@@ -589,11 +589,11 @@ def test_the_question_stays_armed_when_the_revive_will_not_start(monkeypatch, se
     """Finding 3. Consuming the answer first meant a failure after the pop lost both the
     question and their choice, leaving a dead session behind a false 'Resuming…'."""
     monkeypatch.setattr(daemon, "_revive_with_choice", lambda cfg, tid, entry, choice: False)
-    monkeypatch.setattr(daemon, "read_registry", lambda: {"4106": dict(ENTRY)})
-    daemon.pending_reopens["4106"] = {"entry": dict(ENTRY), "tokens": 1, "state": "delivered"}
+    monkeypatch.setattr(daemon, "read_registry", lambda: {"11722": dict(ENTRY)})
+    daemon.pending_reopens["11722"] = {"entry": dict(ENTRY), "tokens": 1, "state": "delivered"}
 
-    assert daemon.check_pending_reopen({}, 4106, "compact") is True
-    assert "4106" in daemon.pending_reopens, "the answer was consumed by a revive that never ran"
+    assert daemon.check_pending_reopen({}, 11722, "compact") is True
+    assert "11722" in daemon.pending_reopens, "the answer was consumed by a revive that never ran"
     assert "still open" in sent[-1]
 
 
@@ -622,7 +622,7 @@ def test_enter_is_withheld_when_the_choice_key_does_not_land(monkeypatch, pane):
 _CFG = {"chat_id": 1, "owner_id": 5}
 
 
-def _msg(text, thread_id=4106, message_id=7):
+def _msg(text, thread_id=11722, message_id=7):
     return {"chat": {"id": 1}, "from": {"id": 5}, "message_id": message_id,
             "message_thread_id": thread_id, "text": text}
 
@@ -639,7 +639,7 @@ def routed(monkeypatch):
     monkeypatch.setattr(daemon, "extract_audio", lambda msg: (None, None))
     # The registry is consulted on every non-answer now (round-2 finding 8 revalidates the
     # re-ask too), so it must be the fixture's, never the live bridge's.
-    monkeypatch.setattr(daemon, "read_registry", lambda: {"4106": dict(ENTRY)})
+    monkeypatch.setattr(daemon, "read_registry", lambda: {"11722": dict(ENTRY)})
     monkeypatch.setattr(daemon, "handle_command",
                         lambda cfg, tid, text: seen["commands"].append(text))
     monkeypatch.setattr(daemon, "interrupt_session",
@@ -652,13 +652,13 @@ def test_a_command_while_the_question_is_open_still_re_asks_it(routed, sent):
     question was open slipped past C4 entirely: neither answered nor re-asked, the question
     sat invisible and the session stayed dead. The command must still run — blocking their
     tooling to enforce a menu is the failure mode this feature already rejected once."""
-    daemon.pending_reopens["4106"] = {"entry": dict(ENTRY), "tokens": 360_000, "state": "delivered"}
+    daemon.pending_reopens["11722"] = {"entry": dict(ENTRY), "tokens": 352_556, "state": "delivered"}
 
     daemon.handle_message(_CFG, _msg("/status"))
 
     assert routed["commands"] == ["/status"], "the command was swallowed by the question"
     assert any("Reopening" in m for m in sent), "C4 breached: the question was not re-asked"
-    assert "4106" in daemon.pending_reopens
+    assert "11722" in daemon.pending_reopens
     # A `/command` is addressed to the DAEMON, not to the session, so it runs now and is not
     # queued for replay. Round 2 read C4 literally and called this a violation; the criterion
     # is about session-bound content, and replaying `/status` into a revived session would be
@@ -669,7 +669,7 @@ def test_a_command_while_the_question_is_open_still_re_asks_it(routed, sent):
 def test_an_interrupt_while_the_question_is_open_still_re_asks_it(routed, sent):
     """Finding 8, the `!` half. There is nothing to interrupt — the session is dead — so the
     one thing that must not happen is silence."""
-    daemon.pending_reopens["4106"] = {"entry": dict(ENTRY), "tokens": 360_000, "state": "delivered"}
+    daemon.pending_reopens["11722"] = {"entry": dict(ENTRY), "tokens": 352_556, "state": "delivered"}
 
     daemon.handle_message(_CFG, _msg("!stop"))
 
@@ -689,8 +689,8 @@ def test_slash_compact_answers_the_question_instead_of_running_a_command(routed,
     revived = []
     monkeypatch.setattr(daemon, "_revive_with_choice",
                         lambda cfg, tid, entry, choice: revived.append(choice) or True)
-    monkeypatch.setattr(daemon, "read_registry", lambda: {"4106": dict(ENTRY)})
-    daemon.pending_reopens["4106"] = {"entry": dict(ENTRY), "tokens": 1, "state": "delivered"}
+    monkeypatch.setattr(daemon, "read_registry", lambda: {"11722": dict(ENTRY)})
+    daemon.pending_reopens["11722"] = {"entry": dict(ENTRY), "tokens": 1, "state": "delivered"}
 
     daemon.handle_message(_CFG, _msg("/compact"))
 
@@ -699,7 +699,7 @@ def test_slash_compact_answers_the_question_instead_of_running_a_command(routed,
     # The handler no longer removes the record — the WORKER does, and only on a revive that
     # actually came up (round 3, finding 5). `reviving` is the honest interim state: it is
     # not answerable, and it is not lost either.
-    assert daemon.pending_reopens["4106"]["state"] == "reviving"
+    assert daemon.pending_reopens["11722"]["state"] == "reviving"
 
 
 def test_a_live_session_still_routes_slash_compact_to_the_command(routed, sent):
@@ -719,7 +719,7 @@ def test_the_persisted_question_is_flushed_before_the_rename(tmp_path, monkeypat
     store = tmp_path / "pending-reopens.json"
     monkeypatch.setattr(daemon, "state_path", lambda *p: str(store))
     monkeypatch.setattr(daemon, "pending_reopens",
-                        {"4106": {"entry": dict(ENTRY), "tokens": 360_000, "state": "delivered"}})
+                        {"11722": {"entry": dict(ENTRY), "tokens": 352_556, "state": "delivered"}})
     order = []
     real_fsync, real_replace = os.fsync, os.replace
     monkeypatch.setattr(os, "fsync", lambda fd: (order.append("fsync"), real_fsync(fd))[1])
@@ -730,7 +730,7 @@ def test_the_persisted_question_is_flushed_before_the_rename(tmp_path, monkeypat
     assert "fsync" in order, "the bytes were never flushed — a crash loses the question"
     assert order.index("fsync") < order.index("replace"), (
         "renamed before flushing, so the atomic swap can publish an empty file")
-    assert json.loads(store.read_text())["4106"]["tokens"] == 360_000
+    assert json.loads(store.read_text())["11722"]["tokens"] == 352_556
 
 
 def test_a_failed_write_reports_failure_and_leaves_no_half_file(tmp_path, monkeypatch):
@@ -738,7 +738,7 @@ def test_a_failed_write_reports_failure_and_leaves_no_half_file(tmp_path, monkey
     tell a persisted question from a lost one."""
     store = tmp_path / "no-such-dir" / "pending-reopens.json"
     monkeypatch.setattr(daemon, "state_path", lambda *p: str(store))
-    monkeypatch.setattr(daemon, "pending_reopens", {"4106": {"entry": dict(ENTRY), "state": "delivered"}})
+    monkeypatch.setattr(daemon, "pending_reopens", {"11722": {"entry": dict(ENTRY), "state": "delivered"}})
 
     assert _REAL_SAVE() is False
     assert not (tmp_path / "no-such-dir").exists(), "left a partial write behind"
@@ -752,8 +752,8 @@ def test_a_question_that_cannot_be_persisted_is_armed_and_says_so(tmp_path, monk
     _transcript(tmp_path, monkeypatch, [{"input_tokens": 1}])
     monkeypatch.setattr(daemon, "_save_pending_reopens", lambda: False)
 
-    assert daemon.offer_reopen_choice({}, 4106, ENTRY) is True
-    assert "4106" in daemon.pending_reopens, "disarmed a question they can already see"
+    assert daemon.offer_reopen_choice({}, 11722, ENTRY) is True
+    assert "11722" in daemon.pending_reopens, "disarmed a question they can already see"
     assert "could not write" in sent[-1].lower()
     assert "close and reopen" in sent[-1].lower()
 
@@ -761,7 +761,7 @@ def test_a_question_that_cannot_be_persisted_is_armed_and_says_so(tmp_path, monk
 def test_a_persisted_question_says_nothing_extra(tmp_path, monkeypatch, sent):
     """The caveat must be the exception, not a permanent footnote on every question."""
     _transcript(tmp_path, monkeypatch, [{"input_tokens": 1}])
-    assert daemon.offer_reopen_choice({}, 4106, ENTRY) is True
+    assert daemon.offer_reopen_choice({}, 11722, ENTRY) is True
     assert len(sent) == 1, f"extra message on the happy path: {sent[1:]}"
 
 
@@ -773,7 +773,7 @@ def _revive_harness(monkeypatch, registry, picker="answered"):
     seen = {"reopened": [], "settle": [], "notices": []}
     monkeypatch.setattr(daemon, "_tmux",
                         lambda argv, **kw: type("R", (), {"returncode": 1, "stdout": ""})())
-    monkeypatch.setattr(daemon, "launch_pane", lambda *a, **k: ("%12", None))
+    monkeypatch.setattr(daemon, "launch_pane", lambda *a, **k: ("%77", None))
     monkeypatch.setattr(daemon, "answer_resume_picker", lambda pane, choice, **k: picker)
     monkeypatch.setattr(daemon, "read_registry", lambda: registry)
     monkeypatch.setattr(daemon, "reopen_topic",
@@ -793,10 +793,10 @@ def test_a_close_during_the_revive_is_not_undone(monkeypatch):
     """Finding 9. A revive is not instantaneous — answering the picker alone can hold it for
     RESUME_MODAL_WAIT — and a close inside that window was silently reversed by revive_one's
     own reopen_topic. A close is the one gesture that must never be overridden."""
-    registry = {"4106": dict(ENTRY, closed=True)}
+    registry = {"11722": dict(ENTRY, closed=True)}
     seen = _revive_harness(monkeypatch, registry)
 
-    status, _task = daemon.revive_one({}, "4106", dict(ENTRY), cause="auto",
+    status, _task = daemon.revive_one({}, "11722", dict(ENTRY), cause="auto",
                                       resume_choice="compact", respect_close=True)
 
     assert seen["reopened"] == [], "reopened a topic they had just closed"
@@ -807,22 +807,22 @@ def test_a_close_during_the_revive_is_not_undone(monkeypatch):
 def test_boot_restore_still_reopens_a_closed_topic(monkeypatch):
     """The guard is scoped. On boot, a closed topic is what a reboot left behind, not a
     decision — #161 restore must still bring it back."""
-    registry = {"4106": dict(ENTRY, closed=True)}
+    registry = {"11722": dict(ENTRY, closed=True)}
     seen = _revive_harness(monkeypatch, registry, picker="absent")
 
-    daemon.revive_one({}, "4106", dict(ENTRY), cause="boot")
+    daemon.revive_one({}, "11722", dict(ENTRY), cause="boot")
 
-    assert seen["reopened"] == ["4106"]
+    assert seen["reopened"] == ["11722"]
 
 
 def test_a_compact_resume_waits_out_the_compaction_before_briefing(monkeypatch):
     """The briefing window is sized for a plain resume, but a `compact` answer drops Claude
-    straight into compaction. Measurement found compaction took 110 seconds against a
-    20-second window. The briefing was skipped, the
+    straight into compaction. Measured on topic 11722 (2026-08-25): picker answered 15:56:31,
+    compaction finished 15:58:21 — 110s against a 20s window. The briefing was skipped, the
     listener never armed, and the session sat dark until it was nudged by hand."""
-    seen = _revive_harness(monkeypatch, {"4106": dict(ENTRY)})
+    seen = _revive_harness(monkeypatch, {"11722": dict(ENTRY)})
 
-    daemon.revive_one({}, "4106", dict(ENTRY), cause="auto", resume_choice="compact")
+    daemon.revive_one({}, "11722", dict(ENTRY), cause="auto", resume_choice="compact")
 
     assert seen["settle"] == [daemon.COMPACT_SETTLE]
     assert daemon.COMPACT_SETTLE > 110, "shorter than a measured compaction"
@@ -830,9 +830,9 @@ def test_a_compact_resume_waits_out_the_compaction_before_briefing(monkeypatch):
 
 def test_a_full_resume_keeps_the_ordinary_briefing_window(monkeypatch):
     """No compaction runs, so the long wait would only delay every ordinary revive."""
-    seen = _revive_harness(monkeypatch, {"4106": dict(ENTRY)})
+    seen = _revive_harness(monkeypatch, {"11722": dict(ENTRY)})
 
-    daemon.revive_one({}, "4106", dict(ENTRY), cause="auto", resume_choice="full")
+    daemon.revive_one({}, "11722", dict(ENTRY), cause="auto", resume_choice="full")
 
     assert seen["settle"] == [None]
 
@@ -840,9 +840,9 @@ def test_a_full_resume_keeps_the_ordinary_briefing_window(monkeypatch):
 def test_an_unapplied_compact_choice_keeps_the_ordinary_window(monkeypatch):
     """If the picker was never answered, nothing is compacting — waiting ten minutes for an
     idle pane that is already idle just delays the briefing."""
-    seen = _revive_harness(monkeypatch, {"4106": dict(ENTRY)}, picker="absent")
+    seen = _revive_harness(monkeypatch, {"11722": dict(ENTRY)}, picker="absent")
 
-    daemon.revive_one({}, "4106", dict(ENTRY), cause="auto", resume_choice="compact")
+    daemon.revive_one({}, "11722", dict(ENTRY), cause="auto", resume_choice="compact")
 
     assert seen["settle"] == [None]
 
@@ -853,42 +853,42 @@ def test_an_unapplied_compact_choice_keeps_the_ordinary_window(monkeypatch):
 def test_a_sigil_message_is_never_an_answer(answer, word):
     """Round 3, finding 3. `.strip(".!?")` takes characters off BOTH ends, so the round-2
     "exact spellings only" fix did not hold: `!fully` still came out as `fully` and
-    authorised the 360k full resume. That is C4 (their message was consumed, not delivered)
+    authorised the 352k full resume. That is C4 (their message was consumed, not delivered)
     and A3 (an expensive resume with no explicit answer) in one line of punctuation."""
     arm, calls = answer
     arm()
-    assert daemon.check_pending_reopen({}, 4106, word) is False
+    assert daemon.check_pending_reopen({}, 11722, word) is False
     assert calls["full"] == [] and calls["compact"] == []
-    assert "4106" in daemon.pending_reopens, "consumed the question on a non-answer"
+    assert "11722" in daemon.pending_reopens, "consumed the question on a non-answer"
 
 
 def test_the_real_answers_still_work_after_the_punctuation_fix(answer):
     arm, calls = answer
     arm()
-    assert daemon.check_pending_reopen({}, 4106, "compact!") is True
-    assert calls["compact"] == ["4106"]
+    assert daemon.check_pending_reopen({}, 11722, "compact!") is True
+    assert calls["compact"] == ["11722"]
 
 
 def test_a_prepared_question_is_re_asked_at_startup(tmp_path, monkeypatch, sent):
     """Round 2, finding 1's other half. A `prepared` record means the daemon died between
     persisting the question and delivering it. It blocks the auto-revive but cannot be
     answered, so without this it is a dead end with no way out but a human noticing."""
-    monkeypatch.setattr(daemon, "read_registry", lambda: {"4106": dict(ENTRY)})
+    monkeypatch.setattr(daemon, "read_registry", lambda: {"11722": dict(ENTRY)})
     monkeypatch.setattr(daemon, "pending_reopens",
-                        {"4106": {"entry": dict(ENTRY), "tokens": 360_000,
+                        {"11722": {"entry": dict(ENTRY), "tokens": 352_556,
                                    "state": "prepared"}})
 
     daemon.resend_undelivered_reopen_questions({})
 
-    assert any("360,000" in m for m in sent), "the question was never re-delivered"
-    assert daemon.pending_reopens["4106"]["state"] == "delivered"
+    assert any("352,556" in m for m in sent), "the question was never re-delivered"
+    assert daemon.pending_reopens["11722"]["state"] == "delivered"
 
 
 def test_startup_drops_a_prepared_question_for_a_topic_that_moved_on(tmp_path, monkeypatch,
                                                                      sent):
     monkeypatch.setattr(daemon, "read_registry", lambda: {})   # no longer a dead session
     monkeypatch.setattr(daemon, "pending_reopens",
-                        {"4106": {"entry": dict(ENTRY), "state": "prepared"}})
+                        {"11722": {"entry": dict(ENTRY), "state": "prepared"}})
 
     daemon.resend_undelivered_reopen_questions({})
 
@@ -906,8 +906,8 @@ def test_a_send_that_raises_still_leaves_an_answerable_question(tmp_path, monkey
 
     monkeypatch.setattr(daemon, "reply", _boom)
 
-    assert daemon.offer_reopen_choice({}, 4106, ENTRY) is True
-    assert daemon.pending_reopens["4106"]["state"] == "delivered", (
+    assert daemon.offer_reopen_choice({}, 11722, ENTRY) is True
+    assert daemon.pending_reopens["11722"]["state"] == "delivered", (
         "an ambiguous send left the question unanswerable until the daemon restarts"
     )
 
@@ -972,7 +972,7 @@ def test_a_stale_carry_forward_does_not_eat_the_reopen_answer(routed, sent, monk
     revived = []
     monkeypatch.setattr(daemon, "_revive_with_choice",
                         lambda cfg, tid, entry, choice: revived.append(choice) or True)
-    daemon.pending_reopens["4106"] = {"entry": dict(ENTRY), "tokens": 1, "state": "delivered"}
+    daemon.pending_reopens["11722"] = {"entry": dict(ENTRY), "tokens": 1, "state": "delivered"}
 
     daemon.handle_message(_CFG, _msg("compact"))
 
@@ -1032,7 +1032,7 @@ def test_a_live_carry_forward_is_still_haltable_while_a_revive_is_running(routed
     monkeypatch.setattr(daemon, "carry_forward_active", lambda tid: True)
     monkeypatch.setattr(daemon, "halt_carry_forward",
                         lambda *a, **k: halted.append(a) or True)
-    daemon.pending_reopens["4106"] = {"entry": dict(ENTRY), "tokens": 1, "state": "reviving"}
+    daemon.pending_reopens["11722"] = {"entry": dict(ENTRY), "tokens": 1, "state": "reviving"}
 
     daemon.handle_message(_CFG, _msg("stop runaway"))
 
@@ -1045,27 +1045,27 @@ def test_a_prepared_question_does_not_disarm_the_kill_switch_either(routed, sent
     monkeypatch.setattr(daemon, "carry_forward_active", lambda tid: True)
     monkeypatch.setattr(daemon, "halt_carry_forward",
                         lambda *a, **k: halted.append(a) or True)
-    daemon.pending_reopens["4106"] = {"entry": dict(ENTRY), "tokens": 1, "state": "prepared"}
+    daemon.pending_reopens["11722"] = {"entry": dict(ENTRY), "tokens": 1, "state": "prepared"}
 
     daemon.handle_message(_CFG, _msg("stop runaway"))
 
     assert len(halted) == 1
 # ---- #198: a topic whose session was never recorded ----------------------------
 
-# The shape that actually occurs: ended entries without session ids also lack an engine,
-# because snapshot_once discarded it and cannot backfill an ended entry. Tests written with
-# engine="codex" never exercised that case.
-NO_SID = {"name": "test-theme", "pane": "%14",
-          "ended": "2000-01-01T00:00:00+0000", "session_id": None}
+# The shape that ACTUALLY occurs: all 9 ended/no-session-id entries in the live registry —
+# topic 15569 included — also have NO engine, because snapshot_once discarded it and cannot
+# backfill an ended entry. Tests written with engine="codex" never exercised the real case.
+NO_SID = {"name": "test-theme", "pane": "%162",
+          "ended": "2026-08-26T11:24:22+0000", "session_id": None}
 NO_SID_CODEX = dict(NO_SID, engine="codex")
 
 
 def test_a_codex_session_killed_before_its_first_turn_is_unrevivable():
-    """The observed failure. Codex does not open its rollout-*.jsonl —
+    """The live failure, 2026-08-26 topic 15569. Codex does not open its rollout-*.jsonl —
     and codex_session_id_for_pane reads the id from that open fd — until it has answered
-    something. Repeated samples before a first turn return None; an id appears only after a
-    turn completes. A session killed before that point therefore has no session_id, and
-    should_auto_revive rejects it."""
+    something. Measured: eight samples over two minutes returned None, then one real turn
+    produced an id within 10s. So a session killed two minutes after spawning has no
+    session_id at all, and should_auto_revive rejects it."""
     assert daemon.should_auto_revive(dict(NO_SID)) is False
     assert daemon.unrevivable_reason(dict(NO_SID)) == "no-session-id"
 
@@ -1081,9 +1081,9 @@ def test_reopening_an_unrevivable_topic_says_so_instead_of_nothing(monkeypatch, 
     """The defect the owner actually hit: they reopened the topic to demo the revive and got
     silence. A topic that is open while its session is gone, with nothing said, is the exact
     dead end #195 exists to remove — reached from a different direction."""
-    monkeypatch.setattr(daemon, "read_registry", lambda: {"4105": dict(NO_SID)})
+    monkeypatch.setattr(daemon, "read_registry", lambda: {"15569": dict(NO_SID)})
     # handle_message records the open/closed state BEFORE anything else, through the real
-    # registry writer. Unstubbed, this test wrote topic 4105's live production entry — and
+    # registry writer. Unstubbed, this test wrote topic 15569's live production entry — and
     # failed outright with EROFS where that directory is read-only, i.e. it reported on the
     # environment rather than on the code. Same trap as round 2's finding 9.
     monkeypatch.setattr(daemon, "set_topic_closed", lambda tid, closed: None)
@@ -1093,24 +1093,24 @@ def test_reopening_an_unrevivable_topic_says_so_instead_of_nothing(monkeypatch, 
                         lambda cfg, tid: revived.append(str(tid)))
 
     daemon.handle_message(_CFG, {"chat": {"id": 1}, "from": {"id": 5}, "message_id": 3,
-                                 "message_thread_id": 4105, "forum_topic_reopened": {}})
+                                 "message_thread_id": 15569, "forum_topic_reopened": {}})
 
     assert sent, "reopening an unrevivable topic said nothing at all"
     assert "nothing to resume" in sent[0]
     assert revived == [], "tried to resume a session that does not exist"
-    assert daemon.pending_reopens["4105"]["kind"] == "fresh"
+    assert daemon.pending_reopens["15569"]["kind"] == "fresh"
     # No engine recorded — so it must NOT offer a bare `fresh`, which would guess.
     assert "will not guess" in sent[0]
     assert "`fresh codex`" in sent[0] and "`fresh claude`" in sent[0]
 
 
 def test_a_known_codex_topic_is_offered_a_bare_fresh_and_the_likely_cause(monkeypatch, sent):
-    monkeypatch.setattr(daemon, "read_registry", lambda: {"4105": dict(NO_SID_CODEX)})
+    monkeypatch.setattr(daemon, "read_registry", lambda: {"15569": dict(NO_SID_CODEX)})
     monkeypatch.setattr(daemon, "set_topic_closed", lambda tid, closed: None)
     monkeypatch.setattr(daemon, "update_registry", lambda fn: None)
 
     daemon.handle_message(_CFG, {"chat": {"id": 1}, "from": {"id": 5}, "message_id": 3,
-                                 "message_thread_id": 4105, "forum_topic_reopened": {}})
+                                 "message_thread_id": 15569, "forum_topic_reopened": {}})
 
     assert "`fresh` to start a NEW codex session" in sent[0]
     # ...and the cause is offered as the likely explanation, not asserted as established
@@ -1119,26 +1119,27 @@ def test_a_known_codex_topic_is_offered_a_bare_fresh_and_the_likely_cause(monkey
 
 
 def test_an_unknown_engine_is_never_guessed(monkeypatch, sent):
-    """The blocker. Ended id-less entries also have no engine, because snapshot_once
-    discarded it and cannot backfill an ended entry. A bare `fresh` there would launch Claude
-    for a Codex topic and permanently rebind that topic to the wrong engine."""
-    monkeypatch.setattr(daemon, "read_registry", lambda: {"4105": dict(NO_SID)})
+    """The blocker. All 9 ended id-less entries in the live registry — including the topic
+    the owner actually hit — have NO engine, because snapshot_once discarded it and cannot backfill
+    an ended entry. A bare `fresh` there would have launched Claude for their Codex topic and
+    rebound the topic to Claude permanently."""
+    monkeypatch.setattr(daemon, "read_registry", lambda: {"15569": dict(NO_SID)})
     started = []
     monkeypatch.setattr(daemon, "_start_fresh_session",
                         lambda cfg, tid, entry: started.append(entry.get("engine")) or True)
-    daemon.pending_reopens["4105"] = {"entry": dict(NO_SID), "tokens": None,
+    daemon.pending_reopens["15569"] = {"entry": dict(NO_SID), "tokens": None,
                                        "state": "delivered", "kind": "fresh"}
 
-    assert daemon.check_pending_reopen({}, 4105, "fresh") is False
+    assert daemon.check_pending_reopen({}, 15569, "fresh") is False
     assert started == [], "guessed an engine for a topic that has none recorded"
     assert "will not guess" in sent[-1]
 
-    assert daemon.check_pending_reopen({}, 4105, "fresh codex") is True
+    assert daemon.check_pending_reopen({}, 15569, "fresh codex") is True
     assert started == ["codex"], "did not use the engine they named"
 
 
 def test_answering_fresh_starts_a_new_session_in_the_same_topic(monkeypatch, sent):
-    monkeypatch.setattr(daemon, "read_registry", lambda: {"4105": dict(NO_SID_CODEX)})
+    monkeypatch.setattr(daemon, "read_registry", lambda: {"15569": dict(NO_SID_CODEX)})
     started = {}
     monkeypatch.setattr(daemon, "revive_one",
                         lambda cfg, tid, entry, **kw: (started.update(kw, tid=str(tid))
@@ -1146,12 +1147,12 @@ def test_answering_fresh_starts_a_new_session_in_the_same_topic(monkeypatch, sen
     monkeypatch.setattr(daemon.threading, "Thread",
                         lambda target=None, daemon=None, **kw: type(
                             "T", (), {"start": lambda self: target()})())
-    daemon.pending_reopens["4105"] = {"entry": dict(NO_SID_CODEX), "tokens": None,
+    daemon.pending_reopens["15569"] = {"entry": dict(NO_SID_CODEX), "tokens": None,
                                        "state": "delivered", "kind": "fresh"}
 
-    assert daemon.check_pending_reopen({}, 4105, "fresh") is True
+    assert daemon.check_pending_reopen({}, 15569, "fresh") is True
 
-    assert started.get("tid") == "4105"
+    assert started.get("tid") == "15569"
     assert started.get("fresh") is True, "resumed instead of starting fresh"
     assert started.get("fresh_requested") is True, (
         "a fresh session they ASKED for must not be described to it as a fallback"
@@ -1160,44 +1161,44 @@ def test_answering_fresh_starts_a_new_session_in_the_same_topic(monkeypatch, sen
 
 
 def test_a_non_answer_re_asks_the_fresh_question_and_is_still_delivered(monkeypatch, sent):
-    monkeypatch.setattr(daemon, "read_registry", lambda: {"4105": dict(NO_SID)})
-    daemon.pending_reopens["4105"] = {"entry": dict(NO_SID), "tokens": None,
+    monkeypatch.setattr(daemon, "read_registry", lambda: {"15569": dict(NO_SID)})
+    daemon.pending_reopens["15569"] = {"entry": dict(NO_SID), "tokens": None,
                                        "state": "delivered", "kind": "fresh"}
 
-    assert daemon.check_pending_reopen({}, 4105, "what happened?") is False
+    assert daemon.check_pending_reopen({}, 15569, "what happened?") is False
     assert "nothing to resume" in sent[-1]
-    assert daemon.pending_reopens["4105"]["kind"] == "fresh", "dropped the question"
+    assert daemon.pending_reopens["15569"]["kind"] == "fresh", "dropped the question"
 
 
 def test_a_fresh_question_is_never_answered_by_a_resume_word(monkeypatch, sent):
     """`compact` and `full` mean nothing here — there is no context to compact. Sharing the
     resume path would also have destroyed these: it validates with should_auto_revive, which
     is False for these entries by definition."""
-    monkeypatch.setattr(daemon, "read_registry", lambda: {"4105": dict(NO_SID)})
+    monkeypatch.setattr(daemon, "read_registry", lambda: {"15569": dict(NO_SID)})
     revived = []
     monkeypatch.setattr(daemon, "_revive_with_choice",
                         lambda cfg, tid, entry, choice: revived.append(choice) or True)
-    daemon.pending_reopens["4105"] = {"entry": dict(NO_SID), "tokens": None,
+    daemon.pending_reopens["15569"] = {"entry": dict(NO_SID), "tokens": None,
                                        "state": "delivered", "kind": "fresh"}
 
-    assert daemon.check_pending_reopen({}, 4105, "compact") is False
+    assert daemon.check_pending_reopen({}, 15569, "compact") is False
     assert revived == []
-    assert daemon.pending_reopens["4105"]["kind"] == "fresh"
+    assert daemon.pending_reopens["15569"]["kind"] == "fresh"
 
 
 def test_a_prepared_fresh_question_survives_a_restart(monkeypatch, sent):
     """The startup resend validated every record with should_auto_revive, which rejects these
     entries by definition — so it would have silently dropped exactly the questions this
     branch exists for, and re-worded the rest as a resume choice."""
-    monkeypatch.setattr(daemon, "read_registry", lambda: {"4105": dict(NO_SID)})
+    monkeypatch.setattr(daemon, "read_registry", lambda: {"15569": dict(NO_SID)})
     monkeypatch.setattr(daemon, "pending_reopens",
-                        {"4105": {"entry": dict(NO_SID), "state": "prepared",
+                        {"15569": {"entry": dict(NO_SID), "state": "prepared",
                                    "kind": "fresh"}})
 
     daemon.resend_undelivered_reopen_questions({})
 
     assert sent and "nothing to resume" in sent[0], "dropped or mis-worded on restart"
-    assert daemon.pending_reopens["4105"]["state"] == "delivered"
+    assert daemon.pending_reopens["15569"]["state"] == "delivered"
 
 
 def test_a_failed_fresh_start_stays_a_fresh_question(monkeypatch, sent):
@@ -1206,17 +1207,17 @@ def test_a_failed_fresh_start_stays_a_fresh_question(monkeypatch, sent):
     entered the resume branch, failed should_auto_revive — which rejects these entries by
     definition — and was discarded as "the topic changed". Neither answerable by the word it
     advertised nor revivable by the path it had switched to."""
-    monkeypatch.setattr(daemon, "read_registry", lambda: {"4105": dict(NO_SID_CODEX)})
+    monkeypatch.setattr(daemon, "read_registry", lambda: {"15569": dict(NO_SID_CODEX)})
     monkeypatch.setattr(daemon, "revive_one", lambda cfg, tid, entry, **kw: ("failed", None))
     monkeypatch.setattr(daemon.threading, "Thread",
                         lambda target=None, daemon=None, **kw: type(
                             "T", (), {"start": lambda self: target()})())
-    daemon.pending_reopens["4105"] = {"entry": dict(NO_SID_CODEX), "tokens": None,
+    daemon.pending_reopens["15569"] = {"entry": dict(NO_SID_CODEX), "tokens": None,
                                        "state": "delivered", "kind": "fresh"}
 
-    assert daemon.check_pending_reopen({}, 4105, "fresh") is True
+    assert daemon.check_pending_reopen({}, 15569, "fresh") is True
 
-    rec = daemon.pending_reopens["4105"]
+    rec = daemon.pending_reopens["15569"]
     assert rec["kind"] == "fresh", "a failed fresh start turned into a resume question"
     assert rec["state"] == "delivered", "left unanswerable after the failure"
     assert any("reply `fresh` to retry" in m.lower() for m in sent)
@@ -1224,18 +1225,18 @@ def test_a_failed_fresh_start_stays_a_fresh_question(monkeypatch, sent):
 
 def test_a_retry_after_a_failed_fresh_start_reaches_the_fresh_launcher(monkeypatch, sent):
     """The half that proves the record is still USABLE, not merely still labelled."""
-    monkeypatch.setattr(daemon, "read_registry", lambda: {"4105": dict(NO_SID_CODEX)})
+    monkeypatch.setattr(daemon, "read_registry", lambda: {"15569": dict(NO_SID_CODEX)})
     started = []
     monkeypatch.setattr(daemon, "_start_fresh_session",
                         lambda cfg, tid, entry: started.append(entry.get("engine")) or True)
     # Start from a REAL fresh record and let the re-arm rebuild it. Hand-writing `kind` here
     # would prove only that a corrected record routes, which is not the claim (round 2).
-    daemon.pending_reopens["4105"] = {"entry": dict(NO_SID_CODEX), "tokens": None,
+    daemon.pending_reopens["15569"] = {"entry": dict(NO_SID_CODEX), "tokens": None,
                                        "state": "reviving", "kind": "fresh"}
-    daemon._rearm_after_failed_revive({}, "4105", dict(NO_SID_CODEX))
+    daemon._rearm_after_failed_revive({}, "15569", dict(NO_SID_CODEX))
 
-    assert daemon.pending_reopens["4105"]["kind"] == "fresh"
-    assert daemon.check_pending_reopen({}, 4105, "fresh") is True
+    assert daemon.pending_reopens["15569"]["kind"] == "fresh"
+    assert daemon.check_pending_reopen({}, 15569, "fresh") is True
     assert started == ["codex"]
 
 
@@ -1250,8 +1251,8 @@ def test_a_stale_fresh_record_cannot_disarm_the_kill_switch(routed, sent, monkey
     monkeypatch.setattr(daemon, "halt_carry_forward",
                         lambda *a, **k: halted.append(a) or True)
     # The topic was rebound to a live, resumable session after the question was asked.
-    monkeypatch.setattr(daemon, "read_registry", lambda: {"4106": dict(ENTRY)})
-    daemon.pending_reopens["4106"] = {"entry": dict(NO_SID), "tokens": None,
+    monkeypatch.setattr(daemon, "read_registry", lambda: {"11722": dict(ENTRY)})
+    daemon.pending_reopens["11722"] = {"entry": dict(NO_SID), "tokens": None,
                                        "state": "delivered", "kind": "fresh"}
 
     daemon.handle_message(_CFG, _msg("stop runaway"))
@@ -1264,11 +1265,11 @@ def test_a_stale_fresh_record_cannot_disarm_the_kill_switch(routed, sent, monkey
 
 def test_a_stale_fresh_record_is_dropped_on_a_non_answer_too(monkeypatch, sent):
     """Validation must run before BOTH branches, not only the answer one."""
-    monkeypatch.setattr(daemon, "read_registry", lambda: {"4105": dict(ENTRY)})
-    daemon.pending_reopens["4105"] = {"entry": dict(NO_SID), "tokens": None,
+    monkeypatch.setattr(daemon, "read_registry", lambda: {"15569": dict(ENTRY)})
+    daemon.pending_reopens["15569"] = {"entry": dict(NO_SID), "tokens": None,
                                        "state": "delivered", "kind": "fresh"}
 
-    assert daemon.check_pending_reopen({}, 4105, "anything at all") is False
+    assert daemon.check_pending_reopen({}, 15569, "anything at all") is False
     assert daemon.pending_reopens == {}
     assert "changed since I asked" in sent[-1]
 
@@ -1302,12 +1303,12 @@ def test_the_stale_branch_uses_the_same_parser_as_the_live_branch(monkeypatch, s
     """Review round 2, regression 2. The two branches disagreed: `fresh idea` was consumed
     and LOST by the stale branch while the live branch rejected it, and `new codex` was an
     answer to the live branch but ordinary text to the stale one."""
-    monkeypatch.setattr(daemon, "read_registry", lambda: {"4105": dict(ENTRY)})  # moved on
+    monkeypatch.setattr(daemon, "read_registry", lambda: {"15569": dict(ENTRY)})  # moved on
 
     for word, consumed in (("fresh idea", False), ("new codex", True), ("fresh", True)):
-        daemon.pending_reopens["4105"] = {"entry": dict(NO_SID_CODEX), "tokens": None,
+        daemon.pending_reopens["15569"] = {"entry": dict(NO_SID_CODEX), "tokens": None,
                                            "state": "delivered", "kind": "fresh"}
-        assert daemon.check_pending_reopen({}, 4105, word) is consumed, (
+        assert daemon.check_pending_reopen({}, 15569, word) is consumed, (
             f"{word!r}: stale branch disagreed with the live parser"
         )
 
@@ -1317,15 +1318,15 @@ def test_a_different_dead_session_in_the_same_topic_is_not_the_one_we_asked_abou
     """Review round 2. unrevivable_reason alone is not identity — another ended, id-less
     session in the same topic satisfies it just as well, so a replaced binding read as
     unchanged. `ended` is the discriminator the resume path gets from `session_id`."""
-    replaced = dict(NO_SID_CODEX, ended="2000-01-02T00:00:00+0000")
-    monkeypatch.setattr(daemon, "read_registry", lambda: {"4105": replaced})
+    replaced = dict(NO_SID_CODEX, ended="2026-08-26T19:00:00+0000")
+    monkeypatch.setattr(daemon, "read_registry", lambda: {"15569": replaced})
     started = []
     monkeypatch.setattr(daemon, "_start_fresh_session",
                         lambda cfg, tid, entry: started.append(entry) or True)
-    daemon.pending_reopens["4105"] = {"entry": dict(NO_SID_CODEX), "tokens": None,
+    daemon.pending_reopens["15569"] = {"entry": dict(NO_SID_CODEX), "tokens": None,
                                        "state": "delivered", "kind": "fresh"}
 
-    assert daemon.check_pending_reopen({}, 4105, "fresh") is True
+    assert daemon.check_pending_reopen({}, 15569, "fresh") is True
     assert started == [], "restarted a topic whose session had already been replaced"
     assert "changed since I asked" in sent[-1]
 
@@ -1338,12 +1339,12 @@ def test_a_current_question_still_exempts_the_kill_switch(routed, sent, monkeypa
     monkeypatch.setattr(daemon, "carry_forward_active", lambda tid: True)
     monkeypatch.setattr(daemon, "halt_carry_forward",
                         lambda *a, **k: halted.append(a) or True)
-    monkeypatch.setattr(daemon, "read_registry", lambda: {"4106": dict(NO_SID_CODEX)})
+    monkeypatch.setattr(daemon, "read_registry", lambda: {"11722": dict(NO_SID_CODEX)})
     # The non-answer falls through to inbox routing, which resolves a REAL path under
-    # ~/.local/share/claude-telegram-bridge and creates topics/4106 there. conftest isolates
+    # ~/.local/share/agent-telegram-bridge and creates topics/11722 there. conftest isolates
     # only the `panes` subtree (round 3, low finding).
     monkeypatch.setattr(daemon, "state_path", lambda *p: str(tmp_path.joinpath(*p)))
-    daemon.pending_reopens["4106"] = {"entry": dict(NO_SID_CODEX), "tokens": None,
+    daemon.pending_reopens["11722"] = {"entry": dict(NO_SID_CODEX), "tokens": None,
                                        "state": "delivered", "kind": "fresh"}
 
     daemon.handle_message(_CFG, _msg("hello?"))
@@ -1366,7 +1367,7 @@ def test_a_broken_registry_read_still_halts_a_carry_forward(routed, sent, monkey
         raise OSError("registry unavailable")
 
     monkeypatch.setattr(daemon, "read_registry", _boom)
-    daemon.pending_reopens["4106"] = {"entry": dict(NO_SID_CODEX), "tokens": None,
+    daemon.pending_reopens["11722"] = {"entry": dict(NO_SID_CODEX), "tokens": None,
                                        "state": "delivered", "kind": "fresh"}
 
     daemon.handle_message(_CFG, _msg("stop runaway"))
@@ -1413,7 +1414,7 @@ def _briefing_pane(monkeypatch, compacting, busy=None):
     monkeypatch.setattr(daemon, "pane_is_idle", lambda pane: not _at(busy))
     monkeypatch.setattr(daemon, "pane_alive", lambda pane: True)
     monkeypatch.setattr(daemon, "has_live_recv", lambda tid: False)
-    monkeypatch.setattr(daemon, "read_registry", lambda: {"4107": {"pane": "%15"}})
+    monkeypatch.setattr(daemon, "read_registry", lambda: {"12999": {"pane": "%178"}})
     monkeypatch.setattr(daemon, "current_boot_id", lambda: "boot-x")
     monkeypatch.setattr(daemon, "update_registry", lambda fn: None)
     monkeypatch.setattr(daemon, "time", _FastTime())
@@ -1436,7 +1437,7 @@ def test_a_compact_briefing_is_not_typed_into_the_pre_compaction_gap(monkeypatch
     # not compacting (the gap), then compacting, then done and staying idle.
     seen = _briefing_pane(monkeypatch, [False, True, True, False, False, False, False])
 
-    daemon.deliver_briefing("%15", "4107", "claude", "brief {tid}",
+    daemon.deliver_briefing("%178", "12999", "claude", "brief {tid}",
                             await_busy=True, settle=daemon.COMPACT_SETTLE)
 
     assert seen["typed_at"] is not None, "never briefed at all"
@@ -1451,7 +1452,7 @@ def test_a_single_idle_repaint_during_compaction_does_not_release_the_briefing(m
     seen = _briefing_pane(monkeypatch,
                           [True, False, True, False, True, False, False, False, False])
 
-    daemon.deliver_briefing("%15", "4107", "claude", "brief {tid}",
+    daemon.deliver_briefing("%178", "12999", "claude", "brief {tid}",
                             await_busy=True, settle=daemon.COMPACT_SETTLE)
 
     assert seen["typed_at"] is None or seen["typed_at"] >= 8, (
@@ -1468,7 +1469,7 @@ def test_a_capture_error_is_not_mistaken_for_compaction_starting(monkeypatch):
     seen = _briefing_pane(monkeypatch, [False] * 60,
                           busy=[True] + [False] * 59)
 
-    daemon.deliver_briefing("%15", "4107", "claude", "brief {tid}",
+    daemon.deliver_briefing("%178", "12999", "claude", "brief {tid}",
                             await_busy=True, settle=daemon.COMPACT_SETTLE)
 
     assert seen["typed_at"] is not None, "a capture blip stranded the briefing entirely"
@@ -1483,11 +1484,11 @@ def test_a_capture_error_is_not_mistaken_for_compaction_starting(monkeypatch):
 
 def test_a_compaction_that_outlasts_the_window_retries_instead_of_going_dark(monkeypatch):
     """Review finding 3. The old code fell through to the ordinary 20s wait, returned without
-    typing, and scheduled NOTHING — which is exactly how topic 4107 was left dark: its retry
+    typing, and scheduled NOTHING — which is exactly how topic 12999 was left dark: its retry
     gave up while compaction was still running."""
     seen = _briefing_pane(monkeypatch, [True])          # compacting forever
 
-    daemon.deliver_briefing("%15", "4107", "claude", "brief {tid}",
+    daemon.deliver_briefing("%178", "12999", "claude", "brief {tid}",
                             await_busy=True, settle=5)
 
     assert seen["typed_at"] is None, "injected mid-compaction"
@@ -1502,7 +1503,7 @@ def test_a_compact_briefing_is_not_stalled_when_compaction_never_starts(monkeypa
     """The grace must not become a new way to strand a session."""
     seen = _briefing_pane(monkeypatch, [False])
 
-    daemon.deliver_briefing("%15", "4107", "claude", "brief {tid}",
+    daemon.deliver_briefing("%178", "12999", "claude", "brief {tid}",
                             await_busy=True, settle=daemon.COMPACT_SETTLE)
 
     assert seen["typed_at"] is not None, "stalled waiting for a compaction that never ran"
@@ -1513,18 +1514,18 @@ def test_an_ordinary_revive_does_not_wait_for_a_busy_phase(monkeypatch):
     ordinary revive by the whole grace window."""
     seen = _briefing_pane(monkeypatch, [False])
 
-    daemon.deliver_briefing("%15", "4107", "claude", "brief {tid}")
+    daemon.deliver_briefing("%178", "12999", "claude", "brief {tid}")
 
     assert seen["typed_at"] == 0, "waited for a compaction on a plain resume"
 
 
 def test_a_rebinding_during_the_compaction_wait_abandons_the_briefing(monkeypatch):
     """Review round 2. The ownership checks run BEFORE a wait that can now last
-    COMPACT_SETTLE. Reproduced: attempt 2 validated 4107 -> %15, the binding moved to %999
-    during the wait, and it typed into %15 then stamped briefed_boot on %999 — which had
+    COMPACT_SETTLE. Reproduced: attempt 2 validated 12999 -> %178, the binding moved to %999
+    during the wait, and it typed into %178 then stamped briefed_boot on %999 — which had
     received nothing. That is the #133 r2 failure reached through a longer wait."""
     seen = _briefing_pane(monkeypatch, [True, True, False, False, False, False, False])
-    registry = {"4107": {"pane": "%15"}}
+    registry = {"12999": {"pane": "%178"}}
     monkeypatch.setattr(daemon, "read_registry", lambda: registry)
     marked = []
     monkeypatch.setattr(daemon, "update_registry", lambda fn: marked.append(True))
@@ -1533,12 +1534,12 @@ def test_a_rebinding_during_the_compaction_wait_abandons_the_briefing(monkeypatc
 
     def _settled(pane, tid, window):
         out = real_settled(pane, tid, window)
-        registry["4107"]["pane"] = "%999"      # rebound while we waited
+        registry["12999"]["pane"] = "%999"      # rebound while we waited
         return out
 
     monkeypatch.setattr(daemon, "_compaction_settled", _settled)
 
-    daemon.deliver_briefing("%15", "4107", "claude", "brief {tid}",
+    daemon.deliver_briefing("%178", "12999", "claude", "brief {tid}",
                             await_busy=True, settle=daemon.COMPACT_SETTLE)
 
     assert seen["typed_at"] is None, "typed into a pane the topic had left"
@@ -1552,7 +1553,7 @@ def test_a_plain_first_attempt_still_does_not_consult_the_registry(monkeypatch):
     seen = _briefing_pane(monkeypatch, [False])
     monkeypatch.setattr(daemon, "read_registry", lambda: {})     # binding not yet visible
 
-    daemon.deliver_briefing("%15", "4107", "claude", "brief {tid}")
+    daemon.deliver_briefing("%178", "12999", "claude", "brief {tid}")
 
     assert seen["typed_at"] is not None, "raced the binding write it was just handed"
 
@@ -1560,10 +1561,10 @@ def test_a_plain_first_attempt_still_does_not_consult_the_registry(monkeypatch):
 def test_the_retry_carries_the_compaction_window_not_just_the_flag(monkeypatch):
     """Review round 2, finding 2. Asserting only await_busy let a mutation drop `settle`,
     which silently reverts the retry to RESTORE_SETTLE — it then gives up after 20s while
-    compaction is still running, which is exactly how topic 4107 went dark."""
+    compaction is still running, which is exactly how topic 12999 went dark."""
     seen = _briefing_pane(monkeypatch, [True])          # compacting forever
 
-    daemon.deliver_briefing("%15", "4107", "claude", "brief {tid}",
+    daemon.deliver_briefing("%178", "12999", "claude", "brief {tid}",
                             await_busy=True, settle=5)
 
     assert seen["retries"], "no retry scheduled"
@@ -1577,7 +1578,7 @@ def test_a_rebind_during_the_ordinary_idle_wait_abandons_the_briefing(monkeypatc
     first sample was busy so the loop slept, the topic was rebound, the second sample released
     the wait, and the briefing went into the pane the topic had left."""
     seen = _briefing_pane(monkeypatch, [False])
-    registry = {"4107": {"pane": "%15"}}
+    registry = {"12999": {"pane": "%178"}}
     monkeypatch.setattr(daemon, "read_registry", lambda: registry)
 
     # Busy first so the loop really sleeps, then idle so it releases. Without the advance the
@@ -1587,12 +1588,12 @@ def test_a_rebind_during_the_ordinary_idle_wait_abandons_the_briefing(monkeypatc
 
     def _idle(pane):
         out = next(samples, True)
-        registry["4107"]["pane"] = "%999"     # rebound while the loop was sleeping
+        registry["12999"]["pane"] = "%999"     # rebound while the loop was sleeping
         return out
 
     monkeypatch.setattr(daemon, "pane_is_idle", _idle)
 
-    daemon.deliver_briefing("%15", "4107", "claude", "brief {tid}")
+    daemon.deliver_briefing("%178", "12999", "claude", "brief {tid}")
 
     assert seen["typed_at"] is None, "typed into a pane the topic had left mid-wait"
 
@@ -1602,21 +1603,21 @@ def test_briefed_boot_is_never_stamped_on_a_pane_that_did_not_receive_it(monkeyp
     _mark stamped whatever pane was then bound, so the registry claimed a pane was briefed
     when it had received nothing — the #133 r2 failure at the far end of the function."""
     seen = _briefing_pane(monkeypatch, [False])
-    registry = {"4107": {"pane": "%15"}}
+    registry = {"12999": {"pane": "%178"}}
     monkeypatch.setattr(daemon, "read_registry", lambda: registry)
     marks = []
     monkeypatch.setattr(daemon, "update_registry", lambda fn: (fn(registry), marks.append(1)))
 
     def _type(pane, text, settle=0.4):
         seen["typed_at"] = seen["n"]
-        registry["4107"]["pane"] = "%999"     # rebound while we were typing
+        registry["12999"]["pane"] = "%999"     # rebound while we were typing
         return "sent"
 
     monkeypatch.setattr(daemon, "type_line", _type)
 
-    daemon.deliver_briefing("%15", "4107", "claude", "brief {tid}")
+    daemon.deliver_briefing("%178", "12999", "claude", "brief {tid}")
 
     assert seen["typed_at"] is not None, "did not deliver at all"
-    assert "briefed_boot" not in registry["4107"], (
+    assert "briefed_boot" not in registry["12999"], (
         "stamped briefed_boot on %999, which never received the briefing"
     )
