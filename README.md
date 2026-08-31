@@ -86,16 +86,6 @@ Full detail in [docs/FEATURES.md](docs/FEATURES.md).
 
 ---
 
-## One product name
-
-The repository, package, config and state directories, and systemd units are all named
-`agent-telegram-bridge`. The command stays `tg-bridge`, and the Python package stays `bridge`:
-both already describe the interface rather than one agent engine. Installs made before this
-rename are migrated once by `scripts/install.sh --force`; see the upgrade note in
-[docs/INSTALL.md](docs/INSTALL.md#upgrading-an-old-name-installation).
-
----
-
 ## Requirements
 
 - Python **3.12** — no third-party runtime dependencies
