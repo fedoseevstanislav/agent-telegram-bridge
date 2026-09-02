@@ -623,10 +623,12 @@ def send_file(token, chat_id, path, caption=None, thread_id=None, as_document=Fa
     return {**delivery, "result": result}
 
 
-# --- Outbound message formatting (Telegram HTML) -------------------------------
-# Messages go out with parse_mode=HTML so agent Markdown renders as real formatting.
-# HTML is used over MarkdownV2 because it needs only & < > escaped, whereas MarkdownV2
-# escapes ~18 chars and breaks on dynamic text (issue #89).
+# --- Outbound message formatting (Telegram HTML or exact plain text) ------------
+# Ordinary messages go out with parse_mode=HTML so agent Markdown renders as real formatting.
+# A disclosure approval needs the other answer: exact visible characters, with no Markdown token
+# interpreted away. Both modes keep one splitter and one delivery-classification path (#283).
+# HTML is used over MarkdownV2 because it needs only & < > escaped, whereas MarkdownV2 escapes
+# ~18 chars and breaks on dynamic text (issue #89).
 
 _TG_HTML_LIMIT = 3800          # split source below the 4096 Bot API cap; leaves headroom
                                # for the HTML tags md_to_telegram_html adds.
@@ -694,11 +696,16 @@ def split_for_telegram(text, limit=_TG_HTML_LIMIT):
     return chunks
 
 
-def send_message(token, chat_id, text, thread_id=None):
+def send_message(token, chat_id, text, thread_id=None, *, verbatim=False, reply_markup=None):
     """Send text to a chat/topic as Telegram HTML (real bold/underline/strike/code/links
-    from Markdown), auto-splitting long text. On an HTML parse error the offending chunk
+    from Markdown), auto-splitting long text. ``verbatim=True`` sends the exact chunks with no
+    parse mode; this is the release-disclosure path where rendering could hide a URL or turn
+    ``__init__.py`` into ``init.py``. On an HTML parse error the offending chunk
     is re-sent as PLAIN text, so a formatting edge case degrades a message, never drops
     it. Non-parse errors (connection failure / PossiblyDelivered) propagate unchanged.
+
+    ``reply_markup`` is JSON-encoded for one single-chunk prompt. Refusing it on a multi-chunk
+    body prevents a ForceReply control from being repeated onto disclosure chunks by accident.
 
     Return one delivery dict per chunk, carrying the exact text passed to sendMessage and
     its API result. If delivery is ambiguous, attach completed deliveries and the in-flight
@@ -708,12 +715,18 @@ def send_message(token, chat_id, text, thread_id=None):
     if thread_id:
         base["message_thread_id"] = thread_id
     chunks = split_for_telegram(text)
+    if reply_markup is not None:
+        if len(chunks) != 1:
+            raise ValueError("reply_markup requires a single Telegram message chunk")
+        base["reply_markup"] = json.dumps(reply_markup, separators=(",", ":"))
     deliveries = []
     for chunk_index, chunk in enumerate(chunks):
-        api_text = md_to_telegram_html(chunk)
+        api_text = chunk if verbatim else md_to_telegram_html(chunk)
+        params = {**base, "text": api_text}
+        if not verbatim:
+            params["parse_mode"] = "HTML"
         try:
-            result = api(token, "sendMessage",
-                         {**base, "text": api_text, "parse_mode": "HTML"})
+            result = api(token, "sendMessage", params)
         except PossiblyDelivered as e:
             e.completed_sends = deliveries
             e.possibly_delivered_send = {
@@ -723,7 +736,7 @@ def send_message(token, chat_id, text, thread_id=None):
             }
             raise
         except RuntimeError as e:
-            if "parse" in str(e).lower():                      # bad entities -> plain text
+            if not verbatim and "parse" in str(e).lower():     # bad entities -> plain text
                 api_text = chunk
                 try:
                     result = api(token, "sendMessage", {**base, "text": api_text})

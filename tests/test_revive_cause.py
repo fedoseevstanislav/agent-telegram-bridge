@@ -294,8 +294,12 @@ def test_retry_timer_carries_the_same_resolved_template(monkeypatch):
     monkeypatch.setattr(daemon, "has_live_recv", lambda tid: False)
     monkeypatch.setattr(daemon, "pane_alive", lambda pane: True)
     monkeypatch.setattr(daemon, "pane_is_idle", lambda pane: True)
-    monkeypatch.setattr(daemon, "type_line", lambda pane, text, settle=None: "swallowed")
+    monkeypatch.setattr(daemon, "type_line",
+                        lambda pane, text, settle=None, still_ok=None: "swallowed")
     monkeypatch.setattr(daemon, "report_blocked_pane", lambda *a, **k: None)
+    # Bound to this pane: the #238 delivery guard now runs on every attempt.
+    monkeypatch.setattr(daemon, "read_registry", lambda: {"1902": {"pane": "%77"}})
+    monkeypatch.setattr(daemon, "current_boot_id", lambda: "boot-1")
 
     tpl, _ = daemon._restore_wording("claude", "auto", fresh=False)
     daemon.deliver_briefing("%77", "1902", "claude", tpl)
@@ -352,6 +356,9 @@ _PINNED_OPENINGS = {
     "reopen": "The owner reopened this topic and asked for this session to be resumed, so a "
               "new terminal was opened",
     "unknown": "A terminal was opened for this topic",
+    "parked": "This topic's session was parked by the bridge after sitting idle (its "
+              "terminal was deliberately shut down to free memory), and your message "
+              "revived it — a new terminal was opened",
 }
 
 _PINNED_PERSISTED = {
@@ -372,6 +379,12 @@ _PINNED_PERSISTED = {
         "them, and do not report a cause you cannot check."),
     "manual": _UNOBSERVED,
     "unknown": _UNOBSERVED,
+    # Deliberate first-person claim: the bridge DID end this terminal, on policy, and says
+    # so; what the shutdown took with it stays undetermined rather than denied (#274 r1 f5).
+    "parked": ("The bridge shut that terminal down deliberately because the session was "
+               "idle — the host does not have memory to keep idle sessions resident. It "
+               "did NOT determine whether background work you had running survived; do "
+               "not assume either way."),
 }
 
 
@@ -589,7 +602,7 @@ def test_the_briefing_retry_actually_re_delivers_the_same_template(monkeypatch):
 
     attempts = {"n": 0}
 
-    def flaky_type_line(pane, text, settle=None):
+    def flaky_type_line(pane, text, settle=None, still_ok=None):
         attempts["n"] += 1
         typed.append(text)
         return "swallowed" if attempts["n"] == 1 else "sent"

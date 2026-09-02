@@ -10,6 +10,7 @@ import fcntl
 import json
 import os
 import re
+import secrets
 import shlex
 import shutil
 import subprocess
@@ -46,16 +47,22 @@ NUDGE_DELAY = 4  # seconds; lets a blocking ask/recv --wait consume the reply fi
 ECHO_CAPTURE_LINES = 30  # rows of scrollback above the visible pane to include in the capture.
                          # The window is the WHOLE capture, never a bottom slice of it — see
                          # _echo_capture for why a content-defined window is unsafe (#165).
-ECHO_PROBE_CHARS = 40    # chars of the line's tail used as the probe
 SWALLOW_MAX_ATTEMPTS = 2  # consecutive unverified injections into one pane before we stop
                           # typing: each attempt appends to an input box we cannot verify
-ECHO_EXTRA_WAITS = (0.6, 1.2)  # further waits before giving up on an injection, after the
-                               # first `settle` sample. One 0.3s sample called a busy pane's
-                               # late repaint a modal, and the verdict was permanent (#250).
-                               # A ladder rather than a deadline: type_line holds the pane
-                               # lock while it waits, so the cost has to be legible — at most
-                               # 0.3+0.6+1.2s — and it must not depend on a clock, which a
-                               # test that stubs sleep would otherwise spin against.
+RECEIPT_NONCE_CHARS = 8   # length of the per-injection receipt typed after the payload (#267)
+RECEIPT_TYPE_GAP = 0.5    # s between typing the payload and typing the receipt, so the
+                          # engine's paste detector does not fold the receipt into the
+                          # payload's "[Pasted text #N]" chip (measured — see type_line)
+RECEIPT_POLL = 0.3        # s between looks while waiting for the receipt to appear/clear
+RECEIPT_LOOKS = 10        # looks while waiting for the receipt to APPEAR — 3.0s, covering
+                          # every render latency measured so far (0.44s, 0.9s, 0.9s, 1.1s,
+                          # 2.5s). Only a pane that is ALREADY late ever spends it.
+RECEIPT_CLEAR_LOOKS = 4   # looks while waiting for it to go — a pane that has just proved it
+                          # echoes does this in ~0.25s, so this is slack, not a budget.
+                          # Both are counts of fixed waits rather than deadlines: type_line
+                          # holds the pane lock throughout, so the worst case has to be
+                          # legible against PANE_LOCK_TIMEOUT (0.5+3.0+1.2s against 10s), and
+                          # a clock would make every test that stubs sleep spin against it.
 SWALLOW_RETRY_AFTER = 600  # s after which a capped pane is tried once more regardless — the
                            # cap must never become a one-way door (see type_line)
 BRIEFING_RETRY_DELAY = 120  # s before re-trying a revival briefing the pane didn't take
@@ -68,6 +75,9 @@ UNREADABLE_ESCALATE_AFTER = 3  # consecutive sweeps where the pane could not be 
 CTX_POLL = int(os.environ.get("TG_BRIDGE_CTX_POLL", "30"))  # context warning poll interval
 CTX_STALE = 600  # ignore context files older than this (session likely closed)
 LIFECYCLE_POLL = int(os.environ.get("TG_BRIDGE_LIFECYCLE_POLL", "30"))  # pane liveness poll interval
+IDLE_PARK_HOURS = float(os.environ.get("TG_BRIDGE_IDLE_PARK_HOURS", "6"))  # 0 disables parking
+IDLE_PARK_POLL = int(os.environ.get("TG_BRIDGE_IDLE_PARK_POLL", "600"))  # s between park sweeps
+IDLE_PARK_RECHECK = int(os.environ.get("TG_BRIDGE_IDLE_PARK_RECHECK", "5"))  # s between the two idle looks
 WARN_START = 20  # first warning threshold (%)
 WARN_STEP = 10  # then every additional 10%
 
@@ -340,13 +350,29 @@ def _squash(text):
     return re.sub(r"\s+", "", text or "")
 
 
-def _echo_probe(text):
-    """The fragment of an injected line to look for in the pane — its TAIL, squashed.
+_RECEIPT_ALPHABET = "abcdefghijklmnopqrstuvwxyz0123456789"
 
-    The tail is what lands next to the cursor: a wrapped line puts its head several rows up
-    (and, in a horizontally-scrolling box, off-screen entirely), but its last characters are
-    always on the input box's final rendered row."""
-    return _squash(text)[-ECHO_PROBE_CHARS:]
+
+def _receipt_nonce():
+    """A fresh string that exists nowhere until we type it (#267).
+
+    This is the whole fix. Every earlier design confirmed an injection by counting the text's
+    own tail, and every bridge wake line has the SAME tail — so a repaint of an older copy
+    raises the count exactly as our keystroke does. That forced the decision into a window
+    short enough that our own write was the only plausible cause, and panes routinely render
+    later than that: four recorded strands at 0.9s, 1.1s, 2.5s, 0.9s, every one a real
+    delivery refused (#250, #252).
+
+    A nonce has no such ambiguity. Nothing the pane can repaint, scroll in, or re-render
+    contains it, because it did not exist anywhere before this call. Its appearance is a
+    receipt for our keystrokes rather than a proxy for them, so we may wait as long as we
+    like. Lowercase letters and digits only: nothing the shell, either engine's composer, or
+    a slash-command menu treats as syntax.
+
+    `secrets` rather than `random`: not because an attacker guesses it, but because `random`
+    is globally seedable and a test or library that seeds it would silently make every nonce
+    in the process identical — which is precisely the property this must not have."""
+    return "".join(secrets.choice(_RECEIPT_ALPHABET) for _ in range(RECEIPT_NONCE_CHARS))
 
 
 def _echo_capture(pane):
@@ -432,38 +458,54 @@ def _geometry_moved(before_geo, after_geo):
     return a[0] < b[0] or a[1:] != b[1:]
 
 
-# Neither engine renders long input literally: past some size it is collapsed into a chip, so
-# the text never appears in the pane at all. The tail probe therefore could never match, and
-# #133 withheld Enter on input that had landed perfectly — every carry-forward broke the
-# moment #133 went live (#163). These are the collapse markers, read out of the shipped
-# binaries rather than the docs: claude 2.1.235 renders "[Pasted text #N]", "[Pasted text #N
-# +M lines]" and "[...Truncated text #N +M lines...]"; codex 0.146.0 renders "[Pasted Content
-# N chars]". "[Image #N]" and "[Audio #N]" are deliberately absent — a different payload type
-# is not proof that TEXT landed. Counting them (rather than testing for presence) keeps the
-# anti-residue property the literal probe has: a chip left by an EARLIER injection does not
-# authorise this one, only a NEW one does.
-_ECHO_CHIPS = tuple(_squash(m) for m in ("[Pasted text", "[...Truncated text", "[Pasted Content"))
+def _await_receipt(pane, nonce, want_present, geo_before, looks, first_wait=None):
+    """Look at `pane` until the nonce's presence matches `want_present`, or the looks run out.
+
+    Returns "ok", "no" (the looks ran out with the wrong answer), or "unreadable".
+
+    Presence, not a count. A count was needed while the probe was the text's own tail, which
+    the pane could hold several copies of; the nonce exists in exactly one place or nowhere.
+
+    Waiting is free here in a way it never was for the tail. Nothing but our own keystrokes
+    can put this string on the screen, so a later look cannot be fooled by a repaint the way
+    #250's extra samples could — which is the entire reason this can be a loop at all.
+
+    The geometry fingerprint still bounds it, for the CLEARING direction only: a window that
+    shrinks under us can hide the nonce and read as "erased" when it is still in the box. It
+    costs nothing on the appearing direction, so it is applied to both rather than argued per
+    branch.
+
+    Returns (status, last capture) — the caller needs the capture itself to check for
+    receipts left behind by EARLIER attempts, which this call knows nothing about."""
+    capture = ""
+    for look in range(looks):
+        time.sleep(RECEIPT_POLL if look or first_wait is None else first_wait)
+        captured = _echo_capture(pane)
+        if captured is None:
+            return "unreadable", capture
+        capture, geo_after = captured
+        if _geometry_moved(geo_before, geo_after):
+            return "unreadable", capture   # different rows; nothing is provable across them
+        if (nonce in capture) == want_present:
+            return "ok", capture
+    return "no", capture
 
 
-def _count_signals(capture, probe):
-    """(literal-tail count, collapse-chip count) in an already-squashed capture."""
-    return capture.count(probe), sum(capture.count(chip) for chip in _ECHO_CHIPS)
-
-
-def _echo_counts(pane, probe):
-    """(counts, geometry) over a fresh capture of `pane`, or None if the capture failed. A
-    pane that took the text shows one signal or the other; a modal that swallowed the
-    keystrokes shows neither, which is what keeps #133's protection intact."""
-    captured = _echo_capture(pane)
-    if captured is None:
-        return None
-    capture, geo = captured
-    return _count_signals(capture, probe), geo
-
-
-def type_line(pane, text, settle=0.3):
+def type_line(pane, text, settle=0.3, still_ok=None):
     """Type `text` into a pane and press Enter ONLY once the text is confirmed to have
-    reached an input box (#133). Returns "sent", "swallowed", or "failed".
+    reached an input box (#133). Returns "sent", "swallowed", "failed", or "abandoned".
+
+    `still_ok` is an optional zero-argument predicate re-checked INSIDE the pane lock,
+    twice: immediately before the first keystroke, and immediately before the Enter. A
+    caller whose authority to write can be revoked mid-call — deliver_briefing, whose
+    topic can be rebound while this function waits on the lock or on the receipt ladder
+    (#270 review r1, finding 2) — passes its ownership check here, because a check taken
+    before the call is stale by the width of those waits. Before typing, a False abandons
+    with nothing landed. Before Enter, a False withholds the send: the payload stays
+    stranded unsent in the box (counted against the pane like a swallow) — a stranded
+    line in the wrong pane is recoverable, a delivered briefing is not. The residual is
+    the straight-line microseconds between check and keystroke, stated rather than
+    papered over: no check from outside the pane can be atomic with tmux's write.
 
     `tmux send-keys Enter` is unconditional. When the pane is showing a modal — codex's
     "Approaching rate limits / 1. Switch to gpt-5.6-luna" picker (option 1 preselected), an
@@ -473,8 +515,16 @@ def type_line(pane, text, settle=0.3):
 
     This checks behaviour, not appearance. Pattern-matching each engine's modals would have
     to track their rendering across releases, and the obvious tell is a trap: codex's '›' is
-    the ordinary input caret, printed on every idle pane. Instead: if the text we typed does
-    not show up, the keystrokes did not land in an input box, so the Enter is withheld.
+    the ordinary input caret, printed on every idle pane. Instead: if what we typed does not
+    show up, the keystrokes did not land in an input box, so the Enter is withheld.
+
+    What we look for is a fresh nonce typed after the payload, not the payload itself (#267).
+    The payload's own tail is shared by every wake line the bridge sends, so a repaint of an
+    older copy is indistinguishable from our keystroke — which is why the decision used to
+    have to be taken inside 0.3s, and why every pane that rendered later than that had its
+    delivery refused and its owner told the session was unreachable. A nonce did not exist
+    anywhere before this call, so nothing but our own keystrokes can put it on the screen and
+    we can wait for it. It is backspaced off before Enter, so the session never sees it.
 
     Erring toward NOT typing on an unreadable pane matches _cf_busy — an unverified pane is
     never acted on. A withheld nudge is retried by idle_sweep_loop; a wrong Enter is not
@@ -491,13 +541,13 @@ def type_line(pane, text, settle=0.3):
 
     Every other daemon path that WRITES to a pane takes the same lock (#165) — interrupts,
     the slash-command relay, model switches — because a write landing inside this window
-    corrupts it in the dangerous direction: a long interrupt instruction collapses into a
-    chip and raises the count this function reads as proof. Two paths deliberately stay
+    corrupts it in the dangerous direction: a second writer's keystrokes land between the
+    payload and the receipt, so the receipt attests to the wrong line. Two paths deliberately stay
     outside it, both bare Escapes on the halt/abort routes: they exist to interrupt a session
     that may be mid-injection, so blocking them on that injection's lock would defeat them."""
-    probe = _echo_probe(text)
-    if not probe:
-        return "failed"
+    if not _squash(text):
+        return "failed"   # nothing to deliver; an empty line must never reach a pane
+    nonce = _receipt_nonce()
     with contextlib.ExitStack() as stack:
         try:
             stack.enter_context(_pane_lock(pane))
@@ -538,6 +588,27 @@ def type_line(pane, text, settle=0.3):
             capped_at = time.time()
             _swallowed_streak[pane] = (streak, capped_at)
 
+        def _take_back_the_receipt():
+            """Erase the receipt even though we never saw it, on the way out of a refusal.
+
+            This is not tidiness, it is the difference between a withheld nudge and a
+            corrupted delivery. A receipt the pane folded into a paste chip is invisible to
+            the look that would have found it, so the attempt cannot confirm it — but the
+            keystrokes DID land, and those eight characters stay in the input box. The next
+            attempt appends to that same box, renders and clears its OWN receipt cleanly, and
+            its Enter delivers the message with the old one still attached (reproduced in
+            review). Nothing on screen distinguishes the stale nonce from the message, so it
+            cannot be found later; the only moment it can be removed is now.
+
+            Best effort by construction: if a modal swallowed the printable keys it swallows
+            these too, which is harmless, and if the whole write became a chip the backspace
+            takes the chip — the payload was not delivered either way."""
+            try:
+                _tmux(["tmux", "send-keys", "-t", pane] + ["BSpace"] * len(nonce),
+                      check=True, capture_output=True)
+            except Exception as e:
+                log(f"type_line: could not take back the receipt on pane {pane}: {e}")
+
         def _stranded():
             """Count this attempt against the pane: the text may be sitting in an input box
             we could not confirm, and every further attempt appends another copy."""
@@ -545,101 +616,77 @@ def type_line(pane, text, settle=0.3):
             _swallowed_streak[pane] = (
                 nxt, time.time() if nxt == SWALLOW_MAX_ATTEMPTS and streak < nxt else capped_at)
 
-        before = _count_signals(capture, probe)
+        if nonce in capture:
+            # Astronomically unlikely, and free to handle: a nonce already on screen would
+            # make its own receipt meaningless. Abstain without typing.
+            log(f"type_line: receipt {nonce} was already on pane {pane} — not typing")
+            return "failed"
+        if still_ok is not None and not still_ok():
+            log(f"type_line: caller's authority over pane {pane} lapsed before typing — "
+                f"abandoned, nothing landed")
+            return "abandoned"
         try:
             _tmux(["tmux", "send-keys", "-t", pane, "-l", text], check=True, capture_output=True)
+            # The nonce goes in a SEPARATE send-keys after a gap, and this is not cosmetic.
+            # Both engines detect a paste by the burst and fold it into a "[Pasted text #N]"
+            # chip; appended to the payload the nonce lands INSIDE that chip, invisible, and
+            # its own receipt can never appear. Measured on a live claude pane: concatenated,
+            # a 3KB payload rendered as "[Pasted text #1][Pasted text #2]" and the injection
+            # was refused; sent 0.5s later it rendered as "[Pasted text #3]qq7z3m1v" and was
+            # delivered. The gap is what makes the nonce typing rather than paste.
+            time.sleep(RECEIPT_TYPE_GAP)
+            _tmux(["tmux", "send-keys", "-t", pane, "-l", nonce], check=True, capture_output=True)
         except Exception as e:
             log(f"type_line: send-keys failed for pane {pane}: {e}")
             return "failed"
-        # #250: one 0.3s sample decides, and a pane that repaints later than that reads
-        # exactly like a modal that swallowed the keystrokes. The verdict was permanent — the
-        # text sat unsent in the input box, the topic was told every thirty minutes that its
-        # session was unreachable, and only a human pressing Enter delivered it. Measured on
-        # 2026-08-30, pane %290 logged `literal=0->0` while nine minutes into a shell command,
-        # with the line plainly in its box afterwards.
-        #
-        # The obvious fix — look again, and act on what the later look sees — was written
-        # twice and refused twice by review, for the same reason both times. The evidence is a
-        # COUNT of the text anywhere in the capture, which stands in for "our text is in the
-        # input box". That proxy holds only while the sole thing that can change the count is
-        # our own keystroke. Widen the window and the pane's renderer gets in: an older
-        # identical wake line repainted behind a still-open picker raises the count, and the
-        # Enter that follows accepts the picker's highlighted option — the exact failure #133
-        # exists to prevent. Reproduced against this function, not argued (#253).
-        #
-        # So the extra samples are OBSERVATION ONLY. They authorise nothing: `confirmed` is
-        # decided by the first sample alone, exactly as before, and this code path cannot
-        # press an Enter that main would not have pressed. What the later samples do is
-        # measure — how often, and how late, a render arrives that the single sample missed.
-        # That distribution is the thing nobody has, and without it a longer window is a
-        # safety change traded for an unquantified benefit (#252).
-        confirmed = False
-        cumulative = 0.0
-        for sample, wait in enumerate((settle,) + ECHO_EXTRA_WAITS):
-            time.sleep(wait)
-            cumulative += wait
-            measured = _echo_counts(pane, probe)
-            if measured is None:
-                _stranded()
-                log(f"type_line: pane {pane} unreadable after typing — Enter withheld")
-                return "swallowed"
-            after, geo_after = measured
-            if _geometry_moved(geo_before, geo_after):
-                break            # abstain below; re-sampling a moved window proves nothing
-            rose = after[0] > before[0] or after[1] > before[1]
-            if sample == 0:
-                confirmed = rose
-                if confirmed:
-                    break        # the decision, unchanged: first sample, both signals
-            elif rose:
-                # Not a delivery. A number for #252, and deliberately not acted on: this same
-                # rise is what a repaint behind a modal produces.
-                log(f"type_line: pane {pane} rendered at sample {sample} (+{cumulative:.1f}s), "
-                    f"after the {settle}s decision had already been taken — literal "
-                    f"{before[0]}->{after[0]} chip {before[1]}->{after[1]}. Enter NOT sent "
-                    f"(#250/#252); the text is stranded in the box.")
-                break
-        # The two counts must come from the SAME window or comparing them means nothing. A
-        # resize can move the row window backwards and admit residue, which reads as a rise
-        # with nothing typed (#165 review r2). Abstain instead of guessing; the caller retries.
-        if _geometry_moved(geo_before, geo_after):
+        # Wait for the receipt to APPEAR. A modal swallowed the keystrokes and shows
+        # neither the text nor the nonce, so #133's protection is intact and by the same
+        # mechanism. What changed is that a slow pane is no longer indistinguishable from a
+        # modal: the nonce cannot be repainted from history, so looking again is sound where
+        # #250's extra samples were not, and the four recorded strands (0.9s, 1.1s, 2.5s,
+        # 0.9s) all land inside this window instead of being called modals.
+        landed, _seen = _await_receipt(pane, nonce, True, geo_before, RECEIPT_LOOKS,
+                                       first_wait=settle)
+        if landed != "ok":
+            _take_back_the_receipt()
             _stranded()
-            log(f"type_line: pane {pane} geometry moved during verification "
-                f"({geo_before!r} -> {geo_after!r}) — Enter withheld")
+            log(f"type_line: pane {pane} never showed the receipt ({landed}) — Enter withheld "
+                f"(modal/picker up?) nonce={nonce} geo={geo_before}")
             return "swallowed"
-        # A RISE in either signal, measured across a window proven not to have moved. Equal or
-        # falling counts are unresolvable (swallowed, or landed while a stale copy scrolled
-        # out), so only a rise is evidence that THIS text rendered — as its literal tail if the
-        # pane echoed it, or as a new collapse chip if the engine folded it away (#163).
-        #
-        # #165 r2 additionally REFUSED a rise whenever the other signal fell, on the argument
-        # that residue leaving as content arrives produces the same pair. That veto is gone
-        # (#168). It cost a real carry-forward within hours of shipping: the daemon typed
-        # `/compact` into a healthy idle pane, refused its own injection, and told the owner their
-        # terminal was stuck on a prompt. The measured reason is that a claude pane runs on the
-        # ALTERNATE SCREEN — `history_size` is 0, so `capture-pane -S -30` clamps to ~23 visible
-        # rows and the whole window is under a kilobyte. Content leaves a window that small
-        # constantly, so a falling count is the ordinary case there, not a signal.
-        #
-        # The veto and the geometry check above were aimed at the SAME threat — residue
-        # appearing without an injection. The geometry check addresses it precisely, by proving
-        # the two counts describe the same rows; the veto addressed it by refusing a whole class
-        # of legitimate transitions. Keeping the precise one and dropping the blunt one is the
-        # trade this makes, deliberately, with the failure it caused on record in #168.
-        #
-        # Residual, deliberately open: text the pane renders FOR THE FIRST TIME that happens
-        # to quote a collapse marker, or a repaint that re-draws an erased one, still raises
-        # the count at unchanged geometry. No substring can tell either from a real paste;
-        # only a causal receipt can (#157).
-        if not confirmed:
+        # The receipt proved the keystrokes reached an editable input, and the payload was
+        # typed into that same input immediately before it. Now take the nonce back out: the
+        # cursor is still at the end of it, so exactly len(nonce) backspaces leave the payload
+        # and nothing else. Verified the same way, for the same reason — an erase we did not
+        # watch land would send the nonce as part of the message.
+        try:
+            _tmux(["tmux", "send-keys", "-t", pane] + ["BSpace"] * len(nonce),
+                  check=True, capture_output=True)
+        except Exception as e:
             _stranded()
-            # Log the numbers. #168 had to be diagnosed from mechanism because this line said
-            # only "swallowed" — the one thing that would have settled it in a second was the
-            # counts themselves.
-            log(f"type_line: pane {pane} swallowed the text — Enter withheld (modal/picker up?) "
-                f"probe={probe[:24]!r} literal={before[0]}->{after[0]} "
-                f"chip={before[1]}->{after[1]} geo={geo_after}")
+            log(f"type_line: could not erase the receipt on pane {pane}: {e} — Enter withheld")
+            return "failed"
+        cleared, _left = _await_receipt(pane, nonce, False, geo_before, RECEIPT_CLEAR_LOOKS)
+        if cleared != "ok":
+            _take_back_the_receipt()   # the first erase may simply not have rendered yet
+            _stranded()
+            log(f"type_line: receipt {nonce} still on pane {pane} after backspaces "
+                f"({cleared}) — Enter withheld rather than send it with the message")
             return "swallowed"
+        if still_ok is not None and not still_ok():
+            # The receipt waits above are the LONG part of this call — the whole reason a
+            # pre-call check goes stale. Authority lost while they ran: withhold the Enter.
+            # The payload strands unsent, counted like a swallow. Erasing it blind is not
+            # safe (a chip renders as one element, so len(text) backspaces would eat
+            # whatever sat in the composer before us), and four review rounds of coupling
+            # an on-disk record to the composer's true state each ended in a proven
+            # counter-interleaving — that composition residual is #269's class and is
+            # documented there, not solved here. What this check DOES buy: the common
+            # rebind (which happens during these waits, not in the microseconds around
+            # the Enter) is refused with nothing delivered.
+            _stranded()
+            log(f"type_line: caller's authority over pane {pane} lapsed before Enter — "
+                f"withheld, payload left unsent")
+            return "abandoned"
         try:
             _tmux(["tmux", "send-keys", "-t", pane, "Enter"], check=True, capture_output=True)
         except Exception as e:
@@ -823,7 +870,12 @@ def maybe_auto_revive(cfg, thread_id, cause="auto"):
             # cause="auto": this session's pane died and we relaunched it on an inbound
             # message. Nothing rebooted — telling it otherwise makes it misread its own
             # reaped background tasks as reboot fallout (#167).
-            status, _task = revive_one(cfg, tid, entry, brief=True, cause=cause)
+            # A parked pane did not die — this daemon shut it down, and the revive
+            # must say so instead of reporting a death (#274 r1, finding 5). A new name,
+            # not a rebind: assigning `cause` here would make it local to this closure.
+            revive_cause = ("parked" if entry.get("parked") and cause == "auto"
+                            else cause)
+            status, _task = revive_one(cfg, tid, entry, brief=True, cause=revive_cause)
             log(f"auto-revive topic {tid}: {status}")
         except Exception as e:
             log(f"auto-revive topic {tid} failed: {e}")
@@ -850,11 +902,27 @@ def schedule_nudge(thread_id, wake_claim):
         threading.Timer(NUDGE_DELAY, maybe_nudge, args=(thread_id, pane, wake_claim)).start()
 
 
-def mark_ended(thread_id):
+def mark_ended(thread_id, observed_pane):
+    """Stamp `ended`, but only while the topic is still bound to the pane that was observed
+    dead. Observation and stamp are two separate moments: a concurrent revive can rebind the
+    topic to a live pane in between, and a stamp keyed on the topic id alone would then mark
+    the LIVE session ended — making should_auto_revive true and driving a second revive
+    against it (#237). The compare runs inside update_registry's lock and is against the
+    BINDING, never the pane itself: re-reading liveness here would be a second observation
+    with the same race one step later. Returns True iff the stamp landed."""
     def _end(reg):
-        if str(thread_id) in reg:
-            reg[str(thread_id)]["ended"] = now_iso()
-    update_registry(_end)
+        entry = reg.get(str(thread_id))
+        if entry is None:
+            return False
+        if entry.get("pane") != observed_pane:
+            return False
+        entry["ended"] = now_iso()
+        return True
+    stamped = bool(update_registry(_end))
+    if not stamped:
+        log(f"lifecycle: topic {thread_id} is no longer bound to dead pane "
+            f"{observed_pane} — not marking ended")
+    return stamped
 
 
 def lifecycle_loop(cfg):
@@ -868,7 +936,8 @@ def lifecycle_loop(cfg):
                     continue  # no pane = liveness unknowable; ended = already handled
                 if pane_alive(pane):
                     continue
-                mark_ended(thread_id)
+                if not mark_ended(thread_id, pane):
+                    continue  # rebound to a live pane mid-sweep — nothing ended (#237)
                 name = info.get("name", "?")
                 try:
                     reply(cfg, int(thread_id), f"🔚 Session '{name}' ended — its terminal is gone. Closing this topic.")
@@ -877,9 +946,449 @@ def lifecycle_loop(cfg):
                     })
                 except Exception as e:
                     log(f"lifecycle notice failed for topic {thread_id}: {e}")
+                # The stamp was consistent when it landed, but the notice and close above
+                # ran OUTSIDE the lock: a revive can claim the topic in between, clear
+                # `ended`, rebind — and this sweep would then have closed the reopened
+                # topic of a live session (#270 review r1, finding 1). The revive's claim
+                # wins: undo the close and say so. The undo itself races an owner close
+                # landing inside the same instants; accepted — a reopen of a topic the
+                # owner is actively closing is one keystroke to redo, a closed topic on a
+                # live session is a dead letterbox until someone notices.
+                after = read_registry().get(str(thread_id)) or {}
+                if after.get("pane") != pane or not after.get("ended"):
+                    log(f"lifecycle: topic {thread_id} was claimed by a revive while its "
+                        f"end was being announced — reopening")
+                    if reopen_topic(cfg, thread_id):
+                        try:
+                            reply(cfg, int(thread_id),
+                                  "↩️ Disregard the notice above — the session was revived "
+                                  "while this topic was being closed. It is open and live.")
+                        except Exception as e:
+                            log(f"lifecycle: correction notice failed for topic "
+                                f"{thread_id}: {e}")
+                    continue
                 log(f"session ended: topic {thread_id} ({name}), pane {pane} gone")
         except Exception as e:
             log(f"lifecycle_loop error: {e}")
+
+
+def load_park_exempt():
+    """Topic ids (strings) never parked: a JSON list at state_path('park_exempt.json'),
+    read fresh at every decision point so an operator can add/remove without a restart.
+    A MISSING file is an empty set — no exemptions is a normal state. An EXISTING file
+    that cannot be read or parsed is None, and every caller must fail closed on None:
+    an unreadable authority is not an empty one (#274 r4, finding 4)."""
+    path = state_path("park_exempt.json")
+    if not os.path.exists(path):
+        return set()
+    try:
+        with open(path) as f:
+            data = json.load(f)
+        if isinstance(data, list):
+            return {str(x) for x in data}
+    except (OSError, ValueError):
+        pass
+    return None
+
+
+def _session_last_activity(info):
+    """Epoch of the session's last real turn, from its OWN artifact — the transcript for
+    claude, the rollout for codex — or None when it cannot be aged. The statusline ctx
+    record is NOT used: measured stale by WEEKS on live panes (#158 accepts any age), it
+    would park working sessions and spare dead ones (#273 A1). Unageable is unparkable."""
+    sid = info.get("session_id")
+    if not sid:
+        return None
+    if (info.get("engine") or "claude") == "claude":
+        path = transcript.transcript_path(info.get("cwd") or "~", sid)
+    else:
+        path = codex_ctx.rollout_for_session(sid)
+    if not path:
+        return None
+    try:
+        return os.stat(path).st_mtime
+    except OSError:
+        return None
+
+
+def idle_park_loop(cfg):
+    """Park sessions idle past IDLE_PARK_HOURS: kill the pane, stamp `ended`+`parked`,
+    tell the topic — and leave the topic OPEN, because the revive is the machinery that
+    already exists: the next inbound message auto-revives with --resume, carrying model
+    and effort (#190) and asking before a big spend (#195), and the `parked` flag makes
+    the revive say WHY the terminal is new instead of reporting a death that was not one
+    (#274 review r1, finding 5).
+
+    Why parking is free past the threshold: the prompt cache TTL is an hour, so any
+    longer-idle session re-reads its context on the next message whether or not the
+    process survived — the only thing a parked process was holding is ~half a GB of RAM,
+    which is what this loop exists to reclaim (#273; the host was hitting OOM).
+
+    The kill is `kill-pane` on the EXACT pane every fence below examined — never the
+    enclosing session, which can hold other windows nobody checked (#274 r1, finding 1;
+    reproduced killing a working second window).
+
+    Stated residuals (#273/#274, class archived on the check-then-act root-cause issue):
+    a session idle at its prompt while a background task still runs looks idle everywhere
+    this daemon can see; and NO sequence of reads is atomic against the kill — a condition
+    can change after its own gate while later gates run, and the gap between the last
+    check and kill-pane has no enforced time bound (the thread can be descheduled
+    arbitrarily long; r3, finding 2). Prevention being impossible, the CONSEQUENCE is
+    bounded instead: the killed session is resumable by design, and _park_one re-checks
+    the repairable authorities AFTER the kill and auto-revives on the spot when one was
+    lost to the race — so the worst case is a brief outage and a spurious notice, never
+    the conversation."""
+    while True:
+        time.sleep(IDLE_PARK_POLL)
+        try:
+            cutoff = time.time() - IDLE_PARK_HOURS * 3600
+            exempt = load_park_exempt()
+            if exempt is None:
+                log("idle-park: park_exempt.json unreadable — skipping the sweep")
+                continue  # fail closed: cannot know who is exempt, so nobody parks
+            candidates = []
+            for tid, info in read_registry().items():
+                # Candidate screen ONLY. Nothing decided here carries authority: r2
+                # proved every fence sampled before the deliberate recheck sleep is a
+                # statement about the past by kill time. The full battery runs fresh in
+                # _park_gates_hold after the sleep, and again under the claim.
+                pane = info.get("pane")
+                if (not pane or info.get("ended") or info.get("feed")
+                        or str(tid) in exempt):
+                    continue
+                if not pane_alive(pane):
+                    continue  # lifecycle_loop's case, not ours
+                last = _session_last_activity(info)
+                if last is None or last > cutoff:
+                    continue
+                if not pane_is_idle(pane):
+                    continue
+                occupant = _pane_occupant(pane)
+                if occupant is None:
+                    continue
+                candidates.append((tid, pane, occupant))
+            if not candidates:
+                continue
+            # ONE shared recheck sleep for the whole sweep, not one per candidate: N
+            # candidates cost IDLE_PARK_RECHECK once, not N times (r3, finding 4) —
+            # and every candidate's authority is decided the same short time after
+            # its screen, instead of the last one waiting through all the others.
+            time.sleep(IDLE_PARK_RECHECK)
+            for tid, pane, occupant in candidates:
+                if not _park_gates_hold(tid, pane, occupant, cutoff):
+                    continue
+                _park_one(cfg, tid, pane, occupant, cutoff)
+        except Exception as e:
+            log(f"idle_park_loop error: {e}")
+
+
+def _pane_occupant(pane):
+    """(foreground process group id, its start epoch) for the pane, or None. This is the
+    identity that must SPAN the recheck sleep and the claim.
+
+    `#{pane_pid}` alone is NOT the occupant: it is the pane's FIRST process, which for a
+    manually registered pane is a persistent shell older than every session it ever
+    hosted — the exact failure PR #159 (Codex round 3) recorded and #274 r3 finding 1
+    reproduced: the shell spans everything while the session behind it changes. The
+    foreground process group is what is actually running, so its id+start is compared
+    across every later look. Same wall-clock caveat as _pane_start_time: the start epoch
+    derives from boot time + ticks, so a clock step between artifact writes and this
+    read can skew the age comparison — accepted, since every other gate remains."""
+    pid = pane_pid(pane)
+    if not pid:
+        return None
+    try:
+        fields = _proc_stat_fields(pid)
+        tpgid = int(fields[5])                        # foreground process group, field 8
+        if tpgid <= 0:
+            return None                               # no controlling terminal — unprovable
+        if tpgid != pid:
+            fields = _proc_stat_fields(tpgid)
+        ticks = int(fields[19])                       # starttime, field 22, in clock ticks
+        with open("/proc/stat") as f:
+            btime = next(int(line.split()[1]) for line in f if line.startswith("btime "))
+        return (tpgid, btime + ticks / os.sysconf("SC_CLK_TCK"))
+    except (OSError, ValueError, IndexError, StopIteration):
+        return None
+
+
+def _park_gates_hold(tid, pane, occupant, cutoff, claim_token=None):
+    """The full park-authority battery, on FRESH reads only — run once after the recheck
+    sleep and once more under the claim. r2's findings were one shape: a fence sampled
+    before a deliberate delay had already expired when the kill ran. So nothing from
+    before the most recent sleep is trusted here except `occupant`, whose whole job is
+    to span it. Post-sleep (claim_token=None) the entry must be live and unclaimed;
+    under the claim it must carry OUR token. Every gate fails closed. The battery is a
+    sequence, not a snapshot — a gate can expire while later gates run (r3, finding 2);
+    that class is closed by _park_one's post-kill repair, not by more reads here."""
+    entry = read_registry().get(str(tid)) or {}
+    if entry.get("pane") != pane or entry.get("feed"):
+        return False
+    if claim_token is None:
+        if entry.get("ended") or entry.get("park_claim"):
+            return False
+    elif entry.get("park_claim") != claim_token:
+        return False
+    # The operator can exempt a topic at ANY moment, including inside the recheck sleep
+    # (r3, finding 3) — so the exemption file is re-read in every battery, not carried
+    # from the sweep's snapshot. None means the file exists but could not be read: fail
+    # closed, an unreadable authority is not an empty one (r4, finding 4).
+    exempt = load_park_exempt()
+    if exempt is None or str(tid) in exempt:
+        return False
+    if not pane_alive(pane):
+        return False
+    if _pane_occupant(pane) != occupant:
+        return False  # the foreground occupant changed under us — not our session
+    last = _session_last_activity(entry)
+    if last is None or last > cutoff:
+        return False  # activity moved during the wait — a message just landed (r2, f2)
+    # A session idle for IDLE_PARK_HOURS cannot live behind a younger occupant: the
+    # foreground group must predate the last activity it would answer for (r2/r3,
+    # finding 1) — a shell's NEW foreground session started after our transcript went
+    # quiet and correctly refuses here.
+    if occupant[1] > last:
+        return False
+    if engine_of_pane(pane) != (entry.get("engine") or "claude"):
+        return False
+    if not _pane_hosts_session(pane, entry):
+        return False
+    # A carry-forward owns the topic even if it began during the sleep (r2, f4).
+    if carry_forward_active(tid):
+        return False
+    if unread_count(tid) > 0:
+        return False  # a message is waiting — needed, not idle
+    # A recently-written inbox with a 6h-old transcript means a message arrived that the
+    # session never processed — possibly drained by its recv with the cursor advanced, so
+    # invisible to unread_count (r4, finding 3). Not idle either way.
+    if recent_inbox_drop(tid, time.time()) is not None:
+        return False
+    if not pane_is_idle(pane):
+        return False
+    return True
+
+
+def _pane_hosts_session(pane, info):
+    """True when the pane's own artifacts name the entry's session id — the fence against
+    a recycled pane id hosting an unrelated session (#274 r1, finding 1). Fail-closed: no
+    proof, no park. The record is read at ANY age on purpose: a stale id from a prior
+    session in a reused pane MISMATCHES the entry and correctly refuses; the one false
+    match — a recycled pane whose new session has never rendered a statusline while the
+    old record still names our sid — closes within seconds of the new TUI's first paint,
+    while this loop acts on 6-hour timescales."""
+    sid = info.get("session_id")
+    if not sid:
+        return False
+    if (info.get("engine") or "claude") == "claude":
+        ctx = read_context(pane, max_age=None)
+        return bool(ctx) and ctx.get("session_id") == sid
+    pid_res = _tmux(["tmux", "display-message", "-p", "-t", pane, "#{pane_pid}"],
+                    capture_output=True, text=True)
+    if getattr(pid_res, "returncode", 1) != 0:
+        return False
+    rollout = codex_ctx.rollout_for_pane((pid_res.stdout or "").strip(),
+                                         info.get("cwd") or "~")
+    return bool(rollout) and rollout.endswith(f"-{sid}.jsonl")
+
+
+def _claim_park(tid, pane):
+    """Atomically stamp `ended` + `parked` + a unique claim token on a live entry still
+    bound to `pane`. The token — never the pane or the timestamp — is what ownership
+    means from here on: r2 finding 3 reproduced a same-pane, same-second restamp that
+    pane+`ended` equality mistook for its own. `parked` lands IN the claim, not after
+    the kill, so a message racing the gap snapshots an entry that already says why it
+    ended (r2, finding 5). Returns the token, or None if the entry was not claimable."""
+    token = secrets.token_hex(8)
+
+    def _claim(reg):
+        entry = reg.get(str(tid))
+        if (entry is None or entry.get("pane") != pane or entry.get("ended")
+                or entry.get("park_claim")):
+            return None
+        entry["ended"] = now_iso()
+        entry["parked"] = True
+        entry["park_claim"] = token
+        return token
+    return update_registry(_claim)
+
+
+def _park_one(cfg, tid, pane, occupant, cutoff):
+    """Claim, re-verify EVERYTHING, kill, notify — with a token-guarded undo on every
+    failure path, and a post-kill REPAIR for what no pre-check can prevent. The claim
+    returns its own token, so there is no post-claim registry read outside the try for
+    an error to escape through (r2, finding 3), and the undo pops only an entry carrying
+    that exact token — same-pane, same-second restamps by other actors cannot be
+    mistaken for ours."""
+    token = _claim_park(tid, pane)
+    if token is None:
+        return  # someone else's topic now — a revive, another claim, a rebind
+    killed = False
+    try:
+        # The whole battery again, now UNDER the claim: a message, carry-forward,
+        # revive or occupant change that arrived between the post-sleep pass and the
+        # claim refuses here, and the finally releases the claim. Anything arriving
+        # after the claim sees ended+parked and takes the revive path instead. A gate
+        # can still expire while later gates run — that class is repaired below, not
+        # prevented here (r3, finding 2).
+        if not _park_gates_hold(tid, pane, occupant, cutoff, claim_token=token):
+            return
+        # One last token look IMMEDIATELY before the kill: the battery's token check is
+        # its first read, so a revive landing mid-battery would otherwise slip past it.
+        final = read_registry().get(str(tid)) or {}
+        if final.get("park_claim") != token or final.get("pane") != pane:
+            return
+        kill = _tmux(["tmux", "kill-pane", "-t", pane], capture_output=True)
+        if getattr(kill, "returncode", 1) != 0:
+            log(f"idle-park: kill-pane failed for {pane} (topic {tid})")
+            return
+        killed = True
+    finally:
+        if not killed:
+            def _undo(reg, _t=str(tid), _tok=token):
+                entry = reg.get(_t)
+                if entry and entry.get("park_claim") == _tok:
+                    entry.pop("ended", None)
+                    entry.pop("parked", None)
+                    entry.pop("park_claim", None)
+            update_registry(_undo)
+
+    # The kill HAPPENED. From here nothing may prevent the repair from running — not
+    # even `log`, which writes to stderr and can itself raise (r5, finding 1). The
+    # whole post-kill tail runs under a finally whose only job is to reach the repair.
+    try:
+        def _done(reg, _t=str(tid), _tok=token):
+            entry = reg.get(_t)
+            if entry and entry.get("park_claim") == _tok:
+                entry.pop("park_claim", None)  # claim served; ended+parked stay
+        try:
+            update_registry(_done)
+        except Exception as e:
+            with contextlib.suppress(Exception):
+                log(f"idle-park: claim release failed for topic {tid}: {e}")
+        idle_h = None
+        name = "?"
+        with contextlib.suppress(Exception):
+            entry_now = read_registry().get(str(tid)) or {}
+            name = entry_now.get("name", "?")
+            last = _session_last_activity(entry_now) or time.time()
+            idle_h = (time.time() - last) / 3600
+        with contextlib.suppress(Exception):
+            log(f"idle-park: parked topic {tid} ({name}), pane {pane}, "
+                f"idle {'?' if idle_h is None else f'{idle_h:.1f}'}h")
+        try:
+            hours = "many" if idle_h is None else f"{idle_h:.0f}"
+            reply(cfg, int(tid), (
+                f"\U0001f4a4 Parked after {hours}h idle to free memory. Write anything "
+                f"here to bring it back — the same conversation resumes (a large session "
+                f"will first ask whether to resume in full or from a summary)."))
+        except Exception as e:
+            with contextlib.suppress(Exception):
+                log(f"idle-park: notice failed for topic {tid}: {e}")
+    finally:
+        try:
+            _park_repair(cfg, tid)
+        except Exception:
+            with contextlib.suppress(Exception):
+                log(f"idle-park: repair crashed for topic {tid}")
+
+
+def _park_repair(cfg, tid):
+    """Post-kill repair (#274 r3 f2, r4 f1-f3; #276): the battery is a sequence and the
+    pre-kill gap has no time bound, so an authority can be lost after its own gate
+    passed. The detectable ones are re-checked HERE, after the act — each in its own
+    guard, and a read failure counts as lost, because an authority that cannot be read
+    cannot prove the race was won (r4, finding 1). A drained message (cursor advanced by
+    the dying recv, invisible to unread_count — r4, finding 3) is re-appended to the
+    inbox so the revive actually replays it. And because maybe_auto_revive is ALLOWED to
+    do nothing (a pending choice; an undeliverable question — r4, finding 2), the repair
+    verifies something durable is in flight and otherwise says so in the topic: the
+    notice the owner can always see is the recovery path of last resort."""
+    lost = []
+    drop = None
+    try:
+        if unread_count(tid) > 0:
+            lost.append("a message arrived")
+    except Exception as e:
+        lost.append(f"the inbox could not be read ({e})")
+    try:
+        drop = recent_inbox_drop(tid, time.time())
+        if drop is not None:
+            lost.append("a message may have been drained by the dying listener")
+    except Exception as e:
+        lost.append(f"the drop check failed ({e})")
+    try:
+        if carry_forward_active(tid):
+            lost.append("a carry-forward became active")
+    except Exception as e:
+        lost.append(f"the carry-forward state could not be read ({e})")
+    try:
+        exempt = load_park_exempt()
+        if exempt is None or str(tid) in exempt:
+            lost.append("an exemption was added (or the file became unreadable)")
+    except Exception as e:
+        lost.append(f"the exemption file could not be checked ({e})")
+    if not lost:
+        return
+    with contextlib.suppress(Exception):
+        log(f"idle-park: topic {tid} lost a race to the kill — {'; '.join(lost)} — "
+            f"reviving")
+    replay_failed = False
+    if drop is not None:
+        # Make the drained record UNREAD again so the revive's briefing replays it. A
+        # duplicate (if the old session did handle it) is honest and says so; a lost
+        # turn is silent. If the append itself fails, the record stays behind the
+        # cursor and NOTHING will replay it — that is a lost owner turn, so the
+        # fallback notice below becomes mandatory and asks for a resend (r5, f2).
+        try:
+            redelivery = dict(drop)
+            redelivery["ts"] = now_iso()
+            redelivery["text"] = ("↩️ [re-delivery — the previous terminal "
+                                  "was parked as this arrived; may repeat] "
+                                  + str(drop.get("text", "")))
+            append_jsonl(state_path("topics", str(tid), "inbox.jsonl"), redelivery)
+        except Exception as e:
+            replay_failed = True
+            with contextlib.suppress(Exception):
+                log(f"idle-park: re-delivery append failed for topic {tid}: {e}")
+    try:
+        maybe_auto_revive(cfg, tid)
+    except Exception as e:
+        with contextlib.suppress(Exception):
+            log(f"idle-park: repair revive failed for topic {tid}: {e}")
+    # Durable means an OUTCOME, not an in-flight marker: the `_auto_reviving` flag is
+    # transient and the worker can fail right after any snapshot of it (r5, finding 3).
+    # So wait, bounded, for one of the two states that actually survive this thread —
+    # the entry back alive (`ended` cleared by _bind) or a DELIVERED reopen question.
+    # A `prepared` record is NOT durable: nobody can answer it, and while it exists it
+    # blocks every future auto-revive until a daemon restart (r6, finding 1) — so a
+    # record still `prepared` after the wait is cleared, letting the owner's next
+    # message re-ask, and the warning below goes out. The notice is harmless if a slow
+    # revive lands after it: it says to write here, which is always true.
+    durable = False
+    for _ in range(30):
+        with contextlib.suppress(Exception):
+            entry = read_registry().get(str(tid)) or {}
+            durable = (not entry.get("ended")
+                       or _pending_reopen_state(tid) == "delivered")
+        if durable:
+            break
+        time.sleep(1)
+    if not durable:
+        with contextlib.suppress(Exception):
+            if _pending_reopen_state(tid) == "prepared":
+                _forget_pending_reopen(tid)
+    if replay_failed or not durable:
+        text = ("⚠️ This terminal was parked in the same instant something needed it"
+                + (", and the automatic revive did not come up" if not durable else "")
+                + (". Your last message could not be queued for replay — please resend "
+                   "it" if replay_failed else "")
+                + ". Nothing else is lost — write anything here and the conversation "
+                  "resumes.")
+        try:
+            reply(cfg, int(tid), text)
+        except Exception as e:
+            with contextlib.suppress(Exception):
+                log(f"idle-park: repair notice failed for topic {tid}: {e}")
 
 
 def set_topic_closed(thread_id, closed):
@@ -936,6 +1445,19 @@ def reply(cfg, thread_id, text):
     Any other failure propagates unchanged."""
     try:
         send_message(cfg["bot_token"], cfg["chat_id"], f"⚙️ {text}", thread_id or None)
+        # A delivery Telegram ACCEPTED is the one positive observation a bot gets that the
+        # topic is open — sends to a closed topic are rejected. Use it to retire a stale
+        # `closed` (#212): the flag is only ever learned from events, and #206 rightly
+        # rejects untrusted ones, which also discards the observation — leaving the topic
+        # hidden from the digest and the context sweep, and revive_one's respect_close
+        # reading a state that is no longer true. Purely passive: it records what was
+        # observed and invokes nothing — no revival, no pending question (the hole #206
+        # closed stays closed).
+        if str(thread_id or "") not in ("", "0"):
+            if (read_registry().get(str(thread_id)) or {}).get("closed"):
+                set_topic_closed(thread_id, False)
+                log(f"topic {thread_id} accepted a message while marked closed — "
+                    f"stale flag cleared (#212)")
         return True
     except RuntimeError as e:
         if not _is_topic_gone_error(e):
@@ -2508,6 +3030,71 @@ def service_event_is_trusted(cfg, msg):
     return bot is not None and sender_id == bot
 
 
+# One log line per rejected service event let an actor with topic-management authority grow
+# the journal and bury real alarms (#212). Identical rejections inside the window are counted
+# instead of written; the count is carried on the NEXT line for that key after the window
+# turns. A burst that simply stops leaves its tail uncounted — accepted: this is log-volume
+# defence, not an audit trail, and the first line of every burst always lands immediately.
+#
+# Windows are measured on the MONOTONIC clock: a wall-clock correction backwards would make
+# `now - start` negative and silently extend suppression far past the real 60 seconds
+# (#272 review r1, finding 2).
+_SVC_REJECT_WINDOW = 60.0
+_SVC_REJECT_MAX_KEYS = 256
+_svc_rejects = {}  # (kind, thread, sender, sender_chat) -> (window_start_monotonic, suppressed)
+
+
+def _log_rejected_service_event(kind, thread_id, sender_id, sender_chat_id):
+    """Log an untrusted forum close/reopen rejection, coalescing identical repeats.
+
+    Metadata only, same as the line it replaces: event kind, topic id, from.id and
+    sender_chat.id — never a token, a name, or message text.
+
+    The key table is bounded, and bounded carefully: a blanket clear at the cap threw away
+    the window state of bursts still running, so their next line lost its suppressed count
+    (#272 review r1, finding 1). Instead, a NEW key arriving at the cap first evicts keys
+    whose window already turned (their tail count is the same accepted loss as a burst that
+    stops), and only if 256 windows are genuinely live — 256 distinct actors with
+    topic-management authority inside one minute — does the oldest live one go."""
+    key = (kind, thread_id, sender_id, sender_chat_id)
+    now = time.monotonic()
+    if key in _svc_rejects:
+        start, suppressed = _svc_rejects[key]
+        if now - start < _SVC_REJECT_WINDOW:
+            _svc_rejects[key] = (start, suppressed + 1)
+            return
+    else:
+        suppressed = 0
+        if len(_svc_rejects) >= _SVC_REJECT_MAX_KEYS:
+            # THE invariant, singular, after three review rounds each found one more path
+            # that dropped a count: a window REMOVED from the table flushes its nonzero
+            # count as a line, whatever the reason for the removal. A count leaves the
+            # journal-side accounting only by being printed — on the key's own next line
+            # (the window-turn overwrite below), or on the removal line here. Volume stays
+            # bounded: every flushed line spends at least one previously-suppressed event,
+            # so the cumulative rate never exceeds the pre-coalescing one line per event
+            # (#272 review r2, r3).
+            def _flush(victim, why):
+                _v_start, v_count = _svc_rejects.pop(victim)
+                if v_count:
+                    v_kind, v_thread, v_sender, v_chat = victim
+                    log(f"ignored forum {v_kind} of topic {v_thread} from untrusted "
+                        f"sender {v_sender} (sender_chat={v_chat}) ({v_count} identical "
+                        f"rejections suppressed; {why})")
+
+            for stale in [k for k, (s, _n) in _svc_rejects.items()
+                          if now - s >= _SVC_REJECT_WINDOW]:
+                _flush(stale, "window expired at capacity")
+            if len(_svc_rejects) >= _SVC_REJECT_MAX_KEYS:
+                _flush(min(_svc_rejects, key=lambda k: _svc_rejects[k][0]),
+                       "window evicted at capacity")
+    _svc_rejects[key] = (now, 0)
+    suffix = (f" ({suppressed} identical rejections suppressed in the last "
+              f"{_SVC_REJECT_WINDOW:.0f}s)" if suppressed else "")
+    log(f"ignored forum {kind} of topic {thread_id} from untrusted sender "
+        f"{sender_id} (sender_chat={sender_chat_id}){suffix}")
+
+
 def handle_message(cfg, msg):
     chat = msg.get("chat", {})
     if chat.get("id") != cfg["chat_id"]:
@@ -2531,10 +3118,10 @@ def handle_message(cfg, msg):
             def _shown_id(value):
                 return value.get("id") if isinstance(value, dict) else None
 
-            log(f"ignored forum {'close' if 'forum_topic_closed' in msg else 'reopen'} of "
-                f"topic {msg.get('message_thread_id')} from untrusted sender "
-                f"{_shown_id(msg.get('from'))} "
-                f"(sender_chat={_shown_id(msg.get('sender_chat'))})")
+            _log_rejected_service_event(
+                "close" if "forum_topic_closed" in msg else "reopen",
+                msg.get("message_thread_id"),
+                _shown_id(msg.get("from")), _shown_id(msg.get("sender_chat")))
             return
         closed = "forum_topic_closed" in msg
         set_topic_closed(msg.get("message_thread_id"), closed)
@@ -3060,7 +3647,7 @@ RESTORE_FRESH_CODEX = (
 # kernel boot_id change. Every other cause knows that a pane is dead and nothing more —
 # `should_auto_revive` records neither why nor when a pane died, and an operator running
 # restore_cli may well be recovering a session a reboot killed.
-RESTORE_CAUSES = ("boot", "recovery", "manual", "auto", "reopen")
+RESTORE_CAUSES = ("boot", "recovery", "manual", "auto", "reopen", "parked")
 
 # Rounds 1 and 2 both failed the same way: every cause-specific "helpful" detail I added
 # turned out to be something the bridge cannot observe — "only this terminal changed" (false
@@ -3086,9 +3673,11 @@ _UNDETERMINED_UNOBSERVED = (
     "you had running is still running — do not assume any of them, and do not report a cause "
     "you cannot check.")
 # Neither of the two above is true on a reopen, in opposite directions, which is why it gets a
-# third. AFTER_DEATH attributes the observed death to the terminal just replaced, and #237 says
-# it cannot: `mark_ended` stamps by topic id, so the pane that was seen dead may not be the one
-# now bound. UNOBSERVED then denies the observation altogether — but a terminal for this topic
+# third. AFTER_DEATH attributes the observed death to the terminal just replaced, and it cannot:
+# when this wording was written `mark_ended` stamped by topic id alone (#237), and even now that
+# it stamps only while the binding still matches, a stamp already in the registry may predate
+# that fix, and "bound at stamp time" is still not "the terminal this session was just resumed
+# into". UNOBSERVED then denies the observation altogether — but a terminal for this topic
 # really was seen dead, which is why `ended` was stamped at all. Round 2 of the #236 review
 # caught that swap as the same error in the under-claiming direction, and it was: the comment
 # calling the weaker clause "never false" was itself false.
@@ -3118,6 +3707,12 @@ _RESTORE_OPENING = {
     # did not happen, and told the owner their own deliberate act was an incident (#235).
     "reopen": "The owner reopened this topic and asked for this session to be resumed, so a "
               "new terminal was opened",
+    # The bridge itself killed the previous terminal, deliberately, and must say so —
+    # reporting it as an unexplained death sends the owner investigating an incident that
+    # was policy (#274 review r1, finding 5).
+    "parked": "This topic's session was parked by the bridge after sitting idle (its "
+              "terminal was deliberately shut down to free memory), and your message "
+              "revived it — a new terminal was opened",
     # Not selectable via RESTORE_CAUSES — the landing point for a caller passing a typo, so a
     # mistake degrades to the weakest claim rather than the strongest false one.
     "unknown": "A terminal was opened for this topic",
@@ -3135,6 +3730,13 @@ _RESTORE_PERSISTED = {
     # These two never inspected a previous pane at all.
     "manual": _UNDETERMINED_UNOBSERVED,
     "unknown": _UNDETERMINED_UNOBSERVED,
+    # The one cause where the bridge KNOWS why the terminal ended: it ended it. What it
+    # cannot know is what the shutdown took with it — a background task the idle checks
+    # could not see dies unrecorded, so that stays undetermined rather than denied.
+    "parked": ("The bridge shut that terminal down deliberately because the session was "
+               "idle — the host does not have memory to keep idle sessions resident. It "
+               "did NOT determine whether background work you had running survived; do "
+               "not assume either way."),
 }
 _RESTORE_NOTICE = {
     ("boot", False): "♻️ Restored after a reboot — resuming this conversation.",
@@ -3154,6 +3756,8 @@ _RESTORE_NOTICE = {
     ("reopen", True): "♻️ Reopened — {fresh_short}, starting fresh.",
     ("unknown", False): "♻️ Restarted — resuming this conversation.",
     ("unknown", True): "♻️ Reopened — {fresh_short}, starting fresh.",
+    ("parked", False): "♻️ Was parked for idling — revived by your message, resuming this conversation.",
+    ("parked", True): "♻️ Was parked for idling — {fresh_short}, starting fresh.",
 }
 
 # How the owner's answer reads back to them. `None` covers a revive with no choice attached,
@@ -3822,9 +4426,14 @@ def _revive_with_choice(cfg, thread_id, entry, choice):
 
     def _run():
         try:
-            status, _task = revive_one(cfg, tid, entry, brief=True, cause="reopen",
+            # The cause must say the BRIDGE parked this session when it did — asking the
+            # resume question first does not change why the terminal is new (#274 r2,
+            # finding 5). Read fresh: the `entry` snapshot can predate the park.
+            revive_cause = ("parked" if (read_registry().get(tid) or {}).get("parked")
+                            else "reopen")
+            status, _task = revive_one(cfg, tid, entry, brief=True, cause=revive_cause,
                                        resume_choice=choice, respect_close=True)
-            log(f"reopen ({choice}) topic {tid}: {status}")
+            log(f"reopen ({choice}, cause={revive_cause}) topic {tid}: {status}")
             if status == "failed":
                 # Do not let a failed revive be a log line only: that is the silent dead end.
                 _rearm_after_failed_revive(cfg, tid, entry)
@@ -4176,7 +4785,7 @@ def deliver_briefing(pane, tid, engine, briefing_tpl, attempt=1, settle=None, aw
             log(f"revive: topic {tid} still compacting after {attempt} attempts — "
                 f"leaving for idle_sweep")
         return
-    deadline, reached, waited = time.time() + window, False, False
+    deadline, reached = time.time() + window, False
     while time.time() < deadline:
         if not pane_alive(pane):
             log(f"revive: pane {pane} for topic {tid} died before briefing")
@@ -4184,27 +4793,41 @@ def deliver_briefing(pane, tid, engine, briefing_tpl, attempt=1, settle=None, aw
         if engine != "claude" or pane_is_idle(pane):
             reached = True
             break
-        waited = True          # any real wait can outlive the ownership we checked on entry
         time.sleep(1)
     if engine == "claude" and not reached:
         log(f"revive: topic {tid} not idle within {window}s — leaving for idle_sweep")
         return
-    # Revalidate IMMEDIATELY before typing, but ONLY where a long wait really happened.
-    # Review round 2: the checks above run before a wait that can now last COMPACT_SETTLE, and
-    # in that window the topic can be rebound, another chain can brief it, or a live recv can
-    # start. Reproduced — attempt 2 validated 12999 -> %178, the binding moved to %999
-    # mid-wait, and it typed into %178 then stamped briefed_boot on %999, which had received
-    # nothing: the #133 r2 failure reached through a longer wait.
+    # Revalidate IMMEDIATELY before typing — on EVERY path, including a plain inline first
+    # attempt. Review round 2 established why for the waited paths: the checks above run
+    # before a wait that can last COMPACT_SETTLE, and in that window the topic can be
+    # rebound, another chain can brief it, or a live recv can start. Reproduced — attempt 2
+    # validated 12999 -> %178, the binding moved to %999 mid-wait, and it typed into %178
+    # then stamped briefed_boot on %999, which had received nothing: the #133 r2 failure
+    # reached through a longer wait.
     #
-    # NOT on a plain first attempt. That runs inline immediately after revive_one bound the
-    # pane, so re-reading there races the very binding write it was handed — which is why the
-    # original check was gated on attempt > 1 at all.
-    if ((attempt > 1 or await_busy or waited)
-            and not _briefing_still_ours(pane, tid, engine, "delivery")):
+    # The first attempt used to be exempt, on the theory that re-reading the registry there
+    # races the binding write revive_one just handed us. It does not: update_registry
+    # commits under an exclusive file lock BEFORE revive_one calls deliver_briefing, so this
+    # chain's own bind is always visible to the re-read — a mismatch here means someone
+    # rebound the topic AFTER us, and abandoning is exactly right. What the exemption
+    # actually allowed was typing into a pane the topic had already left, reproduced by the
+    # #236 round-1 review for both engines with attempt=1 (#238).
+    if not _briefing_still_ours(pane, tid, engine, "delivery"):
         return
     text = briefing_tpl.format(tid=tid)
     try:
-        status = type_line(pane, text, settle=0.4)
+        # The ownership check above is stale by the time type_line holds the pane lock and
+        # rides the receipt ladder — seconds in which a concurrent revive can rebind the
+        # topic (#270 review r1, finding 2). Hand the check IN, so it re-runs inside the
+        # lock immediately before the first keystroke and again before the Enter.
+        status = type_line(pane, text, settle=0.4,
+                           still_ok=lambda: _briefing_still_ours(pane, tid, engine,
+                                                                 "typing"))
+        if status == "abandoned":
+            # Not a delivery failure: the topic left this pane while we were typing at it.
+            # The chain that now owns the topic briefs it; retrying here would type at a
+            # pane this topic no longer has any claim to.
+            return
         if status != "sent":
             # Leave briefed_boot unset AND schedule the retry here. idle_sweep_loop cannot
             # stand in for this: for codex it only makes a candidate when unread > 0, and it
@@ -4374,11 +4997,20 @@ def revive_one(cfg, tid, entry, fresh=False, brief=True, taken=None, cause="boot
         e["pane"] = pane
         e["boot_id"] = boot
         e["engine"] = engine
+        if newly_spawned:
+            # `briefed_boot` describes a PANE's briefing, and this pane did not exist when
+            # it was stamped. Left in place, a same-boot codex replacement is refused its
+            # first briefing by the crash-retry guard — "already briefed this boot" — and
+            # comes up dark (#270 review r1, finding 3). An EXISTING pane keeps its stamp:
+            # that is the crash-retry case the guard exists for.
+            e.pop("briefed_boot", None)
         if do_fresh:
             e.pop("session_id", None)  # clear a stale id so a re-reboot can't resume the old convo
         elif sid:
             e["session_id"] = sid  # persist now, don't wait for the next snapshot
         e.pop("ended", None)
+        e.pop("parked", None)
+        e.pop("park_claim", None)  # a claim the parker never released dies with the revive
     update_registry(_bind)
 
     # `fresh` and `not sid` are different reasons and only one of them means recovery was
@@ -5297,8 +5929,15 @@ def handle_carry_forward(cfg, thread_id, text, info, pane):
                                   "send any message to halt it first.")
             return False
         token = f"{time.time():.6f}-{threading.get_ident()}"
+        # The suffix makes the path PER-FLOW, not per-second. With seconds alone, a halt
+        # and a fresh /cf inside the same second share one marker path: the halted
+        # session's already-issued instruction can then satisfy the new flow's done-gate
+        # (an early /compact), and the old worker's cleanup can eat the new flow's marker
+        # (#271 review, finding 1). Nothing parses this filename back — the path travels
+        # by value into the flow record and the injected prompt.
         ts = datetime.now().strftime("%Y%m%d-%H%M%S")
-        cf_file = state_path("topics", tid, f"carry-forward-{ts}.md")  # ensures the dir exists
+        cf_file = state_path("topics", tid,
+                             f"carry-forward-{ts}-{secrets.token_hex(4)}.md")
         marker = cf_file + ".done"  # session touches this as its last action; daemon polls for it
         _pending_cf[tid] = {"token": token, "phase": "settle", "pane": pane,
                             "cf_file": cf_file, "marker": marker, "started": time.time()}
@@ -5532,6 +6171,28 @@ def halt_carry_forward(cfg, thread_id, reason):
     except subprocess.TimeoutExpired:
         log(f"carry-forward halt: tmux timed out interrupting pane {pane} (topic {thread_id}); "
             f"flow already popped, continuing")
+    # Tell the SESSION, not just the owner (#134). It was already handed the /carryforward
+    # instruction; left untold, it completes the protocol and then waits forever for a
+    # /compact that can never come — listener armed, inbox drained, every health signal
+    # green — while the owner reads it as ignoring them. Measured on topic 4367
+    # (2026-08-06): three hours parked, recovered by exactly this one line typed by hand.
+    # After the pop on purpose: the flow is dead before the pane is told, so a session
+    # mid-write cannot see the notice, finish the flow, and be told twice.
+    try:
+        if pane and pane_alive(pane):
+            status = type_line(pane, (
+                "[tg-bridge] Your carry-forward was cancelled — a new message arrived. Do "
+                "not wait for a compaction; it will never come. Handle the next message "
+                "and continue working normally."), settle=0.4)
+            if status != "sent":
+                # No retry chain here: the owner's very next action is resending the halted
+                # message, whose nudge is a fresh delivery attempt into this pane. Log it
+                # so a parked session can still be traced to this refusal.
+                log(f"carry-forward halt: cancellation notice {status} for pane {pane} "
+                    f"(topic {thread_id}) — the session may still run the CF protocol")
+    except Exception as e:
+        log(f"carry-forward halt: cancellation notice failed for pane {pane} "
+            f"(topic {thread_id}): {e}")
     reply(cfg, thread_id, (
         "🛑 Carry-forward halted — session interrupted. Your message was NOT delivered; "
         "resend it if you want the session to act on it."
@@ -5583,6 +6244,8 @@ def main():
     threading.Thread(target=lifecycle_loop, args=(cfg,), daemon=True).start()
     threading.Thread(target=dashboard_loop, args=(cfg,), daemon=True).start()
     threading.Thread(target=idle_sweep_loop, args=(cfg,), daemon=True).start()
+    if IDLE_PARK_HOURS > 0:
+        threading.Thread(target=idle_park_loop, args=(cfg,), daemon=True).start()
     threading.Thread(target=snapshot_loop, args=(cfg,), daemon=True).start()
     log(f"daemon started, chat_id={cfg['chat_id']}, offset={offset}")
     while True:

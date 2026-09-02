@@ -324,6 +324,16 @@ class _RunRecorder:
         if self._echo:
             if "capture-pane" in argv:
                 stdout = "\n".join([stdout] + self._typed) if stdout else "\n".join(self._typed)
+            elif argv[-1] == "BSpace":
+                # The receipt is backspaced off before Enter (#267). A fake that ignored
+                # these would leave the nonce visible and every inject would be refused.
+                n = sum(1 for a in argv if a == "BSpace")
+                while n and self._typed:
+                    take = min(n, len(self._typed[-1]))
+                    self._typed[-1] = self._typed[-1][:len(self._typed[-1]) - take]
+                    n -= take
+                    if not self._typed[-1]:
+                        self._typed.pop()
             elif "-l" in argv:
                 self._typed.append(argv[-1])
         return types.SimpleNamespace(returncode=0, stdout=stdout, stderr="")
@@ -338,11 +348,14 @@ def test_inject_owned_sends_when_owned(monkeypatch):
     monkeypatch.setattr(daemon, "_pending_cf", {"1": {"token": "t", "pane": "%1"}})
     ok = daemon._cf_inject_owned("1", "t", "%1", "hello", settle=0)
     assert ok is True
-    # exactly two send-keys: the literal text, then Enter
+    # four send-keys: the text, the receipt, the backspaces that take the receipt off
+    # again, then Enter (#267). The payload is written once and is the FIRST thing written.
     keys = rec.sent_keys()
-    assert len(keys) == 2
+    assert len(keys) == 4
     assert keys[0][-2:] == ["-l", "hello"]
-    assert keys[1][-1] == "Enter"
+    assert keys[1][-2] == "-l" and keys[1][-1].isalnum()
+    assert set(keys[2][4:]) == {"BSpace"} and len(keys[2][4:]) == len(keys[1][-1])
+    assert keys[3][-1] == "Enter"
 
 
 def test_inject_owned_noops_after_halt(monkeypatch):
@@ -376,7 +389,7 @@ def test_inject_owned_release_after_pops_flow_atomically(monkeypatch):
     monkeypatch.setattr(daemon, "_pending_cf", {"1": {"token": "t", "pane": "%1"}})
     ok = daemon._cf_inject_owned("1", "t", "%1", "resume", settle=0, release_after=True)
     assert ok is True
-    assert len(rec.sent_keys()) == 2                  # still sent the text + Enter
+    assert len(rec.sent_keys()) == 4                  # text, receipt, erase, Enter (#267)
     assert "1" not in daemon._pending_cf              # flow popped atomically with the send
     assert not daemon.carry_forward_active("1")       # kill-switch disarmed
     # default (release_after omitted) must NOT pop — existing behaviour preserved

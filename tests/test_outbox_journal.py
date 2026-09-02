@@ -55,6 +55,7 @@ def test_successful_send_appends_outbox_record_for_exact_api_text(tmp_path, monk
         "ts": "2026-08-20T12:34:56+0300",
         "message_id": 9001,
         "content_sha256": hashlib.sha256(calls[0]["text"].encode("utf-8")).hexdigest(),
+        "content_chars": len(calls[0]["text"]),
         "kind": "send",
         "chunk_index": 0,
         "chunk_count": 1,
@@ -136,6 +137,7 @@ def test_possibly_delivered_send_journals_null_message_id(tmp_path, monkeypatch)
     assert record["content_sha256"] == hashlib.sha256(
         b"hello <b>bold</b>"
     ).hexdigest()
+    assert record["content_chars"] == len("hello <b>bold</b>")
     assert record["kind"] == "send"
     assert record["chunk_index"] == 0
     assert record["chunk_count"] == 1
@@ -170,6 +172,35 @@ def test_multichunk_possibly_delivered_journals_completed_then_ambiguous(
     assert "delivery" not in records[0]
     assert "delivery" not in records[1]
     assert records[2]["delivery"] == "possibly_delivered"
+
+
+def test_every_chunk_records_its_own_length(tmp_path, monkeypatch):
+    """Both write sites journal content_chars — the length of the exact per-chunk text
+    handed to the API, never the body itself (length only; the journal stays as
+    content-free as the hash next to it)."""
+    _send_env(tmp_path, monkeypatch)
+    calls = []
+
+    def ambiguous_second(_token, method, params):
+        assert method == "sendMessage"
+        calls.append(params)
+        if len(calls) == 2:
+            raise common.PossiblyDelivered("lost Telegram acknowledgement")
+        return {"message_id": 9300 + len(calls)}
+
+    monkeypatch.setattr(common, "api", ambiguous_second)
+
+    with pytest.raises(common.PossiblyDelivered):
+        cli.send_text(CFG, 55, "y" * (common._TG_HTML_LIMIT + 1))
+
+    records = _records(tmp_path, 55)
+    assert len(calls) == len(records) == 2
+    assert "delivery" not in records[0]                       # delivered site
+    assert records[1]["delivery"] == "possibly_delivered"     # ambiguous site
+    assert [record["content_chars"] for record in records] == [
+        len(call["text"]) for call in calls
+    ]
+    assert all(record["content_chars"] > 0 for record in records)
 
 
 def test_possibly_delivered_without_api_text_omits_untruthful_fields(tmp_path, monkeypatch):

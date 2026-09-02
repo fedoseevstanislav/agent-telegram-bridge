@@ -11,8 +11,10 @@ import argparse
 import json
 import os
 from pathlib import Path
+import signal
 import stat
 import sys
+import time
 
 
 LEGACY_SLUG = "claude-telegram-bridge"
@@ -40,10 +42,100 @@ OWNED_REFERENCE_REPLACEMENTS = (
         for suffix in UNIT_SUFFIXES
     ),
 )
+CLI_COMMANDS = frozenset(
+    {"register", "send", "recv", "ask", "typing", "current-topic", "notify", "status"}
+)
+PYTHON_NO_ARGUMENT_FLAGS = frozenset(
+    {"-b", "-bb", "-B", "-E", "-I", "-O", "-OO", "-q", "-s", "-S", "-u", "-v", "-V", "-x"}
+)
 
 
 class MigrationConflict(RuntimeError):
     """The old and new trees cannot be combined without choosing whose data wins."""
+
+
+def _legacy_cli_command(cmdline: bytes, home: Path) -> bool:
+    """Recognise only the Python invocation shape installed by this product."""
+    argv = [part.decode(errors="surrogateescape") for part in cmdline.split(b"\0") if part]
+    if len(argv) < 3:
+        return False
+
+    # The launcher execs ``python -u <release>/bridge/cli.py <command>``. Do not search the
+    # whole argv for the path: an unrelated ``python -c`` process can contain those same words
+    # as data, and stopping it would violate the migration's deliberately narrow boundary.
+    script_index = 1
+    while script_index < len(argv) and argv[script_index] in PYTHON_NO_ARGUMENT_FLAGS:
+        script_index += 1
+    if script_index + 1 >= len(argv):
+        return False
+
+    script = argv[script_index]
+    if not os.path.isabs(script):
+        return False
+    legacy_root = home / ".local" / "share" / LEGACY_SLUG
+    try:
+        relative = Path(os.path.normpath(script)).relative_to(legacy_root)
+    except ValueError:
+        return False
+    return relative.parts[-2:] == ("bridge", "cli.py") and argv[script_index + 1] in CLI_COMMANDS
+
+
+def legacy_cli_pids(
+    home: Path, proc_root: Path = Path("/proc"), uid: int | None = None
+) -> list[int]:
+    """Return same-user legacy CLI processes, never shells or sibling Python jobs."""
+    owner = os.getuid() if uid is None else uid
+    found: list[int] = []
+    for entry in proc_root.iterdir():
+        if not entry.name.isdecimal():
+            continue
+        pid = int(entry.name)
+        if pid == os.getpid():
+            continue
+        try:
+            if entry.stat().st_uid != owner:
+                continue
+            cmdline = (entry / "cmdline").read_bytes()
+        except (FileNotFoundError, PermissionError, ProcessLookupError):
+            continue
+        if _legacy_cli_command(cmdline, home):
+            found.append(pid)
+    return sorted(found)
+
+
+def quiesce_legacy_cli(
+    home: Path,
+    timeout: float = 5.0,
+    proc_root: Path = Path("/proc"),
+) -> dict[str, list[int]]:
+    """Terminate exact legacy CLI waiters and require a bounded quiet window."""
+    deadline = time.monotonic() + timeout
+    quiet_since: float | None = None
+    signalled: set[int] = set()
+    while True:
+        running = legacy_cli_pids(home, proc_root)
+        now = time.monotonic()
+        if not running:
+            quiet_since = quiet_since or now
+            if now - quiet_since >= 0.2:
+                return {"signalled": sorted(signalled)}
+        else:
+            quiet_since = None
+            for pid in running:
+                if pid in signalled:
+                    continue
+                try:
+                    os.kill(pid, signal.SIGTERM)
+                except ProcessLookupError:
+                    continue
+                signalled.add(pid)
+        if now >= deadline:
+            remaining = legacy_cli_pids(home, proc_root)
+            raise MigrationConflict(
+                "legacy CLI processes did not stop before migration: "
+                + ", ".join(str(pid) for pid in remaining)
+            )
+        time.sleep(0.05)
 
 
 def _pair(old: Path, new: Path, rewrite: bool = False) -> tuple[Path, Path, bool]:
@@ -163,11 +255,24 @@ def main() -> int:
     mode = parser.add_mutually_exclusive_group(required=True)
     mode.add_argument("--check", action="store_true", help="validate and print the move plan")
     mode.add_argument("--apply", action="store_true", help="move an old-only installation")
+    mode.add_argument(
+        "--legacy-cli-pids", action="store_true", help="list exact legacy CLI processes"
+    )
+    mode.add_argument(
+        "--quiesce-legacy-cli", action="store_true", help="stop exact legacy CLI processes"
+    )
     parser.add_argument("--home", default=str(Path.home()), help="installation HOME (for tests)")
     args = parser.parse_args()
     home = Path(os.path.abspath(os.path.expanduser(args.home)))
     try:
-        payload = _plan_payload(home) if args.check else apply_migration(home)
+        if args.check:
+            payload = _plan_payload(home)
+        elif args.apply:
+            payload = apply_migration(home)
+        elif args.legacy_cli_pids:
+            payload = {"pids": legacy_cli_pids(home)}
+        else:
+            payload = quiesce_legacy_cli(home)
     except (MigrationConflict, OSError) as exc:
         print(f"migrate_identity.py: {exc}", file=sys.stderr)
         return 1

@@ -40,7 +40,7 @@ die() { printf 'install.sh: %s\n' "$*" >&2; exit 1; }
 step() { printf '\n== %s\n' "$*"; }
 
 migrate_legacy_install () {
-    local plan needed suffix unit
+    local plan needed suffix unit backup stub_tmp had_launcher
     # The complete conflict/symlink check runs before systemd is touched. Stopping the old
     # daemon and only then discovering that both state roots exist turns a safe refusal into
     # an outage, which is exactly the ordering this helper exists to make hard to regress.
@@ -49,16 +49,59 @@ migrate_legacy_install () {
         'import json, sys; print(1 if json.load(sys.stdin)["needed"] else 0)' <<<"$plan")
     [[ $needed == 1 ]] || return 0
 
+    # Close the normal entrance before looking for old waiters. A recv launched between the
+    # process scan and the state rename used to survive in old code and recreate the old root.
+    # Moving a launcher symlink moves only its directory entry; an immutable release behind it
+    # is never touched.
+    mkdir -p -- "$(dirname "$LAUNCHER")"
+    backup="$LAUNCHER.migration-backup.$$"
+    stub_tmp="$LAUNCHER.migration-stub.$$"
+    had_launcher=0
+    if [[ -e $LAUNCHER || -L $LAUNCHER ]]; then
+        had_launcher=1
+    fi
+    printf '%s\n' '#!/usr/bin/env bash' \
+        'printf '\''tg-bridge: installation migration in progress; retry shortly\n'\'' >&2' \
+        'exit 75' > "$stub_tmp" || return 1
+    chmod 0755 "$stub_tmp" || { rm -f -- "$stub_tmp"; return 1; }
+    if [[ $had_launcher == 1 ]]; then
+        mv -- "$LAUNCHER" "$backup" || { rm -f -- "$stub_tmp"; return 1; }
+    fi
+    if ! mv -- "$stub_tmp" "$LAUNCHER"; then
+        [[ $had_launcher == 0 ]] || mv -- "$backup" "$LAUNCHER"
+        rm -f -- "$stub_tmp"
+        return 1
+    fi
+
+    restore_legacy_launcher () {
+        rm -f -- "$LAUNCHER"
+        if [[ $had_launcher == 1 ]]; then
+            mv -- "$backup" "$LAUNCHER"
+        fi
+        rm -f -- "$stub_tmp"
+    }
+
     # The daemon is the sole getUpdates consumer. It must be stopped before state moves, and
     # the new daemon is started only after this function returns — never run both identities.
     for suffix in .service -watchdog.service -watchdog.timer -digest.service -digest.timer \
                   -model-watchdog.service -model-watchdog.timer; do
         unit="claude-telegram-bridge${suffix}"
         if systemctl --user cat "$unit" >/dev/null 2>&1; then
-            systemctl --user disable --now "$unit"
+            if ! systemctl --user disable --now "$unit"; then
+                restore_legacy_launcher
+                return 1
+            fi
         fi
     done
-    "$PYTHON" "$MIGRATOR" --apply --home "$HOME"
+    if ! "$PYTHON" "$MIGRATOR" --quiesce-legacy-cli --home "$HOME"; then
+        restore_legacy_launcher
+        return 1
+    fi
+    if ! "$PYTHON" "$MIGRATOR" --apply --home "$HOME"; then
+        restore_legacy_launcher
+        return 1
+    fi
+    rm -f -- "$backup"
 }
 
 # --- checks that must pass before anything is written ------------------------------------

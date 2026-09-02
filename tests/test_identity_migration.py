@@ -8,6 +8,8 @@ import os
 from pathlib import Path
 import re
 import subprocess
+import sys
+import time
 
 import pytest
 
@@ -38,7 +40,9 @@ LEGACY_ALLOWED = {
     "docs/superpowers/specs/2026-07-02-reboot-restore-and-model-command-design.md",
     "scripts/install.sh",                      # locates and stops the old installation
     "scripts/migrate_identity.py",             # maps old names to new names
+    "release/pipeline.py",                     # blocks disclosure of the private repository slug
     "tests/test_identity_migration.py",         # proves that mapping
+    "tests/test_release_pipeline.py",           # disclosure canary for the private repository slug
 }
 
 
@@ -212,19 +216,29 @@ def _fake_systemctl(tmp_path: Path) -> tuple[Path, Path]:
     return bindir, log
 
 
-def _run_installer_migration(home: Path, bindir: Path, log: Path) -> subprocess.CompletedProcess:
+def _run_installer_migration(
+    home: Path,
+    bindir: Path,
+    log: Path,
+    *,
+    migrator: Path = MIGRATOR_PATH,
+    prefix: Path | None = None,
+) -> subprocess.CompletedProcess:
     script = (
         "set -euo pipefail\n"
         + _installer_migration_function()
         + "migrate_legacy_install\n"
     )
+    prefix = prefix or home / "bin"
     env = {
         **os.environ,
         "HOME": str(home),
         "PATH": f"{bindir}:{os.environ['PATH']}",
         "PYTHON": os.environ.get("PYTHON", "python3"),
         "ROOT": str(ROOT),
-        "MIGRATOR": str(MIGRATOR_PATH),
+        "MIGRATOR": str(migrator),
+        "PREFIX": str(prefix),
+        "LAUNCHER": str(prefix / "tg-bridge"),
         "SYSTEMCTL_LOG": str(log),
     }
     return subprocess.run(["bash", "-c", script], env=env, capture_output=True, text=True)
@@ -241,6 +255,97 @@ def test_installer_stops_old_units_before_the_state_move(tmp_path):
     calls = log.read_text().splitlines()
     assert any(f"disable --now {OLD}.service" in call for call in calls)
     assert (home / ".local" / "share" / NEW / "offset").read_text() == "41\n"
+
+
+def test_installer_stops_real_legacy_waiter_before_it_can_recreate_old_state(tmp_path):
+    home = tmp_path / "home"
+    _old_install(home)
+    cli = home / ".local" / "share" / OLD / "releases" / "abc" / "bridge" / "cli.py"
+    cli.parent.mkdir(parents=True)
+    cli.write_text(
+        "import pathlib, time\n"
+        f"state = pathlib.Path({str(home / '.local' / 'share' / OLD)!r})\n"
+        "while True:\n"
+        "    state.mkdir(parents=True, exist_ok=True)\n"
+        "    (state / 'waiter-was-here').write_text('live\\n')\n"
+        "    time.sleep(0.01)\n"
+    )
+    bindir, log = _fake_systemctl(tmp_path)
+    unrelated = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"])
+    waiter = subprocess.Popen([sys.executable, str(cli), "recv", "--topic", "1", "--wait", "86400"])
+    try:
+        deadline = time.monotonic() + 2
+        marker = home / ".local" / "share" / OLD / "waiter-was-here"
+        while not marker.exists() and time.monotonic() < deadline:
+            time.sleep(0.01)
+        assert marker.exists(), "the real legacy waiter did not start"
+
+        result = _run_installer_migration(home, bindir, log)
+        time.sleep(0.25)
+
+        assert result.returncode == 0, result.stderr
+        assert waiter.poll() is not None
+        assert unrelated.poll() is None, "an unrelated Python process was stopped"
+        assert not (home / ".local" / "share" / OLD).exists()
+        assert (home / ".local" / "share" / NEW / "waiter-was-here").read_text() == "live\n"
+    finally:
+        for process in (waiter, unrelated):
+            if process.poll() is None:
+                process.terminate()
+            process.wait(timeout=5)
+
+
+def test_migration_replaces_launcher_symlink_without_touching_release(tmp_path):
+    home = tmp_path / "home"
+    _old_install(home)
+    bindir, log = _fake_systemctl(tmp_path)
+    target = home / ".local" / "share" / OLD / "releases" / "abc" / "bin" / "tg-bridge"
+    target.parent.mkdir(parents=True)
+    target.write_bytes(b"immutable legacy launcher\n")
+    target_inode = target.stat().st_ino
+    prefix = home / "bin"
+    prefix.mkdir()
+    launcher = prefix / "tg-bridge"
+    launcher.symlink_to(target)
+
+    result = _run_installer_migration(home, bindir, log, prefix=prefix)
+
+    assert result.returncode == 0, result.stderr
+    assert launcher.is_file() and not launcher.is_symlink()
+    assert "migration in progress" in launcher.read_text()
+    migrated_target = home / ".local" / "share" / NEW / "releases" / "abc" / "bin" / "tg-bridge"
+    assert migrated_target.read_bytes() == b"immutable legacy launcher\n"
+    assert migrated_target.stat().st_ino == target_inode
+
+
+def test_failed_migration_restores_launcher_and_preserves_old_state(tmp_path):
+    home = tmp_path / "home"
+    _old_install(home)
+    bindir, log = _fake_systemctl(tmp_path)
+    target = tmp_path / "immutable-tg-bridge"
+    target.write_bytes(b"old launcher\n")
+    prefix = home / "bin"
+    prefix.mkdir()
+    launcher = prefix / "tg-bridge"
+    launcher.symlink_to(target)
+    failing = tmp_path / "failing_migrator.py"
+    failing.write_text(
+        "import os, sys\n"
+        "if '--apply' in sys.argv:\n"
+        "    raise SystemExit(9)\n"
+        f"os.execv(sys.executable, [sys.executable, {str(MIGRATOR_PATH)!r}, *sys.argv[1:]])\n"
+    )
+
+    result = _run_installer_migration(
+        home, bindir, log, migrator=failing, prefix=prefix
+    )
+
+    assert result.returncode != 0
+    assert launcher.is_symlink()
+    assert launcher.resolve() == target
+    assert target.read_bytes() == b"old launcher\n"
+    assert (home / ".local" / "share" / OLD / "offset").read_text() == "41\n"
+    assert not (home / ".local" / "share" / NEW).exists()
 
 
 def test_installer_conflict_refuses_before_stopping_any_unit(tmp_path):

@@ -45,6 +45,17 @@ def _echoing_tmux(literals=None, calls=None):
             return SimpleNamespace(returncode=0, stdout="100,40,80,0")
         if argv[:2] == ["tmux", "capture-pane"]:
             return SimpleNamespace(returncode=0, stdout="\n".join(screen))
+        if argv[-1] == "BSpace":
+            # The receipt is erased with one BSpace per character before Enter (#267); a fake
+            # that ignored them would leave the nonce on screen and refuse every delivery.
+            n = sum(1 for a in argv if a == "BSpace")
+            while n and screen:
+                take = min(n, len(screen[-1]))
+                screen[-1] = screen[-1][:len(screen[-1]) - take]
+                n -= take
+                if not screen[-1]:
+                    screen.pop()
+            return SimpleNamespace(returncode=0)
         if "-l" in argv:
             if literals is not None:
                 literals.append(argv)
@@ -449,7 +460,9 @@ def test_stale_first_unread_owner_cannot_nudge_a_later_batch(monkeypatch, tmp_pa
 
     assert second_result["wake"] == "nudged"
     assert first_result["wake"] == "already-unread"
-    assert len(literal_nudges) == 1
+    # One WAKE LINE, not one send-keys: each injection also types a verification receipt
+    # (#267), so counting raw literals would count that too and pass for the wrong reason.
+    assert len([k for k in literal_nudges if "tg-bridge recv" in k[-1]]) == 1
 
 
 def test_notify_reports_failed_wake_without_losing_local_or_telegram_delivery(
@@ -550,13 +563,17 @@ def test_existing_nudge_primitive_returns_success_and_injects_only_recv_cue(monk
 
     assert daemon.maybe_nudge(8265, "%42") is True
     keys = [argv for argv, _kwargs in calls if argv[:2] == ["tmux", "send-keys"]]
-    assert len(keys) == 2                       # the recv cue and its Enter — nothing else
+    # The recv cue, the verification receipt, the backspaces that remove it, the Enter —
+    # and nothing else. What the SESSION sees is still only the cue (#267).
+    assert len(keys) == 4
     assert keys[0] == [
         "tmux", "send-keys", "-t", "%42", "-l",
         "[tg-bridge] New Telegram message in your topic — "
         "run `tg-bridge recv --topic 8265` and act on it.",
     ]
-    assert keys[1] == ["tmux", "send-keys", "-t", "%42", "Enter"]
+    assert keys[1][:5] == ["tmux", "send-keys", "-t", "%42", "-l"] and keys[1][-1].isalnum()
+    assert set(keys[2][4:]) == {"BSpace"} and len(keys[2][4:]) == len(keys[1][-1])
+    assert keys[3] == ["tmux", "send-keys", "-t", "%42", "Enter"]
     # #133: the Enter is only reached after the pane was read back and the text was seen
     order = [argv[1] for argv, _kwargs in calls]
     assert order.index("capture-pane") < order.index("send-keys")

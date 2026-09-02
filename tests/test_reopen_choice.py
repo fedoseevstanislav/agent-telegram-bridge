@@ -1423,7 +1423,7 @@ def _briefing_pane(monkeypatch, compacting, busy=None):
                             "T", (), {"start": lambda self: seen["retries"].append(
                                 (args, kwargs))})())
 
-    def _type(pane, text, settle=0.4):
+    def _type(pane, text, settle=0.4, still_ok=None):
         seen["typed_at"] = seen["n"]
         return "sent"
 
@@ -1546,16 +1546,21 @@ def test_a_rebinding_during_the_compaction_wait_abandons_the_briefing(monkeypatc
     assert marked == [], "marked a pane briefed that never received the briefing"
 
 
-def test_a_plain_first_attempt_still_does_not_consult_the_registry(monkeypatch):
-    """The revalidation must stay off the inline path. A first attempt with no long wait runs
-    immediately after revive_one bound the pane, so re-reading there races the very binding
-    write it was handed — which is why the original check was gated on attempt > 1."""
+def test_a_plain_first_attempt_now_consults_the_registry(monkeypatch):
+    """CONTRACT CHANGE (#238). The inline path used to be exempt from revalidation, on the
+    theory that the re-read races the binding write revive_one just handed down. It does
+    not: update_registry commits under an exclusive file lock before deliver_briefing is
+    called, so this chain's own bind is always visible — an absent or different binding
+    means the topic moved on, and typing anyway puts one topic's operating instructions
+    into another topic's pane (#236 review r1)."""
     seen = _briefing_pane(monkeypatch, [False])
-    monkeypatch.setattr(daemon, "read_registry", lambda: {})     # binding not yet visible
+    monkeypatch.setattr(daemon, "read_registry", lambda: {})     # topic no longer bound here
 
     daemon.deliver_briefing("%178", "12999", "claude", "brief {tid}")
 
-    assert seen["typed_at"] is not None, "raced the binding write it was just handed"
+    assert seen["typed_at"] is None, (
+        "typed a first-attempt briefing into a pane the registry does not bind (#238)"
+    )
 
 
 def test_the_retry_carries_the_compaction_window_not_just_the_flag(monkeypatch):
@@ -1608,7 +1613,7 @@ def test_briefed_boot_is_never_stamped_on_a_pane_that_did_not_receive_it(monkeyp
     marks = []
     monkeypatch.setattr(daemon, "update_registry", lambda fn: (fn(registry), marks.append(1)))
 
-    def _type(pane, text, settle=0.4):
+    def _type(pane, text, settle=0.4, still_ok=None):
         seen["typed_at"] = seen["n"]
         registry["12999"]["pane"] = "%999"     # rebound while we were typing
         return "sent"

@@ -16,6 +16,16 @@ BOT_ID = 123456789
 CFG = {"chat_id": 1, "owner_id": OWNER, "bot_token": f"{BOT_ID}:AA-not-a-real-token"}
 
 
+@pytest.fixture(autouse=True)
+def _fresh_reject_coalescer():
+    """#212 coalesces identical rejection lines inside a window; several tests here reject
+    the same (kind, topic, sender) key and each assert on its OWN log line, so the window
+    state must not leak between them."""
+    daemon._svc_rejects.clear()
+    yield
+    daemon._svc_rejects.clear()
+
+
 @pytest.fixture
 def registry(tmp_path, monkeypatch):
     # STATE_DIR, not daemon.state_path: `read_registry` lives in bridge.common and resolves

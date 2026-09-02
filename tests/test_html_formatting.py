@@ -162,3 +162,61 @@ def test_send_message_splits_multichunk(monkeypatch):
     common.send_message("t", 5, "\n".join(["y" * 30] * 300), thread_id=1)
     assert len(rec.calls) > 1
     assert all(len(c["text"]) <= common._TG_HTML_LIMIT + 20 for c in rec.calls)  # +tags
+
+
+def test_send_message_verbatim_preserves_disclosure_characters(monkeypatch):
+    rec = _Api()
+    monkeypatch.setattr(common, "api", rec)
+    line = (
+        "+ [install guide](https://example.com/real-target) `code` "
+        "__init__.py <literal> ~~old~~ & exact\n"
+    )
+    disclosure = (line * (10528 // len(line) + 1))[:10528]
+
+    deliveries = common.send_message("t", 5, disclosure, thread_id=33, verbatim=True)
+
+    assert len(rec.calls) == 3
+    assert "".join(call["text"] for call in rec.calls) == disclosure
+    assert "".join(delivery["text"] for delivery in deliveries) == disclosure
+    assert all("parse_mode" not in call for call in rec.calls)
+    assert all(len(call["text"]) <= common._TG_HTML_LIMIT for call in rec.calls)
+
+
+def test_send_message_adds_force_reply_only_to_a_single_prompt(monkeypatch):
+    rec = _Api()
+    monkeypatch.setattr(common, "api", rec)
+
+    common.send_message(
+        "t", 5, "Reply OK or go", thread_id=33,
+        reply_markup={"force_reply": True, "input_field_placeholder": "OK to publish"},
+    )
+
+    assert rec.calls == [{
+        "chat_id": 5,
+        "message_thread_id": 33,
+        "text": "Reply OK or go",
+        "parse_mode": "HTML",
+        "reply_markup": '{"force_reply":true,"input_field_placeholder":"OK to publish"}',
+    }]
+    with pytest.raises(ValueError, match="single Telegram message chunk"):
+        common.send_message(
+            "t", 5, "x" * (common._TG_HTML_LIMIT + 1), reply_markup={"force_reply": True}
+        )
+
+
+def test_verbatim_ambiguous_delivery_records_exact_inflight_chunk(monkeypatch):
+    def ambiguous(_token, _method, _params):
+        raise common.PossiblyDelivered("unknown send result")
+
+    monkeypatch.setattr(common, "api", ambiguous)
+    raw = "__init__.py [guide](https://example.com)"
+
+    with pytest.raises(common.PossiblyDelivered) as caught:
+        common.send_message("t", 5, raw, verbatim=True)
+
+    assert caught.value.completed_sends == []
+    assert caught.value.possibly_delivered_send == {
+        "text": raw,
+        "chunk_index": 0,
+        "chunk_count": 1,
+    }

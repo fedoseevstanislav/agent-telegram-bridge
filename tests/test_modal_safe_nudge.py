@@ -6,10 +6,11 @@ the widget and the Enter accepts the highlighted option, silently downgrading th
 model. The message isn't delivered either. Same hazard for approval/update/resume pickers
 and for claude's own dialogs.
 
-The guard is behavioural, not cosmetic: type, confirm the text actually rendered in the
-input box, and only then press Enter. These tests pin that contract against the REAL pane
-geometry of both engines (captured from live panes), because the load-bearing constant is
-how far above the bottom each engine draws its input line.
+The guard is behavioural, not cosmetic: type, confirm the keystrokes actually reached an
+input box, and only then press Enter. Since #267 the confirmation is a fresh nonce typed
+after the payload and backspaced off before the Enter — a string that existed nowhere until
+this injection, so nothing the pane repaints can counterfeit it. These tests pin that
+contract against the REAL pane geometry of both engines, captured from live panes.
 """
 
 import threading
@@ -26,8 +27,8 @@ from bridge import daemon
 # project and cost replaced by neutral text. What has to survive that substitution is the
 # SHAPE: the number of lines below `{INPUT}` and the fact that a modal has no input line at
 # all. The detector does not read only those lines — `type_line` squashes the whole capture
-# and requires a strict rise in the count of the injected text — so keep the line count and
-# the footer structure when you edit these, and change wording freely.
+# and looks for the receipt it typed anywhere in it (#267) — so keep the line count and the
+# footer structure when you edit these, and change wording freely.
 
 CLAUDE_IDLE = """\
   a completed turn's last three lines of output, which are ordinary scrollback
@@ -72,11 +73,6 @@ NUDGE = "[tg-bridge] New Telegram message in your topic — run `tg-bridge recv 
 _REAL_SLEEP = time.sleep
 
 
-def _counted(screen):
-    """What type_line actually counts in — the WHOLE capture, squashed (#165)."""
-    return daemon._squash(screen)
-
-
 class FakePane:
     """tmux stand-in. `accepts` False models a modal: printable keys go nowhere.
 
@@ -93,6 +89,7 @@ class FakePane:
         self.capture_fails_after_typing = capture_fails_after_typing
         self.typed = []
         self.submitted = []
+        self.erases = 0
         self.enters = 0
         self.trace = None
         self.op_delay = 0
@@ -132,6 +129,14 @@ class FakePane:
                 self.enters += 1
                 self.submitted.append(self.value)
                 self.value = ""          # submit clears the box
+            elif argv[-1] == "BSpace":
+                # One character per keypress, from the end — the receipt is erased this way
+                # (#267). A modal swallows these exactly as it swallows printable keys.
+                self._mark("erase")
+                n = sum(1 for a in argv if a == "BSpace")
+                self.erases += n
+                if self.accepts and n:
+                    self.value = self.value[:-n]
             else:
                 self._mark("type")
                 self.typed.append(argv[-1])
@@ -150,6 +155,7 @@ class FakeSequence:
         self.screens = screens
         self.geometries = geometries
         self.enters = 0
+        self.erased = 0
         self.typed = []
 
     def __call__(self, argv, **kw):
@@ -160,9 +166,23 @@ class FakeSequence:
             return types.SimpleNamespace(returncode=0, stdout=next(self.screens, ""), stderr="")
         if argv[-1] == "Enter":
             self.enters += 1
+        elif argv[-1] == "BSpace":
+            self.erased += sum(1 for a in argv if a == "BSpace")
         elif "-l" in argv:
             self.typed.append(argv[-1])
         return types.SimpleNamespace(returncode=0, stdout="", stderr="")
+
+
+NONCE = "zq7f3a2m"
+
+
+@pytest.fixture(autouse=True)
+def _fixed_receipt(monkeypatch):
+    """Pin the receipt so a fixture can spell out exactly what the pane shows (#267).
+    Production draws a fresh one per call — test_every_injection_gets_a_fresh_receipt pins
+    that separately, because a constant nonce would silently reintroduce the residue
+    ambiguity this whole mechanism exists to remove."""
+    monkeypatch.setattr(daemon, "_receipt_nonce", lambda: NONCE)
 
 
 @pytest.fixture(autouse=True)
@@ -222,54 +242,150 @@ def test_codex_caret_alone_is_not_a_modal(monkeypatch):
 
 def test_scrollback_residue_does_not_mask_a_live_modal(monkeypatch):
     """An earlier, already-entered nudge sitting just above the picker must not be mistaken
-    for the text we just typed — that's why the check counts occurrences instead of asking
-    'is it present?'.
+    for the text we just typed.
 
-    The residue must land INSIDE the counted window or this proves nothing: an earlier draft
-    of this test prepended so many rows that the region excluded the residue and the counts
-    were 0/0, i.e. it passed without ever exercising the count."""
+    Until #267 that took a strict RISE in the count of the text's tail, because presence
+    alone could not tell a stale copy from a fresh one. The receipt makes the question
+    trivial: the pane may hold any number of copies of the payload and none of them is the
+    nonce, which existed nowhere until this call typed it."""
     residue = f"❯ {NUDGE}\n  2. Keep current model\n› 1. Switch to gpt-5.6-luna"
-    assert daemon._echo_probe(NUDGE) in _counted(residue), \
-        "residue must be inside the counted window for this test to mean anything"
+    assert NUDGE in residue and NONCE not in residue
     pane = _install(monkeypatch, FakePane(residue, accepts=False))
     assert daemon.type_line("%1", NUDGE) == "swallowed"
     assert pane.enters == 0
 
 
-def test_a_falling_count_is_never_proof(monkeypatch):
-    """Two stale copies in the region, a modal swallows the typing, and one stale copy
-    scrolls out. The count changes (2 -> 1) but every remaining match is stale — reading a
-    change rather than a RISE as proof pressed Enter on the live picker."""
-    screens = iter([f"{NUDGE}\n{NUDGE}", NUDGE])
+def test_an_identical_repaint_cannot_authorise_the_enter(monkeypatch):
+    """The reproduction that refused three designs of #250 and all of #253.
+
+    A picker holds the keystrokes while the session repaints an OLDER, byte-identical copy
+    of the same wake line. Every count-based rule reads that repaint as delivery and presses
+    Enter, which accepts the highlighted option. The receipt is not in the repaint, because
+    the repaint is of something written before this call existed."""
+    screens = iter([CODEX_RATE_LIMIT_MODAL,
+                    f"  {NUDGE}\n" + CODEX_RATE_LIMIT_MODAL,
+                    f"  {NUDGE}\n  {NUDGE}\n" + CODEX_RATE_LIMIT_MODAL])
     pane = _install(monkeypatch, FakeSequence(screens))
     assert daemon.type_line("%1", NUDGE) == "swallowed"
     assert pane.enters == 0
 
 
-def test_a_rising_count_past_stale_copies_is_proof(monkeypatch):
-    """The other direction: stale copies present in BOTH captures cancel out, so a genuine
-    landing is still recognised and delivery isn't wedged by residue."""
-    screens = iter([NUDGE, f"{NUDGE}\n{NUDGE}"])
+def test_a_late_render_is_delivered_not_called_a_modal(monkeypatch):
+    """The bug this replaced the count for. Nothing on screen at the first look, the receipt
+    on the third — which under the old rule was indistinguishable from a modal and produced
+    a permanent refusal: text stranded unsent in the box and the owner told their session was
+    unreachable. Measured on live panes at 0.9s, 1.1s, 2.5s and 0.9s."""
+    screens = iter(["idle", "idle", "idle", f"❯ {NUDGE}{NONCE}", f"❯ {NUDGE}"])
     pane = _install(monkeypatch, FakeSequence(screens))
     assert daemon.type_line("%1", NUDGE) == "sent"
     assert pane.enters == 1
+    assert pane.typed == [NUDGE, NONCE]     # typed once, never retyped while waiting
 
 
-@pytest.mark.parametrize("before,after,expected", [
-    (0, 0, "swallowed"),   # nothing rendered — a modal ate it
-    (0, 1, "sent"),
-    (1, 1, "swallowed"),   # unresolvable: swallowed, or landed as a stale copy scrolled out
-    (1, 2, "sent"),
-    (2, 1, "swallowed"),   # a fall is never proof
-    (1, 0, "swallowed"),
-    (2, 3, "sent"),
-])
-def test_decision_matrix(monkeypatch, before, after, expected):
-    """The whole before/after state space, pinned. Only a strict rise authorises the Enter."""
-    pane = _install(monkeypatch, FakeSequence(iter(["\n".join([NUDGE] * n) if n else "idle"
-                                                   for n in (before, after)])))
-    assert daemon.type_line("%1", NUDGE) == expected
-    assert pane.enters == (1 if expected == "sent" else 0)
+def test_the_payload_is_typed_before_the_receipt_and_only_once(monkeypatch):
+    """Order is the whole argument: the receipt proves the keystrokes BEFORE it reached the
+    same input. Typed the other way round it would prove nothing about the payload."""
+    pane = _install(monkeypatch, FakePane(CLAUDE_IDLE))
+    assert daemon.type_line("%1", NUDGE) == "sent"
+    assert pane.typed == [NUDGE, NONCE]
+
+
+def test_the_receipt_is_erased_before_the_enter(monkeypatch):
+    """What the session receives is the payload and nothing else. The nonce is an artefact of
+    verification, and a message carrying eight random characters would be a defect the user
+    sees on every single nudge."""
+    pane = _install(monkeypatch, FakePane(CLAUDE_IDLE))
+    assert daemon.type_line("%1", NUDGE) == "sent"
+    assert pane.submitted == [NUDGE]
+
+
+def test_an_unerasable_receipt_withholds_the_enter(monkeypatch):
+    """A pane that echoes but refuses backspaces would otherwise send `<payload>zq7f3a2m`.
+    Withhold instead: a stranded line is recoverable, a corrupted delivered message is not."""
+    screens = iter([CLAUDE_IDLE.replace("{INPUT}", ""),
+                    f"❯ {NUDGE}{NONCE}"] + [f"❯ {NUDGE}{NONCE}"] * 20)
+    pane = _install(monkeypatch, FakeSequence(screens))
+    assert daemon.type_line("%1", NUDGE) == "swallowed"
+    assert pane.enters == 0
+
+
+def test_a_window_that_shrank_cannot_report_the_receipt_erased(monkeypatch):
+    """Why the geometry fingerprint is still checked on every look, and specifically why it
+    is checked on the CLEARING one.
+
+    "The nonce is gone" is read off a capture, and a capture is a window over the pane. A
+    resize that pulls rows back out of history moves that window's top edge BACKWARDS
+    (#165 r2), so content can leave the window without leaving the input box. Trust that and
+    the Enter goes in with eight random characters still on the end of the message — the one
+    outcome worse than a withheld nudge, because it is delivered and unrecoverable.
+
+    Nothing else catches this: the receipt's uniqueness makes its PRESENCE unforgeable, and
+    says nothing at all about its ABSENCE. A mutation removing this check passed all 187
+    other tests."""
+    still_there = f"❯ {NUDGE}{NONCE}\n  statusline"
+    pane = _install(monkeypatch, FakeSequence(
+        iter([CLAUDE_IDLE.replace("{INPUT}", ""), still_there, still_there]),
+        # baseline, then the appear look at the same geometry, then a look taken after the
+        # history shrank under us — same rows on screen, different rows in the window.
+        geometries=iter([_GEO, _GEO, _GEO, _GEO, "40,40,80,0", "40,40,80,0"])))
+    assert daemon.type_line("%1", NUDGE) == "swallowed"
+    assert pane.enters == 0
+
+
+def test_a_receipt_that_never_showed_is_taken_back_anyway(monkeypatch):
+    """The defect review reproduced, closed at the only moment it can be.
+
+    An attempt whose receipt the pane folds into a paste chip cannot see it — and the
+    keystrokes landed all the same, so those eight characters sit in the input box. The next
+    attempt appends to the SAME box, renders and clears its own receipt cleanly, and its
+    Enter delivers the message with the older receipt still on it. That is worse than any
+    withheld nudge, because it is delivered and unrecoverable, and nothing on screen tells
+    the stale nonce from the message afterwards.
+
+    So the backspaces go out on the refusal path too, unseen. If a modal swallowed the
+    printable keys it swallows these; if the write became a chip, the chip goes with them."""
+    hidden = "❯ [Pasted text #1]\n  statusline"
+    pane = _install(monkeypatch, FakeSequence(iter([CLAUDE_IDLE.replace("{INPUT}", ""),
+                                                    hidden, hidden])))
+    assert daemon.type_line("%1", NUDGE) == "swallowed"
+    assert pane.enters == 0
+    assert pane.erased == len(NONCE)
+
+
+def test_a_modal_refusal_also_takes_the_receipt_back(monkeypatch):
+    """Same on the ordinary modal path. The keystrokes were probably swallowed, but "probably"
+    is not a reason to leave eight random characters in a box we cannot see into."""
+    pane = _install(monkeypatch, FakePane(CODEX_RATE_LIMIT_MODAL, accepts=False))
+    assert daemon.type_line("%1", NUDGE) == "swallowed"
+    assert pane.enters == 0
+    assert pane.erases == len(NONCE)
+
+
+def test_the_erase_is_exactly_the_receipt_length(monkeypatch):
+    """One backspace per nonce character, no more: an extra one eats the payload's last
+    character and delivers a truncated message."""
+    pane = _install(monkeypatch, FakePane(CLAUDE_IDLE))
+    daemon.type_line("%1", NUDGE)
+    assert pane.erases == len(NONCE)
+
+
+def test_every_injection_gets_a_fresh_receipt(monkeypatch):
+    """Unpinned, so this is the real generator. A repeated nonce would be residue like any
+    other — the previous injection's copy would authorise the next one."""
+    monkeypatch.undo()
+    seen = {daemon._receipt_nonce() for _ in range(200)}
+    assert len(seen) > 190
+    assert all(n.isalnum() and n.islower() and len(n) == daemon.RECEIPT_NONCE_CHARS
+               for n in seen)
+
+
+def test_a_receipt_already_on_the_pane_is_refused(monkeypatch):
+    """Degenerate, but it must fail closed rather than confirm itself: if the string is
+    already there, its later presence proves nothing."""
+    pane = _install(monkeypatch, FakePane(f"  {NONCE} in the transcript\n❯ {{INPUT}}"))
+    assert daemon.type_line("%1", NUDGE) == "failed"
+    assert pane.typed == []
+    assert pane.enters == 0
 
 
 def test_deep_chrome_still_finds_the_input(monkeypatch):
@@ -288,7 +404,8 @@ def test_repeated_unverified_attempts_stop_typing(monkeypatch):
     pane = _install(monkeypatch, FakePane(CODEX_RATE_LIMIT_MODAL, accepts=False))
     results = [daemon.type_line("%1", NUDGE) for _ in range(4)]
     assert results == ["swallowed"] * 4
-    assert len(pane.typed) == daemon.SWALLOW_MAX_ATTEMPTS   # then it stops adding to the box
+    # Each attempt writes the payload and then the receipt, so count payloads (#267).
+    assert pane.typed.count(NUDGE) == daemon.SWALLOW_MAX_ATTEMPTS  # then it stops typing
     assert pane.enters == 0
 
 
@@ -334,13 +451,13 @@ def test_a_repainting_modal_cannot_reset_the_cap(monkeypatch):
     pane = _install(monkeypatch, Ticking(CODEX_RATE_LIMIT_MODAL, accepts=False))
     for _ in range(6):
         assert daemon.type_line("%2", NUDGE) == "swallowed"
-    assert len(pane.typed) == daemon.SWALLOW_MAX_ATTEMPTS
+    assert pane.typed.count(NUDGE) == daemon.SWALLOW_MAX_ATTEMPTS
     assert pane.enters == 0
 
     now = time.time()
     monkeypatch.setattr(daemon.time, "time", lambda: now + daemon.SWALLOW_RETRY_AFTER + 1)
     assert daemon.type_line("%2", NUDGE) == "swallowed"
-    assert len(pane.typed) == daemon.SWALLOW_MAX_ATTEMPTS + 1   # one more try, then capped again
+    assert pane.typed.count(NUDGE) == daemon.SWALLOW_MAX_ATTEMPTS + 1  # one more, then capped
     assert pane.enters == 0
 
 
@@ -359,7 +476,7 @@ def test_a_failing_enter_counts_against_the_pane(monkeypatch):
     # the first attempts genuinely fail; after that the cap engages and stops typing at all
     assert results[:2] == ["failed", "failed"]
     assert set(results[2:]) == {"swallowed"}
-    assert len(pane.typed) == daemon.SWALLOW_MAX_ATTEMPTS   # bounded, not one copy per call
+    assert pane.typed.count(NUDGE) == daemon.SWALLOW_MAX_ATTEMPTS  # bounded, not one per call
 
 
 def test_the_timed_retry_spends_one_attempt_not_a_fresh_budget(monkeypatch):
@@ -371,14 +488,14 @@ def test_the_timed_retry_spends_one_attempt_not_a_fresh_budget(monkeypatch):
     monkeypatch.setattr(daemon.time, "time", lambda: now)
     for _ in range(4):
         daemon.type_line("%2", NUDGE)
-    assert len(pane.typed) == daemon.SWALLOW_MAX_ATTEMPTS
+    assert pane.typed.count(NUDGE) == daemon.SWALLOW_MAX_ATTEMPTS
 
     for window in range(1, 4):   # each window buys exactly ONE more attempt
         monkeypatch.setattr(daemon.time, "time",
                             lambda w=window: now + w * (daemon.SWALLOW_RETRY_AFTER + 1))
         for _ in range(4):
             daemon.type_line("%2", NUDGE)
-        assert len(pane.typed) == daemon.SWALLOW_MAX_ATTEMPTS + window
+        assert pane.typed.count(NUDGE) == daemon.SWALLOW_MAX_ATTEMPTS + window
     assert pane.enters == 0
 
 
@@ -439,12 +556,14 @@ def test_concurrent_injections_cannot_interleave(monkeypatch):
         t.join(timeout=10)
 
     assert [r for _n, r in results] == ["sent"] * 4
-    # the trace is a concatenation of whole sequences, never a mix of two callers' steps
-    assert len(pane.trace) == 16
-    for i in range(0, 16, 4):
-        chunk = pane.trace[i:i + 4]
-        assert [step for step, _who in chunk] == ["capture", "type", "capture", "Enter"], chunk
-        assert len({who for _step, who in chunk}) == 1, chunk   # all four steps, one caller
+    # The trace is a concatenation of whole sequences, never a mix of two callers' steps.
+    # One sequence is baseline capture, payload, receipt, look, erase, look, Enter (#267).
+    seq = ["capture", "type", "type", "capture", "erase", "capture", "Enter"]
+    assert len(pane.trace) == len(seq) * 4
+    for i in range(0, len(pane.trace), len(seq)):
+        chunk = pane.trace[i:i + len(seq)]
+        assert [step for step, _who in chunk] == seq, chunk
+        assert len({who for _step, who in chunk}) == 1, chunk   # every step, one caller
 
 
 def _lock_trace(monkeypatch):
@@ -555,11 +674,68 @@ def test_empty_text_never_presses_enter(monkeypatch):
 
 # ---- probe helpers -----------------------------------------------------------
 
-def test_probe_is_the_tail_of_the_line():
-    # the tail lands next to the cursor; a wrapped line's head can be rows away
-    probe = daemon._echo_probe(NUDGE)
-    assert probe == daemon._squash(NUDGE)[-daemon.ECHO_PROBE_CHARS:]
-    assert daemon._squash(NUDGE).endswith(probe)
+def test_one_injection_makes_a_bounded_number_of_tmux_calls(monkeypatch):
+    """What can honestly be pinned about the pane lock hold, after review corrected me.
+
+    My first version of this test asserted the hold stays inside PANE_LOCK_TIMEOUT by adding
+    up the configured sleeps. That bound is FALSE: `_tmux` allows each call up to
+    TMUX_TIMEOUT, PANE_LOCK_TIMEOUT bounds only the acquisition, and a worst-case injection
+    makes dozens of tmux calls. A single hung call has always been able to blow any wall-clock
+    budget here, before this change and after it.
+
+    What this change actually moves is the COUNT, so the count is what gets pinned — and
+    pinned tightly enough that adding a look or a capture to the sequence has to be a
+    deliberate edit rather than a quiet one."""
+    pane = _install(monkeypatch, FakePane(CLAUDE_IDLE))
+    calls = []
+    real = pane.__call__
+    monkeypatch.setattr(daemon, "_tmux", lambda argv, **kw: (calls.append(argv), real(argv, **kw))[1])
+
+    assert daemon.type_line("%1", NUDGE) == "sent"
+    # baseline capture (2 geometry + 1 capture), payload, receipt, one appear look (3),
+    # the erase, one clear look (3), Enter.
+    assert len(calls) == 13
+    worst = 3 + 2 + 3 * daemon.RECEIPT_LOOKS + 1 + 3 * daemon.RECEIPT_CLEAR_LOOKS + 1
+    assert worst == 49
+
+
+def test_the_paste_gap_is_real_and_comes_between_the_two_writes(monkeypatch):
+    """The receipt escapes the payload's paste chip only because it is written after a pause.
+    A mutation setting RECEIPT_TYPE_GAP to 0 passed every other test in this file — the
+    constant the behaviour depends on was pinned nowhere."""
+    events = []
+    monkeypatch.setattr(daemon.time, "sleep", lambda s: events.append(("sleep", s)))
+    pane = FakePane(CLAUDE_IDLE)
+    real = pane.__call__
+
+    def spy(argv, **kw):
+        if argv[:2] == ["tmux", "send-keys"] and "-l" in argv:
+            events.append(("type", argv[-1]))
+        return real(argv, **kw)
+
+    monkeypatch.setattr(daemon, "_tmux", spy)
+    assert daemon.type_line("%1", NUDGE) == "sent"
+
+    assert daemon.RECEIPT_TYPE_GAP > 0
+    payload_at = events.index(("type", NUDGE))
+    receipt_at = events.index(("type", NONCE))
+    between = [s for kind, s in events[payload_at + 1:receipt_at] if kind == "sleep"]
+    assert between == [daemon.RECEIPT_TYPE_GAP], events
+
+
+def test_the_appear_budget_covers_the_measured_render_latencies():
+    """Every late render recorded on a live pane, in seconds. The budget exists to cover
+    these; shrinking it below them re-creates the strand this replaced the count for."""
+    measured = (0.44, 0.9, 0.9, 1.1, 2.5)
+    assert daemon.RECEIPT_LOOKS * daemon.RECEIPT_POLL > max(measured)
+
+
+def test_the_receipt_alphabet_carries_no_syntax():
+    """The nonce is typed into a live composer with the payload still in it. A character
+    either engine's slash-command menu, the shell, or tmux send-keys treats as syntax would
+    turn verification into an action — so the alphabet is letters and digits, nothing else."""
+    assert daemon._RECEIPT_ALPHABET.isalnum()
+    assert daemon._RECEIPT_ALPHABET == daemon._RECEIPT_ALPHABET.lower()
 
 
 def test_squash_survives_a_wrap():
@@ -670,7 +846,7 @@ def test_growing_history_still_delivers(monkeypatch):
     top edge forward and evicts. Refusing that would fail every injection into a pane that
     printed a line while we typed."""
     idle = "● done\n────────\n❯ \n────────\n  statusline\n"
-    landed = "● done\n────────\n❯ [Pasted text #1]\n────────\n  statusline\n"
+    landed = f"● done\n────────\n❯ [Pasted text #1]{NONCE}\n────────\n  statusline\n"
     pane = _install(monkeypatch, FakeSequence(
         iter([idle, landed]),
         geometries=iter([_GEO, _GEO, "137,40,80,0", "137,40,80,0"])))
@@ -679,71 +855,52 @@ def test_growing_history_still_delivers(monkeypatch):
 
 
 def test_a_short_command_lands_on_a_churning_alternate_screen_pane(monkeypatch):
-    """#168, reproduced from the live failure rather than imagined.
+    """#168's live failure, and the class of failure #267 closes for good.
 
-    A claude pane runs on the ALTERNATE SCREEN: `history_size` is 0, so `capture-pane -S -30`
-    clamps to the ~23 visible rows and the whole counted window is under a kilobyte. When the
-    daemon typed `/compact` into a healthy idle pane, one pre-existing occurrence scrolled out
-    of that small window as the typed one appeared. #165 r2 refused the rise because the other
-    count had fallen, reported the pane as blocked, and told the owner their terminal was stuck on a
-    prompt — for a pane with no modal on it at all.
+    `/compact` is the pathological payload: the old probe was the text's own tail, which for
+    an eight-character command is the whole string — and `/compact` occurs in ordinary
+    conversation. Three pre-existing occurrences were measured on the live pane. A claude
+    pane also runs on the ALTERNATE SCREEN, so `history_size` is 0, `capture-pane -S -30`
+    clamps to ~23 rows, and stale copies enter and leave that window constantly. Every
+    version of the counting rule had to reason about which way the count had moved and why;
+    #165 r2 got it wrong and told the owner a healthy idle pane was stuck on a prompt.
 
-    `/compact` is also the pathological probe: `_echo_probe` returns the whole eight-character
-    string, which occurs in ordinary conversation. Measured on the live pane at the time: three
-    pre-existing occurrences. The literal signal cannot be payload-specific here, which is
-    exactly why refusing on any fall is unaffordable.
-
-    What this pins is the transition the veto blocked: the typed text collapses into a chip
-    while a stale literal leaves the small window. The chip rose; #165 r2 threw that away
-    because the literal fell."""
-    before = "stale /compact from earlier\nline B\n❯ \n  statusline"
-    after = "line B\n❯ [Pasted text #4]\n  statusline"     # literal evicted, chip appeared
+    None of that arithmetic exists now. The pane may hold any number of `/compact`s, gaining
+    and losing them while we type, and the answer still comes from the one string that was
+    not there before."""
+    before = "stale /compact from earlier\nstale /compact again\nline B\n❯ \n  statusline"
+    after = f"line B\n❯ /compact{NONCE}\n  statusline"     # two stale copies evicted meanwhile
     pane = _install(monkeypatch, FakeSequence(iter([before, after]),
                                               geometries=iter([_GEO, _GEO, _GEO, _GEO])))
-    monkeypatch.setattr(daemon, "_echo_probe", lambda _t: "/compact")
     assert daemon.type_line("%1", "/compact") == "sent"
     assert pane.enters == 1
 
 
-def test_a_net_equal_count_is_still_refused(monkeypatch):
-    """The boundary this fix does NOT move, stated so nobody assumes otherwise.
-
-    If one occurrence scrolls out of the window as the typed one appears, the count nets to
-    EQUAL — and equal has never been a rise, under any version of this rule. So dropping the
-    fall veto does not rescue that case. Whether #168's live failure was this case or the mixed
-    one above is unknown, because the refusal logged no counts; that is precisely why the
-    logging went in alongside. Only the transcript settles it for good (#157)."""
-    before = "stale /compact here\n❯ \n  statusline"
-    after = "❯ /compact\n  statusline"                      # one out, one in -> 1 -> 1
-    pane = _install(monkeypatch, FakeSequence(iter([before, after]),
-                                              geometries=iter([_GEO, _GEO, _GEO, _GEO])))
-    monkeypatch.setattr(daemon, "_echo_probe", lambda _t: "/compact")
-    assert daemon.type_line("%1", "/compact") == "swallowed"
-    assert pane.enters == 0
-
-
 def test_a_modal_still_blocks_a_short_command(monkeypatch):
-    """The other half of #168: relaxing the fall veto must not reopen #133. A modal swallows
-    the keystrokes, so NEITHER count rises, and Enter is still withheld."""
-    modal = "Approaching rate limits\n❯ 1. Switch to gpt-5.6-luna\n  2. Keep going\n  statusline"
-    evicted = "❯ 1. Switch to gpt-5.6-luna\n  2. Keep going\n  statusline"   # churn, but no rise
-    pane = _install(monkeypatch, FakeSequence(iter([modal, evicted]),
+    """The other half of #168: none of this may reopen #133. A modal swallows the keystrokes,
+    so the receipt never appears, and Enter is still withheld — even though the payload
+    itself is sitting on the screen twice."""
+    modal = ("stale /compact here\nApproaching rate limits\n"
+             "❯ 1. Switch to gpt-5.6-luna\n  2. Keep going\n  statusline")
+    churned = "stale /compact here\n❯ 1. Switch to gpt-5.6-luna\n  2. Keep going\n  statusline"
+    pane = _install(monkeypatch, FakeSequence(iter([modal, churned]),
                                               geometries=iter([_GEO, _GEO, _GEO, _GEO])))
-    monkeypatch.setattr(daemon, "_echo_probe", lambda _t: "/compact")
     assert daemon.type_line("%1", "/compact") == "swallowed"
     assert pane.enters == 0
 
 
-def test_a_refusal_logs_the_counts(monkeypatch, capsys):
+def test_a_refusal_says_which_receipt_and_why(monkeypatch, capsys):
     """#168 had to be diagnosed from mechanism because the refusal logged only 'swallowed'.
-    The numbers that would have settled it in one line are now in the journal."""
+    A refusal must name the receipt it was waiting for and say whether the pane answered at
+    all — "no" (it stayed readable and the receipt never came) reads very differently from
+    "unreadable" (we could not see the pane), and they need different fixes."""
     screen = "nothing relevant here\n❯ \n  statusline"
     _install(monkeypatch, FakeSequence(iter([screen, screen]),
                                        geometries=iter([_GEO, _GEO, _GEO, _GEO])))
     daemon.type_line("%1", NUDGE)
     logged = capsys.readouterr().err
-    assert "literal=0->0" in logged and "chip=0->0" in logged, logged
-    assert "geo=" in logged
+    assert f"nonce={NONCE}" in logged, logged
+    assert "(no)" in logged and "geo=" in logged, logged
 
 
 def test_a_pane_that_cannot_be_locked_is_not_typed_into(monkeypatch):
@@ -919,6 +1076,9 @@ def test_swallowed_briefing_is_retried(monkeypatch):
     monkeypatch.setattr(daemon, "pane_alive", lambda _p: True)
     monkeypatch.setattr(daemon, "type_line", lambda *a, **k: "swallowed")
     monkeypatch.setattr(daemon, "report_blocked_pane", lambda *a: True)
+    # Bound to this pane: the #238 delivery guard now runs on every attempt.
+    monkeypatch.setattr(daemon, "read_registry", lambda: {"8265": {"pane": "%1"}})
+    monkeypatch.setattr(daemon, "current_boot_id", lambda: "boot-1")
     marked = []
     monkeypatch.setattr(daemon, "update_registry", lambda fn: marked.append(fn))
     monkeypatch.setattr(daemon.threading, "Timer",
@@ -963,18 +1123,22 @@ def test_a_retry_abandons_a_topic_already_briefed(monkeypatch):
     assert typed == []
 
 
-def test_first_attempt_does_not_consult_the_registry(monkeypatch):
-    """The first call runs inline right after the revive bound the pane; re-reading there
-    would race the binding write it was just handed."""
+def test_first_attempt_consults_the_registry_and_abandons_an_unbound_pane(monkeypatch):
+    """CONTRACT CHANGE (#238). This test used to pin the opposite: a first attempt typing
+    without consulting the registry, on the theory that the re-read races the binding write
+    it was just handed. It does not — update_registry commits under an exclusive file lock
+    before revive_one calls deliver_briefing — and what the exemption actually allowed was
+    typing into a pane the topic had already left (#236 review r1, both engines). Now every
+    delivery revalidates: no binding, no typing."""
     typed = []
     monkeypatch.setattr(daemon, "pane_alive", lambda _p: True)
     monkeypatch.setattr(daemon, "type_line", lambda p, t, **k: typed.append((p, t)) or "sent")
-    monkeypatch.setattr(daemon, "read_registry", lambda: {})   # not yet visible
+    monkeypatch.setattr(daemon, "read_registry", lambda: {})   # topic not bound to this pane
     monkeypatch.setattr(daemon, "update_registry", lambda fn: None)
     monkeypatch.setattr(daemon, "current_boot_id", lambda: "boot-1")
 
     daemon.deliver_briefing("%1", "8265", "codex", "brief {tid}")
-    assert typed == [("%1", "brief 8265")]
+    assert typed == [], "typed a briefing into a pane the registry does not bind (#238)"
 
 
 def test_giving_up_on_a_briefing_forces_the_escalation(monkeypatch):
@@ -1052,190 +1216,85 @@ def _always_current():
         yield True
     return _ctx
 
-
-# ---- Claude Code collapses long input into a chip (#163) ---------------------
+# ---- both engines collapse long input into a chip (#163, #267) ---------------
 #
-# The pane never renders the text, so the literal tail probe could not match and #133
-# withheld Enter on every long injection — every carry-forward broke the moment it went
-# live. Measured on live panes %44/%46: "❯ [Pasted text #1]", "❯ [Pasted text #5]".
+# Past some size neither engine renders the input literally: it becomes "[Pasted text #N]"
+# (claude 2.1.235) or "[Pasted Content N chars]" (codex 0.146.0). The payload is therefore
+# invisible on a pane that took it perfectly, which is why #133 refused every long injection
+# and broke every carry-forward the day it shipped. The receipt is what makes the payload's
+# own rendering irrelevant — but only if the receipt itself escapes the chip.
 
 def _chip_tmux(states):
-    """tmux stub whose capture-pane returns states.pop(0) each time, recording send-keys."""
+    """tmux stub whose capture-pane returns states.pop(0) each time (then repeats the last),
+    recording send-keys."""
     sent = []
 
     def fake(cmd, *a, **k):
         if cmd[1] == "display-message":
             return types.SimpleNamespace(returncode=0, stdout="100,40,80,0")
         if cmd[1] == "capture-pane":
-            return types.SimpleNamespace(returncode=0, stdout=states.pop(0))
+            return types.SimpleNamespace(returncode=0,
+                                         stdout=states.pop(0) if len(states) > 1 else states[0])
         sent.append(cmd)
         return types.SimpleNamespace(returncode=0, stdout="")
     return fake, sent
 
 
-def test_a_collapsed_paste_counts_as_delivered(monkeypatch):
-    idle = "● done\n────────\n❯ \n────────\n  statusline\n"
-    chipped = "● done\n────────\n❯ [Pasted text #1]\n────────\n  statusline\n"
-    fake, sent = _chip_tmux([idle, chipped])
-    monkeypatch.setattr(daemon, "_tmux", fake)
-    monkeypatch.setattr(daemon.time, "sleep", lambda *a, **k: None)
-    monkeypatch.setattr(daemon, "_swallowed_streak", {})
-
-    assert daemon.type_line("%1", "a very long carry-forward prompt " * 40) == "sent"
-    assert [c[-1] for c in sent] == ["a very long carry-forward prompt " * 40, "Enter"]
-
-
-def test_an_existing_chip_does_not_authorise_a_new_injection(monkeypatch):
-    # Anti-residue, same rule as the literal probe: a chip from an EARLIER injection is not
-    # evidence for this one. Only a RISE counts.
-    stale = "● done\n────────\n❯ [Pasted text #1]\n────────\n  statusline\n"
-    fake, sent = _chip_tmux([stale, stale])
-    monkeypatch.setattr(daemon, "_tmux", fake)
-    monkeypatch.setattr(daemon.time, "sleep", lambda *a, **k: None)
-    monkeypatch.setattr(daemon, "_swallowed_streak", {})
-
-    assert daemon.type_line("%1", "another long prompt " * 40) == "swallowed"
-    assert "Enter" not in [c[-1] for c in sent]
-
-
-def test_a_second_chip_does_authorise_it(monkeypatch):
-    one = "● done\n────────\n❯ [Pasted text #1]\n────────\n  statusline\n"
-    two = "● done\n────────\n❯ [Pasted text #1] [Pasted text #2]\n────────\n  statusline\n"
-    fake, sent = _chip_tmux([one, two])
-    monkeypatch.setattr(daemon, "_tmux", fake)
-    monkeypatch.setattr(daemon.time, "sleep", lambda *a, **k: None)
-    monkeypatch.setattr(daemon, "_swallowed_streak", {})
-
-    assert daemon.type_line("%1", "long prompt " * 40) == "sent"
-    assert [c[-1] for c in sent][-1] == "Enter"
-
-
-def test_a_modal_still_blocks_enter_with_the_chip_rule_in_place(monkeypatch):
-    # The whole point of #133: a picker swallows the keystrokes, so NEITHER signal rises.
-    modal = ("Approaching rate limits\n❯ 1. Switch to gpt-5.6-luna\n  2. Keep going\n"
-             "────────\n  statusline\n")
-    fake, sent = _chip_tmux([modal, modal])
-    monkeypatch.setattr(daemon, "_tmux", fake)
-    monkeypatch.setattr(daemon.time, "sleep", lambda *a, **k: None)
-    monkeypatch.setattr(daemon, "_swallowed_streak", {})
-
-    assert daemon.type_line("%1", "please answer the owner " * 40) == "swallowed"
-    assert "Enter" not in [c[-1] for c in sent]
-
-
-def test_a_short_line_still_verifies_literally(monkeypatch):
-    # Short text is rendered verbatim and must keep working exactly as before.
-    idle = "● done\n────────\n❯ \n────────\n  statusline\n"
-    echoed = "● done\n────────\n❯ ping from the owner\n────────\n  statusline\n"
-    fake, sent = _chip_tmux([idle, echoed])
-    monkeypatch.setattr(daemon, "_tmux", fake)
-    monkeypatch.setattr(daemon.time, "sleep", lambda *a, **k: None)
-    monkeypatch.setattr(daemon, "_swallowed_streak", {})
-
-    assert daemon.type_line("%1", "ping from the owner") == "sent"
-    assert [c[-1] for c in sent][-1] == "Enter"
-
-
-# ---- every collapse form each engine actually ships (#165) -------------------
-#
-# Read out of the shipped binaries, not the docs — claude 2.1.235 renders three text forms
-# and codex 0.146.0 a fourth. #163 recognised only the first two, so the other two would have
-# failed exactly the same way once a payload got big enough.
-
 @pytest.mark.parametrize("chip", [
-    "[Pasted text #1]",                     # claude, short paste
-    "[Pasted text #2 +180 lines]",          # claude, multi-line paste
-    "[...Truncated text #3 +900 lines...]",  # claude, oversized paste
-    "[Pasted Content 2317 chars]",          # codex
+    "[Pasted text #1]",
+    "[Pasted text #2 +180 lines]",
+    "[...Truncated text #3 +900 lines...]",
+    "[Pasted Content 2317 chars]",
 ])
-def test_every_shipped_collapse_form_counts_as_delivered(monkeypatch, chip):
+def test_a_collapsed_payload_is_still_delivered(monkeypatch, chip):
+    """Every collapse form each engine actually ships, read out of the binaries. The payload
+    is unreadable in all of them and it does not matter: the receipt is beside the chip."""
     idle = "● done\n────────\n❯ \n────────\n  statusline\n"
-    collapsed = f"● done\n────────\n❯ {chip}\n────────\n  statusline\n"
-    fake, sent = _chip_tmux([idle, collapsed])
+    collapsed = f"● done\n────────\n❯ {chip}{NONCE}\n────────\n  statusline\n"
+    fake, sent = _chip_tmux([idle, collapsed, idle])
     monkeypatch.setattr(daemon, "_tmux", fake)
-    monkeypatch.setattr(daemon.time, "sleep", lambda *a, **k: None)
-    monkeypatch.setattr(daemon, "_swallowed_streak", {})
 
     assert daemon.type_line("%1", "a long payload " * 40) == "sent"
     assert [c[-1] for c in sent][-1] == "Enter"
 
 
-@pytest.mark.parametrize("placeholder", ["[Image #1]", "[Audio #1]"])
-def test_a_non_text_placeholder_is_not_proof_that_text_landed(monkeypatch, placeholder):
-    """Claude renders images and audio with the same bracket grammar. They say a DIFFERENT
-    payload type arrived, not that our text did, so they must not authorise Enter."""
+def test_the_receipt_is_typed_separately_so_the_chip_cannot_eat_it(monkeypatch):
+    """Measured, not assumed. Appended to the payload in ONE send-keys, a 3KB injection into
+    a live claude pane rendered as `[Pasted text #1][Pasted text #2]` — the nonce inside the
+    second chip, invisible, its own receipt unobtainable, the delivery refused and the text
+    left stranded. Sent as a second send-keys 0.5s later the same payload rendered as
+    `[Pasted text #3]qq7z3m1v` and went through. The gap is what makes the receipt typing
+    rather than paste, so the two writes must stay two writes."""
+    pane = _install(monkeypatch, FakePane(CLAUDE_IDLE))
+    long_payload = "a long carry-forward prompt " * 40
+    assert daemon.type_line("%1", long_payload) == "sent"
+    assert pane.typed == [long_payload, NONCE]
+
+
+def test_a_chip_alone_is_not_a_receipt(monkeypatch):
+    """The chip says SOMETHING collapsed, somewhere, at some time — including on an earlier
+    injection. Under the counting rule a new chip authorised the Enter; it no longer does,
+    because the pane can produce a chip and the pane cannot produce the nonce."""
     idle = "● done\n────────\n❯ \n────────\n  statusline\n"
-    other = f"● done\n────────\n❯ {placeholder}\n────────\n  statusline\n"
-    fake, sent = _chip_tmux([idle, other])
+    chipped = "● done\n────────\n❯ [Pasted text #1]\n────────\n  statusline\n"
+    fake, sent = _chip_tmux([idle, chipped])
     monkeypatch.setattr(daemon, "_tmux", fake)
-    monkeypatch.setattr(daemon.time, "sleep", lambda *a, **k: None)
-    monkeypatch.setattr(daemon, "_swallowed_streak", {})
 
     assert daemon.type_line("%1", "a long payload " * 40) == "swallowed"
     assert "Enter" not in [c[-1] for c in sent]
 
 
-def test_a_chip_whose_number_changes_in_place_is_not_a_rise(monkeypatch):
-    """One placeholder replaced by another leaves the count equal. Equal is unresolvable, so
-    it must fail closed even though the digits changed."""
-    one = "● done\n────────\n❯ [Pasted text #1]\n────────\n  statusline\n"
-    two = "● done\n────────\n❯ [Pasted text #2]\n────────\n  statusline\n"
-    fake, sent = _chip_tmux([one, two])
+@pytest.mark.parametrize("placeholder", ["[Image #1]", "[Audio #1]"])
+def test_a_non_text_placeholder_is_not_proof_that_text_landed(monkeypatch, placeholder):
+    """Claude renders images and audio with the same bracket grammar. A different payload
+    type arriving was never evidence that ours did."""
+    idle = "● done\n────────\n❯ \n────────\n  statusline\n"
+    other = f"● done\n────────\n❯ {placeholder}\n────────\n  statusline\n"
+    fake, sent = _chip_tmux([idle, other])
     monkeypatch.setattr(daemon, "_tmux", fake)
-    monkeypatch.setattr(daemon.time, "sleep", lambda *a, **k: None)
-    monkeypatch.setattr(daemon, "_swallowed_streak", {})
 
-    assert daemon.type_line("%1", "long prompt " * 40) == "swallowed"
+    assert daemon.type_line("%1", "a long payload " * 40) == "swallowed"
     assert "Enter" not in [c[-1] for c in sent]
-
-
-# ---- the two signals move independently: pin the whole matrix (#165) ---------
-
-@pytest.mark.parametrize("before,after,expected", [
-    ((0, 0), (0, 0), "swallowed"),  # neither rendered — a modal ate it
-    ((0, 0), (1, 0), "sent"),       # literal appeared
-    ((0, 0), (0, 1), "sent"),       # collapsed into a chip
-    ((1, 0), (2, 0), "sent"),       # literal rose past a stale copy
-    ((0, 1), (0, 2), "sent"),       # chip rose past a stale chip
-    ((1, 0), (0, 1), "sent"),       # mixed: the chip rose. #168 — refusing this cost a
-                                    # real carry-forward on an alternate-screen pane, where
-                                    # a falling count is ordinary eviction, not a signal.
-    ((0, 1), (1, 0), "sent"),       # mixed the other way — the literal rose
-    ((1, 1), (0, 0), "swallowed"),  # both fell — everything left is stale
-    ((2, 0), (1, 0), "swallowed"),  # a stale copy scrolled out; no new one arrived
-    ((1, 1), (1, 1), "swallowed"),  # unchanged — unresolvable, so fail closed
-])
-def test_the_rise_matrix(monkeypatch, before, after, expected):
-    """A rise in one signal AND no fall in the other is proof; anything else is not.
-
-    The mixed transitions are the ones worth pinning, and they have moved twice. #165 accepted
-    them; #165 r2 refused them as observationally ambiguous; #168 accepts them again, because
-    the refusal broke a live carry-forward and the geometry check added in r2 already covers
-    the threat the refusal was blunt cover for. The r2 argument was not wrong about the
-    ambiguity — it was wrong that refusing was affordable."""
-    calls = {"n": 0}
-    sent = []
-
-    def fake(cmd, *a, **k):
-        if cmd[1] == "display-message":
-            return types.SimpleNamespace(returncode=0, stdout="100,40,80,0")
-        if cmd[1] == "capture-pane":
-            counts = before if calls["n"] == 0 else after
-            calls["n"] += 1
-            return types.SimpleNamespace(
-                returncode=0,
-                stdout="\n".join(["tail-probe-marker"] * counts[0]
-                                 + ["[Pasted text #9]"] * counts[1]))
-        sent.append(cmd)
-        return types.SimpleNamespace(returncode=0, stdout="")
-
-    monkeypatch.setattr(daemon, "_tmux", fake)
-    monkeypatch.setattr(daemon, "_echo_probe", lambda _t: "tail-probe-marker")
-    monkeypatch.setattr(daemon.time, "sleep", lambda *a, **k: None)
-    monkeypatch.setattr(daemon, "_swallowed_streak", {})
-
-    assert daemon.type_line("%1", "some payload") == expected
-    assert ("Enter" in [c[-1] for c in sent]) is (expected == "sent")
 
 
 def test_cf_clear_modal_refuses_enter_on_dont_ask_me_again(monkeypatch):

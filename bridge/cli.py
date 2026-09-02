@@ -205,6 +205,9 @@ def append_outbox_record(topic_id, kind, delivery, possibly_delivered=False):
                 record["content_sha256"] = hashlib.sha256(
                     delivery["text"].encode("utf-8")
                 ).hexdigest()
+                # Length only, never the body: the journal stays content-free (same
+                # boundary as the hash), but a reader can cost deliveries by size.
+                record["content_chars"] = len(delivery["text"])
             if "chunk_index" in delivery:
                 record["chunk_index"] = int(delivery["chunk_index"])
             if "chunk_count" in delivery:
@@ -214,6 +217,7 @@ def append_outbox_record(topic_id, kind, delivery, possibly_delivered=False):
             record["content_sha256"] = hashlib.sha256(
                 delivery["text"].encode("utf-8")
             ).hexdigest()
+            record["content_chars"] = len(delivery["text"])
             record["chunk_index"] = int(delivery["chunk_index"])
             record["chunk_count"] = int(delivery["chunk_count"])
         line = json.dumps(record, ensure_ascii=False) + "\n"
