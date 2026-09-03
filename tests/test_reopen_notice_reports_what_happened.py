@@ -45,7 +45,8 @@ def capture_notices(monkeypatch, tmp_path):
 
 
 def _revive(entry_cwd, choice, picker_result, monkeypatch, posted):
-    monkeypatch.setattr(daemon, "answer_resume_picker", lambda pane, c: picker_result)
+    monkeypatch.setattr(daemon, "answer_resume_picker",
+                        lambda pane, c, deadline=None: picker_result)
     entry = {"engine": "claude", "session_id": "SID", "cwd": entry_cwd, "pane": "%OLD"}
     daemon.revive_one({}, "5935", entry, brief=False, cause="reopen",
                       resume_choice=choice, respect_close=True)

@@ -27,6 +27,7 @@ collapsing them is how the pane helpers failed: absence of evidence was read as 
 absence. Callers may treat absence as proof ONLY when the status is OK.
 """
 
+import glob
 import hashlib
 import json
 import os
@@ -85,6 +86,58 @@ def transcript_path(cwd, session_id):
     absolute_cwd = os.path.abspath(os.path.expanduser(cwd))
     flattened_cwd = re.sub(r"[^A-Za-z0-9]", "-", absolute_cwd)
     return os.path.join(PROJECTS_DIR, flattened_cwd, f"{session_id}.jsonl")
+
+
+def launch_cwd(session_id):
+    """Where claude was actually launched for `session_id`, as `(cwd, None)` or `(None, why)`.
+
+    `transcript_path` cannot be inverted: it maps EVERY non-alphanumeric character to '-', so
+    `-home-user--worktrees-12` has many pre-images and un-flattening a directory name would be
+    a guess. This does not invert it. It finds the transcript by name, reads the launch cwd out
+    of the file's own records, and returns it only after three checks that a wrong answer fails:
+    the record must not name a DIFFERENT session (one that names none is accepted — most
+    records carry no `sessionId`, so requiring one would answer nothing), the path must be
+    absolute (a relative one would be resolved against whatever the READER's cwd happens to
+    be), and it must lead back to the file it was found in.
+
+    What the round-trip does and does not prove, stated exactly: it proves the value names a
+    directory whose flattened form is the directory holding this transcript — which is what
+    `claude --resume` needs. It does NOT prove textual identity with the launch directory,
+    because the flattening is many-to-one: `/a.b` and `/a-b` flatten alike. The value comes
+    from a record in the session's own file that does not name another session, so the gap
+    needs a transcript carrying a foreign, unlabelled cwd — not something Claude Code writes.
+
+    A `(None, why)` answer means "not answerable here", never "no such session". Every caller
+    must leave what it has alone, and `why` is there so the log says which case it was.
+    """
+    matches = glob.glob(os.path.join(PROJECTS_DIR, "*", f"{session_id}.jsonl"))
+    if not matches:
+        return None, "no transcript with that name"
+    if len(matches) > 1:
+        return None, f"{len(matches)} transcripts with that name — ambiguous, not guessing"
+    found = matches[0]
+    try:
+        # The permissive tail reader, not the causal API: the question is "what does this file
+        # say its cwd is", and the checks below — not the parse — are what make the answer
+        # trustworthy. A bounded tail also stops a 72 MB transcript being read to answer it.
+        records = read_tail_records(found, max_bytes=256 * 1024)
+    except OSError as e:
+        return None, f"its transcript is unreadable ({e.__class__.__name__})"
+    for record in reversed(records):
+        if not isinstance(record, dict):
+            continue
+        cwd = record.get("cwd")
+        if not (isinstance(cwd, str) and cwd):
+            continue
+        sid = record.get("sessionId")
+        if isinstance(sid, str) and sid != session_id:
+            continue        # a sidechain or copied record: it describes someone else's cwd
+        if not os.path.isabs(cwd):
+            return None, f"its cwd {cwd!r} is relative"
+        if os.path.realpath(transcript_path(cwd, session_id)) != os.path.realpath(found):
+            return None, f"its cwd {cwd!r} does not lead back to it"
+        return cwd, None
+    return None, "no record in its transcript carries a cwd"
 
 
 def read_tail_records(path, max_bytes=TAIL_BYTES):

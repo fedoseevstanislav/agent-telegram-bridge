@@ -162,7 +162,7 @@ def _stub_revive_one(monkeypatch, seen):
     `cause="boot"` was deleted from `_restore_targets_now`."""
 
     def fake(_cfg, tid, _entry, fresh=False, brief=True, taken=None, *, cause,
-             fresh_requested=None):
+             fresh_requested=None, **kw):   # **kw: tolerate params this test does not assert on
         seen.append((str(tid), cause))
         return "resumed", {"needs_brief": False}
 
@@ -283,7 +283,7 @@ def test_retry_timer_carries_the_same_resolved_template(monkeypatch):
     scheduled = []
 
     class _Timer:
-        def __init__(self, delay, fn, args=()):
+        def __init__(self, delay, fn, args=(), kwargs=None):
             self.fn, self.args = fn, args
             scheduled.append(args)
 
@@ -559,7 +559,7 @@ def test_the_mass_restore_fan_out_thread_delivers_the_resolved_template(monkeypa
                         lambda pane, tid, engine, tpl, *a, **k: delivered.append((str(tid), tpl)))
 
     def fake_revive(_cfg, tid, _info, fresh=False, brief=True, taken=None, *, cause,
-                    fresh_requested=None):
+                    fresh_requested=None, **kw):
         tpl, _ = daemon._restore_wording("claude", cause, fresh=False)
         return "resumed", {"pane": "%9", "tid": str(tid), "engine": "claude", "tpl": tpl,
                            "needs_brief": True, "reopened": True}
@@ -612,12 +612,12 @@ def test_the_briefing_retry_actually_re_delivers_the_same_template(monkeypatch):
     scheduled = []
 
     class _Timer:
-        def __init__(self, delay, fn, args=()):
-            self.fn, self.args = fn, args
+        def __init__(self, delay, fn, args=(), kwargs=None):
+            self.fn, self.args, self.kwargs = fn, args, kwargs or {}
             scheduled.append(self)
 
         def start(self):
-            self.fn(*self.args)                # run the retry for real
+            self.fn(*self.args, **self.kwargs)  # run the retry for real
 
     monkeypatch.setattr(daemon.threading, "Timer", _Timer)
 

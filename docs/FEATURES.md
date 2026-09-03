@@ -58,7 +58,7 @@ Anything starting with `/` in a topic is a command, never inbox content.
 | `/help` | The command list. Works in General too. |
 | `/sessions` | Every tmux pane running an agent — not just registered ones — with name, bound topic, context %, cost, unread flag. Codex panes tagged `[codex]`; unconnected ones flagged. |
 | `/ctx` | This session's context-window usage. |
-| `/usage` | Account limits: the 5-hour window and the weekly one, each with its reset time. |
+| `/usage` | Both account meters in one message — Claude (5h, week, Fable week) and Codex — every window as **% left** with its reset time, from any topic. `/usage claude` / `/usage codex` show just that one line; `/usage codex` from a Codex topic scopes to that session's rollout. |
 | `/stop` | Interrupt the current turn (Escape into the pane). |
 | `/kill` | End the session. Asks first; reply `yes` within 60 seconds. Anything else cancels and is passed through to the session. |
 | `/peek` | The last ~25 visible lines of the session's terminal. |
@@ -68,6 +68,14 @@ Anything starting with `/` in a topic is a command, never inbox content.
 | any other `/command` | Typed into the session's pane and executed, with a confirmation reply. |
 
 Plain text in **General** gets an immediate hint instead of vanishing: no session reads General.
+
+**Topic icons.** A new topic gets a forum icon matched to its name — 💻 for a build, 📆 for a
+meeting, 🧠 for graph or memory work, 👮‍♂️ for security — so the topic list can be scanned by
+subject. A name that matches nothing keeps Telegram's default rather than being given a guess.
+This is separate from the per-session signature emoji in message headers, which is unchanged.
+Existing topics are caught up with `tg-bridge retheme`, which prints what it would change and
+writes only with `--apply`. Bots may only use Telegram's free icon set, so the palette is
+whatever `getForumTopicIconStickers` offers.
 
 ### Starting a session
 
@@ -111,8 +119,22 @@ recreates it.
 **Context warnings.** A session's topic is warned when its context usage first crosses 20%, then
 every further 10%. The mark re-arms when usage drops, so a compact does not silence it.
 
+**5-hour limit → low priority.** The limit is account-wide, so when it is reached every live
+Claude session is switched to low-priority mode automatically — the same `/low-priority` you
+would type yourself — and each topic gets one line saying so and when the window resets. A
+session that is mid-turn gets it once it settles, retried a few times over half a minute and
+then left alone until the window resets. At most one switch per pane per window, and Codex
+sessions are never touched.
+
 **Morning digest.** One summary a day to General: sessions with their overnight cost deltas,
 sessions that ended, account usage, daemon health. Also zero tokens.
+
+**Restore after a reboot.** Sessions come back automatically, and a big, old session is resumed
+**from its summary** rather than re-reading its whole history — past a few hours the model's
+cache has expired, so the full re-read costs a great deal and buys nothing. The restore message
+names the sessions that were. A whole restore has one time budget for this; if a long restore
+uses it up, the sessions after that come back the old way rather than holding up the fleet. When
+you revive a session yourself by writing to it, you are still asked which you want.
 
 **Lifecycle.** When a registered session's pane dies, its topic gets a "session ended" notice and
 is closed, and the registry is stamped — which stops nudges and warnings for it. Reopening the

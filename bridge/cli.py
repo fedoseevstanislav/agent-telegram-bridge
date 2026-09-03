@@ -9,6 +9,7 @@ Commands:
   notify --topic N ...        enqueue an event into another topic's inbox, wake its pane,
                               mirror to Telegram (the sanctioned session -> session path)
   status                      daemon health + registered topics
+  retheme [--apply]           give existing topics a theme-relevant forum icon (dry by default)
 
 Topic resolution order: --topic flag, TG_BRIDGE_TOPIC env var, ./.tg-bridge-topic file.
 """
@@ -17,6 +18,7 @@ import argparse
 import hashlib
 import json
 import os
+import re
 import subprocess
 import sys
 import time
@@ -36,6 +38,108 @@ CWD_BINDING_FILE = ".tg-bridge-topic"
 # Visually distinct session icons — assigned at register time, shown in message headers
 ICONS = ("🦊", "🐙", "🦉", "🐳", "⚡", "🌵", "🎯", "🧩", "🛰️", "🌶️",
          "🪐", "🦜", "🍄", "🗿", "🌊", "🔥")
+
+# Telegram custom-emoji ids are decimal digit strings; see custom_emoji_id (#292).
+_CUSTOM_EMOJI_ID = re.compile(r"[0-9]+")
+
+
+# ---- theme-relevant forum-topic icons (#278) ----
+#
+# Two DIFFERENT icons, deliberately. `ICONS`/`pick_icon` above is the message SIGNATURE — one
+# emoji per session, chosen to be visually distinct from its neighbours so a line in General
+# says who is speaking. This is the forum TOPIC icon, the glyph Telegram shows in the topic
+# list, and there the useful property is the opposite one: it should say what the topic is
+# ABOUT, so the list can be scanned by subject. A topic keeps both.
+#
+# Bots may only use the icons in `getForumTopicIconStickers` (112 of them; premium custom
+# emoji are settable from a user account only), and each is addressed by a `custom_emoji_id`
+# that belongs to Telegram, not to us — so the ids are resolved at runtime from that call and
+# never written down here. The rules below name EMOJI; the resolution to an id is a lookup.
+#
+# First match wins, so order is precedence: the specific rules come before the general ones.
+# `\b` boundaries matter — an unanchored "ops" matched "Chronops" and "ai" matched "email".
+# Every emoji here was checked against a live `getForumTopicIconStickers` response — a rule
+# naming a glyph outside that set silently degrades to no icon, which looks like a matching
+# bug rather than the typo it is (`tests/test_topic_icons.py` pins the whole table against a
+# recorded copy of the set).
+TOPIC_ICON_RULES = (
+    (r"\b(security|secret|auth|token|vuln|sanitiser|sanitizer)\b", "👮‍♂️"),
+    (r"\b(meeting|calendar|schedule|agenda|standup)\b", "📆"),
+    (r"\b(release|launch|ship|milestone|rollout)\b", "🏁"),
+    (r"\b(review|audit|verify|qa)\b", "🔎"),
+    (r"\b(test|experiment|eval|trial|benchmark)\b", "🧪"),
+    (r"\b(bridge|daemon|cli|repo|build|deploy|refactor|bug|patch|debug|infra)\b", "💻"),
+    (r"\b(graph|memory|ontology|extraction|intake|embedding|recall)\b", "🧠"),
+    (r"\b(research|study|learn(ing)?|paper|wiki|knowledge|docs?)\b", "📚"),
+    (r"\b(client|consult(ing)?|deck|proposal|pitch|gtm|sales|lead)\b", "💼"),
+    (r"\b(growth|metric|analytics|revenue|funnel|market(ing)?|seo)\b", "📈"),
+    (r"\b(money|invoice|billing|budget|cost|pricing|tax|fintech|finance)\b", "💰"),
+    (r"\b(company|legal|hr|hiring|org|corp)\b", "🏛"),
+    (r"\b(gym|health|training|sleep|food|habit|medical)\b", "🩺"),
+    (r"\b(home|house|flat|estate|apartment|renovation)\b", "🏠"),
+    (r"\b(travel|trip|flight|visa|hotel)\b", "✈️"),
+    (r"\b(idea|design|concept|vision|strategy|plan(ning)?)\b", "💡"),
+    (r"\b(news|digest|feed|report)\b", "📰"),
+    (r"\b(content|writing|article|blog|copy)\b", "✍️"),
+    (r"\b(video|film|movie|recording)\b", "🎬"),
+    (r"\b(agent|bot|model|llm|ai|orchestra|prompt)\b", "🤖"),
+)
+_ICON_SET_CACHE = []   # [ {emoji: custom_emoji_id} ] — one slot, so "fetched and empty" is
+                       # distinguishable from "not fetched yet" without a sentinel global
+ICON_SET_TIMEOUT = 5   # s; this call sits in front of registration — see icon_emoji_ids
+
+
+def theme_emoji(name):
+    """The themed emoji for a topic name, or None when nothing matches.
+
+    No match means NO icon — the topic keeps Telegram's default. Falling back to a generic
+    glyph would make the list uniform again, which is the thing this feature exists to fix,
+    and a wrong-but-confident icon is worse for scanning than an honest blank."""
+    if not isinstance(name, str):
+        return None
+    for pattern, emoji in TOPIC_ICON_RULES:
+        if re.search(pattern, name, re.IGNORECASE):
+            return emoji
+    return None
+
+
+def icon_emoji_ids(cfg):
+    """{emoji: custom_emoji_id} for the icons a BOT may use, fetched at most once per process.
+
+    Every failure degrades to an empty map, i.e. to "no themed icon": the payload is not ours,
+    the ids can change under us, and none of that is a reason to fail a registration. The
+    cache is populated even when empty so one dead call does not become one call per topic.
+
+    Bounded hard, because this runs BEFORE `createForumTopic` and a session is waiting on it:
+    `api`'s defaults are `timeout=70, retries=3`, so the default would put up to ~3.5 minutes
+    of cosmetics in front of the one call that actually registers the session. A decoration
+    gets one short attempt — 5 s, no retry — and anything slower is treated exactly like a
+    failure, which is "no themed icon"."""
+    if _ICON_SET_CACHE:
+        return _ICON_SET_CACHE[0]
+    table = {}
+    try:
+        stickers = api(cfg["bot_token"], "getForumTopicIconStickers", {},
+                       timeout=ICON_SET_TIMEOUT, retries=1)
+        if not isinstance(stickers, list):
+            raise TypeError(f"sticker set is {type(stickers).__name__}, not a list")
+        for sticker in stickers:
+            if not isinstance(sticker, dict):
+                continue
+            emoji, emoji_id = sticker.get("emoji"), sticker.get("custom_emoji_id")
+            if isinstance(emoji, str) and isinstance(emoji_id, str) and emoji_id:
+                table.setdefault(emoji, emoji_id)
+    except Exception:
+        table = {}
+    _ICON_SET_CACHE.append(table)
+    return table
+
+
+def theme_icon_id(cfg, name):
+    """`custom_emoji_id` for a topic name, or None. None at any step means "leave the default":
+    no rule matched, the API is unreachable, or the rule's emoji is not in the free set."""
+    emoji = theme_emoji(name)
+    return icon_emoji_ids(cfg).get(emoji) if emoji else None
 
 
 def pick_icon(registry, topic_id):
@@ -61,7 +165,13 @@ def resolve_topic(args):
 
 def cmd_register(cfg, args):
     name = args.name or f"session {now_iso()}"
-    topic = api(cfg["bot_token"], "createForumTopic", {"chat_id": cfg["chat_id"], "name": name})
+    # The themed icon rides the CREATE call rather than a follow-up editForumTopic: one round
+    # trip, and a topic is never briefly wrong. A None means "leave Telegram's default".
+    params = {"chat_id": cfg["chat_id"], "name": name}
+    emoji_id = theme_icon_id(cfg, name)
+    if emoji_id:
+        params["icon_custom_emoji_id"] = emoji_id
+    topic = api(cfg["bot_token"], "createForumTopic", params)
     topic_id = topic["message_thread_id"]
     entry = {"name": name, "created": now_iso(), "cwd": os.getcwd()}
     if args.feed:
@@ -70,6 +180,12 @@ def cmd_register(cfg, args):
         entry["icon"] = "📡"
     # icon needs the existing registry to avoid collisions; compute + write atomically so a
     # concurrent daemon snapshot/revive can't clobber this new registration.
+    if emoji_id:
+        # Remember the themed emoji, not its id: ids belong to Telegram and can be reissued,
+        # and this is only ever compared against a freshly computed emoji. There is no Bot API
+        # call that reads a topic's current icon back, so what we set is the only record of it.
+        entry["topic_icon"] = theme_emoji(name)
+
     def _add(reg):
         if not args.feed:
             entry["icon"] = pick_icon(reg, topic_id)
@@ -86,6 +202,63 @@ def cmd_register(cfg, args):
         print("Feed topic: no context warnings, idle nudges, or lifecycle notices")
     elif "pane" in entry:
         print(f"Idle nudges enabled: new replies will be typed into tmux pane {entry['pane']}")
+
+
+def retheme_plan(cfg, registry):
+    """[(topic_id, name, current_emoji, wanted_emoji)] for live dialog topics needing a change.
+
+    Skipped: feed and ended topics (nobody navigates to them), names that match no rule (they
+    keep Telegram's default rather than being given a guess), and topics already carrying the
+    wanted emoji. `topic_icon` is what THIS tool last set — the Bot API has no call that reads
+    a topic's icon back, so a topic themed by hand looks unthemed here and will be re-set to
+    the same glyph at worst."""
+    plan = []
+    for tid, info in sorted(registry.items(), key=lambda kv: int(kv[0])):
+        if not isinstance(info, dict) or info.get("feed") or info.get("ended"):
+            continue
+        name = info.get("name")
+        want = theme_emoji(name)
+        if not want or info.get("topic_icon") == want:
+            continue
+        plan.append((int(tid), name, info.get("topic_icon"), want))
+    return plan
+
+
+def cmd_retheme(cfg, args):
+    """Give existing topics their theme icon. Prints the plan; writes only under --apply.
+
+    A bulk edit of the owner's forum is not something to do as a side effect of being run, so
+    the default is a dry run and `--apply` is the whole of the difference."""
+    plan = retheme_plan(cfg, read_registry())
+    if not plan:
+        print("Nothing to retheme.")
+        return
+    for tid, name, current, want in plan:
+        print(f"  topic {tid:>6}  {current or '—'} -> {want}  {name}")
+    if not args.apply:
+        print(f"{len(plan)} topic(s) would change. Re-run with --apply to write them.")
+        return
+    ids = icon_emoji_ids(cfg)
+    changed = 0
+    for tid, name, _current, want in plan:
+        emoji_id = ids.get(want)
+        if not emoji_id:
+            print(f"  topic {tid}: {want} is not in the bot-settable set — skipped")
+            continue
+        try:
+            api(cfg["bot_token"], "editForumTopic", {
+                "chat_id": cfg["chat_id"], "message_thread_id": tid,
+                "icon_custom_emoji_id": emoji_id,
+            })
+        except Exception as e:
+            # One topic that refuses the edit (closed, deleted, rights revoked) must not stop
+            # the rest: this is a batch, and a half-applied batch is the normal outcome.
+            print(f"  topic {tid}: failed ({e})")
+            continue
+        update_registry(lambda reg, t=str(tid), w=want:
+                        reg[t].__setitem__("topic_icon", w) if t in reg else None)
+        changed += 1
+    print(f"Retheme applied to {changed} topic(s).")
 
 
 def send_typing(cfg, topic_id):
@@ -107,15 +280,37 @@ def cmd_typing(cfg, args):
         time.sleep(4)  # Telegram typing status lasts ~5s; refresh to sustain it
 
 
+def custom_emoji_id(topic_id, info):
+    """The registry's optional `icon_custom_emoji_id` for this topic, or None (#292).
+
+    Digits only, as a string: the value is interpolated into an HTML attribute, and what
+    Telegram does with a malformed entity is not established here. Anything else is dropped
+    with a line on stderr, and the message goes out with the plain icon."""
+    raw = info.get("icon_custom_emoji_id")
+    if raw is None:
+        return None
+    if isinstance(raw, str) and _CUSTOM_EMOJI_ID.fullmatch(raw):
+        return raw
+    print(f"warning: topic {topic_id} icon_custom_emoji_id is not a digit string ({raw!r}); "
+          "sending the plain icon", file=sys.stderr)
+    return None
+
+
 def send_text(cfg, topic_id, text):
     info = read_registry().get(str(topic_id), {})
     icon = info.get("icon")
+    emoji_id = custom_emoji_id(topic_id, info)
     if icon:  # one bot account; the per-thread emoji (assigned at register) is the signature
         text = f"{icon} {text}"
     # Render agent Markdown as real Telegram formatting (HTML), splitting + plain-text
-    # fallback handled in common.send_message (#89). The emoji prefix is safe literal text.
+    # fallback handled in common.send_message (#89). The emoji prefix is safe literal text;
+    # when the topic names a custom emoji, send_message wraps that leading icon in a
+    # <tg-emoji> entity after the HTML conversion (#292).
+    # The keyword is passed only when the topic asks for it, so the ordinary call is the
+    # pre-#292 one.
+    extra = {"icon_custom_emoji": (icon, emoji_id)} if icon and emoji_id else {}
     try:
-        deliveries = send_message(cfg["bot_token"], cfg["chat_id"], text, topic_id)
+        deliveries = send_message(cfg["bot_token"], cfg["chat_id"], text, topic_id, **extra)
     except PossiblyDelivered as e:
         journal_possibly_delivered(topic_id, "send", e, text)
         raise
@@ -813,6 +1008,13 @@ def build_parser():
                    help="durable retry key, unique per logical event")
 
     sub.add_parser("status", help="daemon health and registered topics")
+
+    p = sub.add_parser(
+        "retheme",
+        help="show which live topics would get a theme icon; --apply to write them",
+    )
+    p.add_argument("--apply", action="store_true",
+                   help="actually call editForumTopic (without this, nothing is written)")
     return parser
 
 
@@ -825,7 +1027,7 @@ def main():
     cfg = load_config()
     {"register": cmd_register, "send": cmd_send, "recv": cmd_recv,
      "ask": cmd_ask, "status": cmd_status, "typing": cmd_typing,
-     "notify": cmd_notify}[args.command](cfg, args)
+     "notify": cmd_notify, "retheme": cmd_retheme}[args.command](cfg, args)
 
 
 if __name__ == "__main__":

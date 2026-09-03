@@ -619,18 +619,52 @@ def test_an_interrupt_writes_under_the_pane_lock(monkeypatch):
     assert _writes_are_locked(trace), trace
 
 
+def _lock_trace_over(monkeypatch, pane):
+    """`_lock_trace`, but over a FakePane that can actually satisfy type_line's receipt.
+
+    Both relays now deliver through `type_line` (#154), which takes the pane lock itself and
+    only writes once it has read the pane. A stub that answers every capture with an empty
+    string makes it refuse to type at all, which would let these tests pass while nothing was
+    ever written — so the pane has to be a real enough fake to reach the writes."""
+    import contextlib
+    trace = []
+    real = daemon._pane_lock
+
+    @contextlib.contextmanager
+    def traced(p):
+        with real(p):
+            trace.append(("lock", p))
+            try:
+                yield
+            finally:
+                trace.append(("unlock", p))
+
+    def tmux(argv, *a, **k):
+        if argv[:2] == ["tmux", "send-keys"]:
+            trace.append(("write", argv[3] if len(argv) > 3 else ""))
+        return pane(argv, *a, **k)
+
+    monkeypatch.setattr(daemon, "_pane_lock", traced)
+    monkeypatch.setattr(daemon, "_tmux", tmux)
+    monkeypatch.setattr(daemon.time, "sleep", lambda *a, **k: None)
+    return trace
+
+
 def test_the_command_relay_writes_under_the_pane_lock(monkeypatch):
-    trace = _lock_trace(monkeypatch)
+    pane = FakePane(CLAUDE_IDLE)
+    trace = _lock_trace_over(monkeypatch, pane)
     monkeypatch.setattr(daemon, "read_registry", lambda: {"33": {"pane": "%1"}})
     monkeypatch.setattr(daemon, "pane_alive", lambda _p: True)
     monkeypatch.setattr(daemon, "reply", lambda *_a, **_k: True)
 
     daemon.handle_command({}, 33, "/status")
     assert _writes_are_locked(trace), trace
+    assert pane.submitted == ["/status"]        # and it really was delivered
 
 
 def test_the_model_switch_writes_under_the_pane_lock(monkeypatch):
-    trace = _lock_trace(monkeypatch)
+    pane = FakePane(CLAUDE_IDLE)
+    trace = _lock_trace_over(monkeypatch, pane)
     monkeypatch.setattr(daemon, "read_registry", lambda: {"33": {"pane": "%1"}})
     monkeypatch.setattr(daemon, "pane_alive", lambda _p: True)
     monkeypatch.setattr(daemon, "engine_of_pane", lambda _p: "claude")
@@ -640,6 +674,7 @@ def test_the_model_switch_writes_under_the_pane_lock(monkeypatch):
 
     daemon._try_send_model({}, 33, "opus", "%1", "claude", 1)
     assert _writes_are_locked(trace), trace
+    assert pane.submitted == ["/model opus"]
 
 
 def test_unreadable_pane_types_nothing(monkeypatch):
@@ -1082,7 +1117,7 @@ def test_swallowed_briefing_is_retried(monkeypatch):
     marked = []
     monkeypatch.setattr(daemon, "update_registry", lambda fn: marked.append(fn))
     monkeypatch.setattr(daemon.threading, "Timer",
-                        lambda delay, fn, args=(): timers.append((delay, args)) or
+                        lambda delay, fn, args=(), kwargs=None: timers.append((delay, args)) or
                         types.SimpleNamespace(start=lambda: None))
 
     daemon.deliver_briefing("%1", "8265", "codex", "brief {tid}")
@@ -1169,7 +1204,7 @@ def test_briefing_retries_are_bounded(monkeypatch):
     monkeypatch.setattr(daemon, "report_blocked_pane", lambda *a: True)
     monkeypatch.setattr(daemon, "update_registry", lambda fn: None)
     monkeypatch.setattr(daemon.threading, "Timer",
-                        lambda delay, fn, args=(): timers.append(args) or
+                        lambda delay, fn, args=(), kwargs=None: timers.append(args) or
                         types.SimpleNamespace(start=lambda: None))
 
     daemon.deliver_briefing("%1", "8265", "codex", "brief {tid}",

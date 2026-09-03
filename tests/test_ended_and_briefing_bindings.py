@@ -305,7 +305,7 @@ def test_a_new_codex_pane_on_the_same_boot_is_briefed(registry, monkeypatch):
     monkeypatch.setattr(daemon, "_tmux",
                         lambda *a, **k: types.SimpleNamespace(returncode=1, stdout=""))
     monkeypatch.setattr(daemon, "ensure_codex_trust", lambda cwd: None)
-    monkeypatch.setattr(daemon, "launch_pane", lambda name, cwd, launch: ("%NEW", None))
+    monkeypatch.setattr(daemon, "launch_pane", lambda name, cwd, launch, engine, reason: ("%NEW", None))
     monkeypatch.setattr(daemon, "reply", lambda cfg, tid, text: True)
     monkeypatch.setattr(daemon, "reopen_topic", lambda cfg, tid: True)
     monkeypatch.setattr(daemon, "pane_alive", lambda p: True)

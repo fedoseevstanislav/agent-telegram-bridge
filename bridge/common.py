@@ -696,13 +696,29 @@ def split_for_telegram(text, limit=_TG_HTML_LIMIT):
     return chunks
 
 
-def send_message(token, chat_id, text, thread_id=None, *, verbatim=False, reply_markup=None):
+def wrap_custom_emoji(api_text, icon, emoji_id):
+    """Wrap a leading plain `icon` in a Telegram `<tg-emoji>` entity (#292).
+
+    Called on the ALREADY-converted HTML: `md_to_telegram_html` escapes `< >` in its input,
+    so a tag put in before conversion would be sent as literal text — the blocker #292
+    reports. Text that does not start with the icon is returned unchanged."""
+    if not api_text.startswith(icon):
+        return api_text
+    return f'<tg-emoji emoji-id="{emoji_id}">{icon}</tg-emoji>' + api_text[len(icon):]
+
+
+def send_message(token, chat_id, text, thread_id=None, *, verbatim=False, reply_markup=None,
+                 icon_custom_emoji=None):
     """Send text to a chat/topic as Telegram HTML (real bold/underline/strike/code/links
     from Markdown), auto-splitting long text. ``verbatim=True`` sends the exact chunks with no
     parse mode; this is the release-disclosure path where rendering could hide a URL or turn
     ``__init__.py`` into ``init.py``. On an HTML parse error the offending chunk
     is re-sent as PLAIN text, so a formatting edge case degrades a message, never drops
     it. Non-parse errors (connection failure / PossiblyDelivered) propagate unchanged.
+
+    ``icon_custom_emoji`` is ``(icon, emoji_id)``: the leading ``icon`` of the FIRST chunk is
+    wrapped in a ``<tg-emoji>`` entity after that chunk's HTML conversion (#292). Chunks 2+
+    and the plain-text fallback are untouched, so a fallback carries the plain icon.
 
     ``reply_markup`` is JSON-encoded for one single-chunk prompt. Refusing it on a multi-chunk
     body prevents a ForceReply control from being repeated onto disclosure chunks by accident.
@@ -722,6 +738,8 @@ def send_message(token, chat_id, text, thread_id=None, *, verbatim=False, reply_
     deliveries = []
     for chunk_index, chunk in enumerate(chunks):
         api_text = chunk if verbatim else md_to_telegram_html(chunk)
+        if icon_custom_emoji and not verbatim and chunk_index == 0:
+            api_text = wrap_custom_emoji(api_text, *icon_custom_emoji)
         params = {**base, "text": api_text}
         if not verbatim:
             params["parse_mode"] = "HTML"

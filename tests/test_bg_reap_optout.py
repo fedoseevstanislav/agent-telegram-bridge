@@ -41,6 +41,7 @@ def launched(monkeypatch):
         pane, err = daemon.launch_pane(
             kw.get("name", "sess"), kw.get("cwd", "/home/user"),
             kw.get("launch", "claude --dangerously-skip-permissions"),
+            kw.get("engine", "claude"), kw.get("reason", "a stated reason"),
             kw.get("prompt"),
         )
         assert (pane, err) == ("%77", "")

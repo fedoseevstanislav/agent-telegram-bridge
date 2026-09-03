@@ -344,7 +344,7 @@ def test_revive_one_actually_answers_the_picker(tmp_path, monkeypatch):
     being fixed (a headless revive leaving the modal up and the briefing swallowed)."""
     answered = []
     monkeypatch.setattr(daemon, "launch_pane",
-                        lambda tmux_name, cwd, launch, prompt=None: ("%77", ""))
+                        lambda tmux_name, cwd, launch, engine, reason, prompt=None: ("%77", ""))
     monkeypatch.setattr(daemon, "_tmux",
                         lambda *a, **kw: type("R", (), {"returncode": 1, "stdout": "", "stderr": ""})())
     monkeypatch.setattr(daemon, "answer_resume_picker",
@@ -370,7 +370,7 @@ def test_a_revive_with_no_choice_does_not_touch_the_picker(tmp_path, monkeypatch
     # Boot restore and the plain on-message revive pass no choice; they must not press keys.
     answered = []
     monkeypatch.setattr(daemon, "launch_pane",
-                        lambda tmux_name, cwd, launch, prompt=None: ("%77", ""))
+                        lambda tmux_name, cwd, launch, engine, reason, prompt=None: ("%77", ""))
     monkeypatch.setattr(daemon, "_tmux",
                         lambda *a, **kw: type("R", (), {"returncode": 1, "stdout": "", "stderr": ""})())
     monkeypatch.setattr(daemon, "answer_resume_picker",

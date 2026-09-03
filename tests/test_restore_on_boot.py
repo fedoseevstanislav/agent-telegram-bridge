@@ -20,7 +20,7 @@ def test_missing_boot_id_with_dead_registered_panes_restores_before_saving(monke
 
     # `cause` is keyword-only with no default: a defaulted fake cannot tell "production
     # passed it" from "production omitted it".
-    def fake_revive(_cfg, tid, info, brief=True, taken=None, *, cause):
+    def fake_revive(_cfg, tid, info, brief=True, taken=None, *, cause, **kw):
         events.append(("revive", tid, info["session_id"], brief, cause))
         return "resumed", {"needs_brief": False}
 

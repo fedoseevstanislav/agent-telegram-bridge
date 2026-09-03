@@ -8,6 +8,7 @@ transcribed before being written to the inbox.
 import contextlib
 import fcntl
 import json
+import math
 import os
 import re
 import secrets
@@ -183,6 +184,57 @@ def recent_inbox_drop(tid, now, window=RECENT_DROP_WINDOW):
     return last_inbox_message(tid)
 
 
+def nudge_address(tid):
+    """Who a typed nudge is for, to open every line that tells a session to run `recv`.
+
+    A nudge is keystrokes into a tmux pane, and a session's subagents share that pane. The
+    text says "run `tg-bridge recv --topic N`", agents obey instructions they can read, and
+    `recv` CONSUMES: an in-process research subagent ran it, ate its owner's message and
+    re-posted it into the topic (#145). Nothing here can stop that — the owning session and
+    its subagent share a pane, a process tree and an environment, so no read distinguishes
+    them (measured: six live topics all report the same inherited `CLAUDE_CODE_SESSION_ID`).
+    All that is left is to say who the line is for, which is why it goes FIRST: an agent that
+    reads the instruction before the address has already been told to act.
+
+    It is addressing, not a guard, and must never be described as one.
+
+    The session id is carried in full rather than abbreviated so that a later check can match
+    it against a transcript exactly instead of by prefix. Omitted when the registry has none
+    (a codex session has no id until its first turn completes), because a line that says
+    "session None" addresses nobody."""
+    try:
+        sid = (read_registry().get(str(tid)) or {}).get("session_id")
+    except Exception:
+        # NEVER let addressing cost a delivery. This runs on the nudge path, where the old
+        # code read no registry at all, so an unreadable or malformed registry would have
+        # turned a missing address into a missing MESSAGE — a worse failure than the one this
+        # fixes, and one the caller could not tell from "nothing to nudge" (review r1, C8).
+        sid = None
+    # A non-string here rendered as "(session 7)", which addresses nobody and looks like it
+    # addresses somebody — worse than saying nothing (review r2). The registry is a JSON file
+    # this process does not solely own.
+    who = f" (session {sid})" if isinstance(sid, str) and sid else ""
+    return (f"For the session registered on topic {tid}{who}; other agents in this "
+            f"terminal ignore this.")
+
+
+def nudge_text(tid, body):
+    """Constructor for the SWEEP and MESSAGE nudges — the lines typed at a session that is
+    already running, to make it drain its inbox. Body starts after the address.
+
+    Not every `recv` instruction in this module comes through here, and the docstring said so
+    wrongly before: the `RESTORE_BRIEFING_*` templates also instruct `recv` and are also typed
+    into the pane, by `deliver_briefing`. They are left unaddressed for now — a revive briefing
+    lands on a pane whose session has just restarted, which is the moment a subagent is least
+    likely to be reading it — and that gap is recorded by name in the enumeration test rather
+    than papered over.
+
+    Each of the three sites that DO come through here used to build its own prefix, which is
+    how a fourth could be added unaddressed. Nothing in Python holds that shut; the test that
+    enumerates this module's `recv --topic` strings does, within the limits it states."""
+    return f"[tg-bridge] {nudge_address(tid)} {body}"
+
+
 def dead_listener_nudge(tid, rec=None):
     """Text nudged into a topic whose background recv listener has died (#105).
 
@@ -203,13 +255,13 @@ def dead_listener_nudge(tid, rec=None):
             f"most recent, from {rec.get('from')}: \"{snippet}\"{more}. If you have NOT "
             f"already handled it, act on it now."
         )
-    return (
-        f"[tg-bridge] Your background listener for topic {tid} isn't "
+    return nudge_text(tid, (
+        f"Your background listener for topic {tid} isn't "
         f"running, so new replies won't wake you.{recap} Drain with "
         f"`tg-bridge recv --topic {tid}`, then re-arm "
         f"`tg-bridge recv --topic {tid} --wait 86400` via run_in_background "
         f"— NEVER a detached `&` shell job."
-    )
+    ))
 
 
 def sweep_nudge_text(tid, flavor, now):
@@ -218,12 +270,12 @@ def sweep_nudge_text(tid, flavor, now):
       * "unread" — messages sit undrained in the inbox; tell the session to drain + re-arm.
       * otherwise — the recv listener has died; re-deliver a FRESH dropped message if any."""
     if flavor == "unread":
-        return (
-            f"[tg-bridge] You have undelivered messages in topic {tid} — "
-            f"run `tg-bridge recv --topic {tid}` now and drain the inbox. "
+        return nudge_text(tid, (
+            f"You have undelivered messages in topic {tid} "
+            f"— run `tg-bridge recv --topic {tid}` now and drain the inbox. "
             f"For claude: then re-arm ONE long background wait with "
             f"run_in_background (never a detached `&`)."
-        )
+        ))
     return dead_listener_nudge(tid, recent_inbox_drop(tid, now))
 
 
@@ -710,7 +762,7 @@ def _prune_pane_tables():
         return
     if not live:
         return  # an empty/failed fleet read is not evidence that every pane died
-    for table in (_swallowed_streak, _pane_locks):
+    for table in (_swallowed_streak, _pane_locks, _low_priority_done):
         for pane in [p for p in table if p not in live]:
             table.pop(pane, None)
 
@@ -797,6 +849,17 @@ def maybe_nudge(thread_id, pane, wake_claim=None):
     """Type a wake-up line into the session's tmux pane if its inbox is still unread."""
     try:
         inbox = state_path("topics", str(thread_id), "inbox.jsonl")
+        # Built BEFORE the wake claim: addressing reads the registry, and the critical
+        # section below is not the place to add file I/O (review r1, C8). The address can
+        # therefore be stale by the time the keystrokes land — nothing revalidates the binding
+        # in between, and this path does not pass `still_ok` to type_line. A stale address
+        # names the session that held the topic a moment ago, which is a weaker claim than the
+        # line makes; it is the price of keeping the read out of the lock, and it is not
+        # bounded here.
+        text = nudge_text(thread_id, (
+            f"New Telegram message in your topic "
+            f"— run `tg-bridge recv --topic {thread_id}` and act on it."
+        ))
         with validate_wake_claim(inbox, wake_claim) as claim_is_current:
             if not claim_is_current:
                 return None
@@ -805,10 +868,6 @@ def maybe_nudge(thread_id, pane, wake_claim=None):
             if not pane_alive(pane):
                 log(f"nudge skipped, pane {pane} gone (topic {thread_id})")
                 return False
-            text = (
-                f"[tg-bridge] New Telegram message in your topic — "
-                f"run `tg-bridge recv --topic {thread_id}` and act on it."
-            )
             status = type_line(pane, text)
             if status != "sent":
                 log(f"nudge not delivered to pane {pane} (topic {thread_id}): {status}")
@@ -1773,11 +1832,69 @@ def local_datetime(epoch):
     return time.strftime("%a %d %b %H:%M", time.gmtime(epoch + TZ_OFFSET * 3600))
 
 
-def reset_epoch(block):
-    try:
-        return datetime.fromisoformat((block.get("resets_at") or "").replace("Z", "+00:00")).timestamp()
-    except ValueError:
+# ---- usage-source shape guards (#284) ----
+#
+# The usage line builders read two sources we do not parse ourselves: `/tmp/claude-usage-cache.json`,
+# written by a shell script from a network response, and Codex's own rollout JSON. Both are
+# "ours" in the sense that no attacker writes them — but a broken writer is not hostile input
+# and still took the whole `/usage` reply down, because `handle_command` swallows the raise and
+# the owner simply got NO answer. Since #795 the reply carries both accounts, so one malformed
+# cache also cost the other account's line.
+#
+# The guards are three helpers used at every site rather than an isinstance test per call: the
+# invariant is "a shape we did not expect is missing data", and it needs one statement of what
+# that means, not one per field. Each returns the empty/None case so callers can keep reading
+# without branching.
+
+
+def _as_dict(value):
+    """`value` if it is a dict, else {} — a non-dict where a mapping was promised is no data."""
+    return value if isinstance(value, dict) else {}
+
+
+def _as_list(value):
+    """`value` if it is a list, else []. Deliberately not "any iterable": a string is iterable,
+    and iterating one yields characters, which then fail as mappings one at a time."""
+    return value if isinstance(value, list) else []
+
+
+def _finite_number(value):
+    """`value` if it is a real finite number, else None.
+
+    `isinstance(x, (int, float))` is not that test and was the bug in three places: it admits
+    `True` (which then prints as 1) and NaN/±infinity (on which `round()` and `time.gmtime()`
+    both raise)."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
         return None
+    return value if math.isfinite(value) else None
+
+
+def _usable_epoch(value):
+    """`value` as an epoch this platform can actually format, or None. Finiteness is necessary
+    but not sufficient — the formattable range is the platform's business, so the last word is
+    trying it rather than guessing a bound."""
+    if _finite_number(value) is None:
+        return None
+    try:
+        time.gmtime(value + TZ_OFFSET * 3600)
+    except (ValueError, OverflowError, OSError):
+        return None
+    return value
+
+
+def reset_epoch(block):
+    """Epoch for a block's `resets_at`, or None. TOTAL: no input raises.
+
+    It used to catch only ValueError, so an int `resets_at` reached `.replace` and raised
+    AttributeError through every caller (#284)."""
+    raw = _as_dict(block).get("resets_at")
+    if not isinstance(raw, str) or not raw.strip():
+        return None
+    try:
+        parsed = datetime.fromisoformat(raw.strip().replace("Z", "+00:00")).timestamp()
+    except (ValueError, TypeError, OverflowError, OSError):
+        return None
+    return _usable_epoch(parsed)
 
 
 DASH_POLL = int(os.environ.get("TG_BRIDGE_DASH_POLL", "60"))  # dashboard rebuild interval
@@ -1905,42 +2022,311 @@ def issue_queue_line(counts):
 def _scoped_weekly_pct(u, model_name):
     """Percent + reset epoch for a model-scoped weekly limit from the usage cache. Model-scoped
     usage (e.g. Fable) is NOT a top-level field — it's a `weekly_scoped` entry inside limits[]
-    whose scope.model.display_name matches. Returns (percent:int, reset_epoch) or None if absent."""
-    for lim in u.get("limits") or []:
+    whose scope.model.display_name matches. Returns (percent, reset_epoch) — the RAW percent,
+    so the one validator (_pct_left) sees it: rounding here first crashed on a malformed value
+    and took the whole two-account reply with it — or None if absent."""
+    for lim in _as_list(_as_dict(u).get("limits")):
+        lim = _as_dict(lim)
         if lim.get("group") != "weekly":
             continue
-        model = (lim.get("scope") or {}).get("model") or {}
-        if (model.get("display_name") or "").casefold() == model_name.casefold():
+        model = _as_dict(_as_dict(lim.get("scope")).get("model"))
+        display = model.get("display_name")
+        if not isinstance(display, str):
+            continue
+        if display.casefold() == model_name.casefold():
             pct = lim.get("percent")
             if pct is None:  # entry present but percent unknown — omit rather than report a false 0%
                 return None
-            return round(pct), reset_epoch(lim)
+            return pct, reset_epoch(lim)
     return None
+
+
+def _pct_left(used):
+    """Remaining percent from a USED percentage, or None when the source has no usable
+    number. A null/absent/NaN meter must DROP its segment: rendering "nan% left" is a lie,
+    and crashing on round(None) would take down the whole /usage reply — including the other
+    account's line, which shares the message since #795. Clamped to 0..100 so an
+    out-of-range source value can never print a negative or above-100 remainder."""
+    if isinstance(used, bool) or not isinstance(used, (int, float)) or not math.isfinite(used):
+        return None
+    return max(0, min(100, 100 - round(used)))
 
 
 def account_usage_line():
     try:
         with open(USAGE_CACHE) as f:
-            u = json.load(f)
+            u = _as_dict(json.load(f))   # a cache that is a list/str/number is no data at all
     except (OSError, ValueError):
         return None
-    five = u.get("five_hour") or {}
-    week = u.get("seven_day") or {}
-    line = f"👤 Account: 5h {round(five.get('utilization', 0))}% used"
-    five_reset = reset_epoch(five)
-    if five_reset:
-        line += f" (resets {local_hhmm(five_reset)} UTC+{TZ_OFFSET})"
-    line += f" · week {round(week.get('utilization', 0))}% used"
-    week_reset = reset_epoch(week)
-    if week_reset:
-        line += f" (resets {local_datetime(week_reset)})"
+    # The cache stores UTILIZATION (% used); every meter the owner reads is REMAINING (#795),
+    # so both this line and codex_usage_line() print "N% left" in the same segment shape.
+    segments = []
+    for label, window, reset_fmt in (
+        ("5h", _as_dict(u.get("five_hour")), "hhmm"),
+        ("week", _as_dict(u.get("seven_day")), "datetime"),
+    ):
+        left = _pct_left(window.get("utilization"))
+        if left is None:
+            continue  # meter absent or unusable this snapshot — omit, don't invent a number
+        seg = f"{label} {left}% left"
+        reset = reset_epoch(window)
+        if reset:
+            seg += (f" (resets {local_hhmm(reset)} UTC+{TZ_OFFSET})" if reset_fmt == "hhmm"
+                    else f" (resets {local_datetime(reset)})")
+        segments.append(seg)
     fable = _scoped_weekly_pct(u, "Fable")
     if fable is not None:
-        fpct, freset = fable
-        line += f" · Fable week {fpct}% used"
-        if freset:
-            line += f" (resets {local_datetime(freset)})"
-    return line
+        fleft = _pct_left(fable[0])
+        if fleft is not None:
+            seg = f"Fable week {fleft}% left"
+            if fable[1]:
+                seg += f" (resets {local_datetime(fable[1])})"
+            segments.append(seg)
+    if not segments:
+        return None  # nothing usable in the cache — the caller prints its no-data line
+    return "👤 Claude usage (account): " + " · ".join(segments)
+
+
+# ---- 5h limit -> automatic low-priority mode (#279) ----
+#
+# When the account's 5-hour window is spent, a Claude session stops making progress and sits
+# there until somebody notices. Claude Code's own answer is the `/low-priority` slash command
+# ("Continue now at lower priority · uses your weekly limit"), which the owner was running by
+# hand. The daemon runs it instead: the limit is ACCOUNT-wide, so one reading of the usage cache
+# decides it for every live Claude pane at once.
+
+LOW_PRIORITY_CMD = "/low-priority"
+LOW_PRIORITY_RETRY_DELAY = 8       # seconds between idle-gate retries (mirrors /model)
+LOW_PRIORITY_MAX_ATTEMPTS = 4
+# Claude Code's own status line while the mode is on ("Lower priority until {reset}").
+LOW_PRIORITY_ACTIVE = "Lower priority until"
+_low_priority_done = {}            # pane -> `resets_at` of the 5h window it was handled in
+_low_priority_lock = threading.Lock()
+
+
+def five_hour_exhausted(usage):
+    """`(window_key, reset_epoch)` when the account's 5-hour window is spent, else None.
+
+    Which field carries "spent" is not something the cache documents, so this keys on the two
+    it demonstrably carries. `limits[]` holds exactly one `kind: "session"` entry — that IS the
+    5h window; its `resets_at` equals `five_hour.resets_at` — with a `percent` and a `severity`.
+    A healthy cache reads `"severity": "normal"`; the value it takes when the window is spent is
+    not discoverable from the cache or from the Claude Code binary, so `severity` is NOT what we
+    trip on. `percent >= 100` is, with `locked_reason` (non-null on a locked window) as a second,
+    independent trip, and `five_hour.utilization` as the fallback when the `session` entry is
+    missing.
+
+    The window key is `resets_at`, and it must PARSE. Without a key there is no way to say
+    "once per window", and without an epoch there is no reset time to put in the notice — so a
+    cache carrying neither is treated as no signal at all rather than as a licence to type on
+    every poll. Every field is type-checked before it is used: this reads a file written by a
+    shell script from a network response, and the honest answer to a shape we don't recognise
+    is silence, not a traceback in the dashboard loop.
+    """
+    if not isinstance(usage, dict):
+        return None
+    five = usage.get("five_hour")
+    five = five if isinstance(five, dict) else {}
+    limits = usage.get("limits")
+    session = {}
+    for lim in limits if isinstance(limits, list) else []:
+        if isinstance(lim, dict) and lim.get("kind") == "session":
+            session = lim
+            break
+    pct = session.get("percent")
+    if not isinstance(pct, (int, float)) or isinstance(pct, bool):
+        pct = five.get("utilization")
+    # A reason must be a non-empty STRING to count. `true`, `{}` or `[]` in that field is a
+    # shape we don't recognise, and acting on an unrecognised shape is how a fleet-wide
+    # keystroke gets sent on a misread (review r2, C4).
+    locked = next((r for r in (session.get("locked_reason"), five.get("locked_reason"))
+                   if isinstance(r, str) and r.strip()), None)
+    if not locked and not (isinstance(pct, (int, float)) and not isinstance(pct, bool)
+                           and pct >= 100):
+        return None
+    window = session.get("resets_at") or five.get("resets_at")
+    if not isinstance(window, str) or not window.strip():
+        return None
+    try:
+        reset = datetime.fromisoformat(window.strip().replace("Z", "+00:00")).timestamp()
+    except (ValueError, TypeError, OverflowError):
+        return None
+    return window, reset
+
+
+def _low_priority_capture(pane):
+    """The pane's visible tail, or None if it can't be read. Same window `_try_send_model`
+    reads for its confirmation dialog."""
+    cap = _tmux(["tmux", "capture-pane", "-p", "-t", pane, "-S", "-12"],
+                capture_output=True, text=True)
+    return cap.stdout if cap.returncode == 0 else None
+
+
+def _pane_in_low_priority(pane):
+    """True when the pane already shows Claude Code's low-priority status line. Covers the two
+    cases the in-memory window guard cannot: the owner ran `/low-priority` themselves, and a
+    daemon restart mid-window that lost the guard. A capture that fails reads as "not in it" —
+    the fallback is one redundant command, not a stuck session."""
+    return LOW_PRIORITY_ACTIVE in (_low_priority_capture(pane) or "")
+
+
+def _low_priority_echo_count(pane):
+    """How many times the command text is visible on the pane, or None if it can't be read.
+    An unreadable pane is never typed-and-Entered into (`_cf_busy` errs the same way)."""
+    cap = _low_priority_capture(pane)
+    return None if cap is None else cap.count(LOW_PRIORITY_CMD)
+
+
+def low_priority_sweep(cfg):
+    """One pass of the 5h-limit check, called from `dashboard_loop` — the loop that already
+    reads this cache every DASH_POLL seconds. A missing or malformed cache is a no-op.
+
+    The window is claimed for a pane BEFORE the command is attempted, so the retry chain owns
+    that pane for the rest of the window and the next poll does not start a second chain
+    alongside it. A chain that gives up (the pane never settled) therefore does not retry until
+    the window resets — the same bargain `/model` makes."""
+    try:
+        with open(USAGE_CACHE) as f:
+            usage = json.load(f)
+    except (OSError, ValueError):
+        return
+    hit = five_hour_exhausted(usage)
+    if not hit:
+        return
+    window, reset = hit
+    for tid, info in read_registry().items():
+        pane = info.get("pane")
+        if not pane or info.get("ended") or info.get("feed"):
+            continue  # registry facts only — every PANE precondition is _low_priority_blocker's
+        try:
+            with _low_priority_lock:
+                if _low_priority_done.get(pane) == window:
+                    continue
+                _low_priority_done[pane] = window
+            _try_low_priority(cfg, tid, pane, reset, 1)
+        except Exception as e:
+            # One unreadable pane must not cost the rest of the fleet its switch. The 5h limit
+            # is the moment the whole fleet is stalled, so a fleet-wide abort here is the
+            # expensive failure.
+            log(f"low-priority: pane {pane} (topic {tid}) failed: {e}")
+
+
+def _low_priority_blocker(pane):
+    """Why this pane must not be typed into *right now*, or None if it may be.
+
+    Every precondition for the switch lives here and nowhere else, so that "check it again
+    before the next keystroke" is one call rather than a list somebody has to keep in sync.
+    Returns `(kind, reason)`:
+
+      "done"  — terminal for this 5h window: the pane is gone, is not a Claude session, or is
+                already in low-priority mode. Nothing to type and nothing to announce.
+      "retry" — may clear on its own (mid-turn); the caller re-arms its timer.
+
+    Caller must hold the pane lock: `pane_is_idle` and `_pane_in_low_priority` both read the
+    pane, and a read taken outside the lock can be invalidated by another injector before the
+    keystroke it is supposed to authorize. None of these calls takes `_pane_lock` itself, so
+    holding it here is not re-entrant."""
+    if not pane_alive(pane):
+        return "done", "pane is gone"
+    if engine_of_pane(pane) != "claude":
+        return "done", "pane is not a claude session"
+    if _pane_in_low_priority(pane):
+        return "done", "already in low-priority mode"
+    if not pane_is_idle(pane):
+        return "retry", "stayed mid-turn"
+    return None
+
+
+def _try_low_priority(cfg, thread_id, pane, reset, attempt):
+    """Deliver `/low-priority` once the pane is idle, retrying on a bounded timer. Same gate and
+    same pane lock as `_try_send_model`: typing into a pane mid-turn puts the command into the
+    session's next prompt instead of the command bar, and typing inside another injection's
+    capture→type→capture window corrupts it (#165).
+
+    The Enter is receipt-gated the way `type_line` gates its own (#133): capture before, type,
+    capture again, and press Enter only if `/low-priority` appears MORE times than it did — a
+    modal swallows printable text and reads the Enter as "accept the highlighted option", which
+    is how a session once got silently switched to a cheaper model. A strict rise, not mere
+    presence, because an earlier switch can leave the same string in scrollback. `type_line`
+    itself is not the vehicle here: it appends a nonce after the payload and backspaces it off,
+    which for a slash command means typing into the autocomplete filter and relying on how that
+    widget redraws — unverifiable without writing to a live pane. A withheld Enter is retried on
+    the same timer and gives up at the same cap, so nothing grows without bound.
+
+    Every precondition is `_low_priority_blocker`, and it is re-evaluated INSIDE the pane lock
+    immediately before EACH of the two irreversible keystrokes. Three review rounds each found
+    another precondition that had been checked once, outside the lock, and was therefore stale
+    by the width of the lock wait: the engine (r2), the idle gate (r3), the already-switched
+    check (r3). Patching them one at a time is what kept producing the next one, so there is now
+    one predicate and one place it is called from, and adding a precondition means adding it to
+    that function only. The residual is the straight-line microseconds between the last read and
+    tmux's write — the same one `type_line` states for `still_ok`, and irreducible for the same
+    reason: no check from outside the pane can be atomic with tmux's write.
+
+    A precondition that turns out false between the text and the `Enter` leaves the text
+    stranded, unsent, in the input box. That is `type_line`'s bargain too, and for the same
+    reason: a stranded line is recoverable, a wrong `Enter` on a modal is not.
+
+    The whole body is inside one `try`, and every failure — the lock, a tmux error, an
+    unreadable pane — retries on the timer rather than returning. `low_priority_sweep` claims
+    the window BEFORE calling, so a bare return anywhere in here would leave the pane claimed
+    and untried until the window reset (review r2 C1, r3 finding 1)."""
+    retry = None
+    try:
+        with _pane_lock(pane):
+            state = _low_priority_blocker(pane)
+            if state:
+                kind, retry = state
+                if kind == "done":
+                    return              # terminal for this window; nothing to type or announce
+            else:
+                before = _low_priority_echo_count(pane)
+                if before is None:
+                    retry = "can't be read"     # never type into a pane we cannot verify
+                else:
+                    _tmux(["tmux", "send-keys", "-t", pane, "-l", LOW_PRIORITY_CMD],
+                          check=True, capture_output=True)
+                    time.sleep(0.5)  # let the slash-command menu settle on the exact match
+                    after = _low_priority_echo_count(pane)
+                    state = _low_priority_blocker(pane)   # re-check before the Enter
+                    if state:
+                        kind, retry = state
+                        if kind == "done":
+                            return
+                    elif after is None or after <= before:
+                        retry = "didn't take the command (modal or unreadable pane)"
+                    else:
+                        _tmux(["tmux", "send-keys", "-t", pane, "Enter"],
+                              check=True, capture_output=True)
+    except Exception as e:
+        log(f"low-priority send failed for pane {pane}: {e}")
+        retry = f"errored ({e})"
+    if retry:
+        if attempt >= LOW_PRIORITY_MAX_ATTEMPTS:
+            log(f"low-priority: pane {pane} {retry}, gave up after {attempt} attempts")
+            return
+        threading.Timer(LOW_PRIORITY_RETRY_DELAY, _try_low_priority,
+                        args=(cfg, thread_id, pane, reset, attempt + 1)).start()
+        return
+    log(f"{LOW_PRIORITY_CMD} -> pane {pane} (topic {thread_id})")
+    reply(cfg, thread_id,
+          f"5h limit hit — switched to low-priority until {local_hhmm(reset)} UTC+{TZ_OFFSET}.")
+PLAN_LABEL_MAX = 32   # chars; a plan name is a word or two, and this line must stay one message
+
+
+def _plan_label(plan):
+    """The Codex plan name, bounded, or "?".
+
+    Unbounded interpolation broke the "one message" guarantee this reply is built on: a
+    4,000-character `plan_type` produced a 4,104-character reply, which `split_for_telegram`
+    turned into three messages (#284). Newlines matter as much as length — one would break the
+    two-line shape that `/usage` composes — so whitespace is collapsed before the cap."""
+    if not isinstance(plan, str):
+        return "?"
+    collapsed = " ".join(plan.split())
+    if not collapsed:
+        return "?"
+    return collapsed if len(collapsed) <= PLAN_LABEL_MAX else collapsed[:PLAN_LABEL_MAX - 1] + "…"
 
 
 def _codex_window_label(window_min):
@@ -1948,8 +2334,11 @@ def _codex_window_label(window_min):
     reports each limit's `window_minutes` (5h window = 300, weekly = 10080). The
     primary/secondary SLOT does NOT fix the window — a pro account's `primary` can itself be
     the weekly window — so the label must come from the length, not the slot. Returns None
-    when the length is unknown (caller falls back to "?")."""
-    if not isinstance(window_min, (int, float)):
+    when the length is unknown (caller falls back to "?").
+
+    `isinstance(x, (int, float))` alone admitted bools, NaN and ±infinity, and `round(nan)`
+    raises — the same shape hole as the reset values (#284)."""
+    if _finite_number(window_min) is None:
         return None
     m = round(window_min)
     if m <= 360:                       # ~5h (300) and shorter
@@ -1973,23 +2362,25 @@ def codex_usage_line(cwd=None):
     except Exception as e:
         log(f"codex usage lookup failed for {cwd or 'latest'}: {e}")
         return None
+    u = _as_dict(u)
     if not u:
         return None
-    plan = u.get("plan_type") or "?"
+    plan = _plan_label(u.get("plan_type"))
     segments = []
     for pct_key, win_key, reset_key in (
         ("primary_pct", "primary_window_min", "primary_reset"),
         ("secondary_pct", "secondary_window_min", "secondary_reset"),
     ):
-        pct = u.get(pct_key)
-        if not isinstance(pct, (int, float)):
-            continue  # window absent for this account/snapshot — omit, don't print "n/a"
+        left = _pct_left(u.get(pct_key))
+        if left is None:
+            continue  # window absent/unusable for this snapshot — omit, don't print "n/a"
         win_min = u.get(win_key)
-        seg = f"{_codex_window_label(win_min) or '?'} {100 - pct:.0f}% left"
-        reset = u.get(reset_key)
-        if isinstance(reset, (int, float)):
+        seg = f"{_codex_window_label(win_min) or '?'} {left}% left"
+        reset = _usable_epoch(u.get(reset_key))
+        if reset is not None:
             # short (≈5h) windows show just HH:MM; longer ones show the full datetime.
-            if isinstance(win_min, (int, float)) and win_min <= 360:
+            short = _finite_number(win_min)
+            if short is not None and short <= 360:
                 seg += f" (resets {local_hhmm(reset)} UTC+{TZ_OFFSET})"
             else:
                 seg += f" (resets {local_datetime(reset)})"
@@ -2071,6 +2462,13 @@ def dashboard_loop(cfg):
     last_body, last_edit, orch_counts, tick = None, 0.0, None, 0
     while True:
         try:
+            # #279: this loop already reads the usage cache (via account_usage_line) on the
+            # same cadence, so the 5h-limit check rides it rather than adding a thread. Its
+            # own try: a failure here must not cost the fleet its dashboard.
+            low_priority_sweep(cfg)
+        except Exception as e:
+            log(f"low_priority_sweep error: {e}")
+        try:
             if tick % DASH_ORCH_EVERY == 0:
                 fresh = issue_queue_counts()
                 if any(v is not None for v in fresh.values()):
@@ -2109,7 +2507,7 @@ HELP_TEXT = """Bridge commands (work in any session topic):
 /ctx — session's context-window usage
 /model [name] — switch this session's model live (opus/sonnet/haiku, or a full id), keeping its conversation; no arg lists the options
 /carryforward (or /cf) — bridge-driven: the session writes its carry-forward (state + next-steps) to a GitHub issue (creating one if none), then I run /compact and auto-resume it from those next-steps. Send any message to halt.
-/usage [claude|codex] — account limits (5h window %, weekly %, reset time); bare /usage uses this topic's engine, `/usage claude` / `/usage codex` force either from any topic
+/usage [claude|codex] — account limits as % LEFT (5h, week, reset time); bare /usage shows BOTH the Claude and the Codex meter from any topic, `/usage claude` / `/usage codex` show just one
 /stop — interrupt the session's current turn
 /peek — last ~25 lines of the session's terminal
 !<text> — interrupt + hand <text> to the session as its next instruction
@@ -2313,7 +2711,10 @@ def spawn_session(cfg, thread_id, text):
             ensure_codex_trust(cwd)
         except OSError as e:
             log(f"codex trust write failed for {cwd}: {e}")  # spawn anyway; worst case it prompts
-    pane, err = launch_pane(tmux_name, cwd, engine_launch(engine), bootstrap)
+    # The owner's own words for this seat, minus what the daemon consumed (`@path`): the
+    # name, and the task when they gave one. This is what the shim journals as the reason.
+    pane, err = launch_pane(tmux_name, cwd, engine_launch(engine), engine,
+                            f"{name}: {task}" if task else name, prompt=bootstrap)
     if not pane:
         reply(cfg, thread_id, f"Spawn failed: {err}")
         return
@@ -2428,23 +2829,23 @@ def handle_command(cfg, thread_id, text):
         if len(parts) > 2 or arg not in ("", "claude", "codex"):
             reply(cfg, thread_id, "Usage: /usage [claude|codex] — bare /usage uses this topic's engine.")
             return
-        # Explicit `/usage codex` works from ANY topic (account-wide, most-recent rollout);
-        # bare /usage in a Codex topic scopes to that session's cwd. `/usage claude` and
-        # bare /usage elsewhere report the Claude account.
-        want_codex = arg == "codex" or (arg == "" and pane and engine_of_pane(pane) == "codex")
-        if want_codex:
-            cwd = pane_cwd(pane) if (arg == "" and pane) else None
-            usage = codex_usage_line(cwd)
-            reply(cfg, thread_id, usage or (
-                "No Codex usage data yet — it appears once a Codex session has logged a "
-                "rate-limit snapshot (start a Codex session and run some work first)."
-            ))
-        else:
-            usage = account_usage_line()
-            reply(cfg, thread_id, usage or (
-                "No usage data yet — it appears once any session has rendered "
+        # Bare /usage reports BOTH accounts, account-wide, whatever engine this topic runs
+        # (#795) — two meters in one glance, both as "% left". `/usage claude` / `/usage codex`
+        # return just that one line; `/usage codex` from a Codex topic still scopes to that
+        # session's cwd (from any other topic it is the most-recent rollout, account-wide).
+        lines = []
+        if arg in ("", "claude"):
+            lines.append(account_usage_line() or (
+                "👤 Claude: no data yet — it appears once any session has rendered "
                 "its statusline recently."
             ))
+        if arg in ("", "codex"):
+            cwd = pane_cwd(pane) if (arg == "codex" and pane and engine_of_pane(pane) == "codex") else None
+            lines.append(codex_usage_line(cwd) or (
+                "🤖 Codex: no data yet — it appears once a Codex session has logged a "
+                "rate-limit snapshot (start a Codex session and run some work first)."
+            ))
+        reply(cfg, thread_id, "\n".join(lines))
         return
     if cmd.split()[0] in ("/claude", "/codex", "/spawn"):
         spawn_session(cfg, thread_id, cmd)
@@ -2480,18 +2881,37 @@ def handle_command(cfg, thread_id, text):
     if not pane or not pane_alive(pane):
         reply(cfg, thread_id, f"Can't deliver {cmd}: no live terminal bound to this topic.")
         return
-    try:
-        with _pane_lock(pane):  # #165: don't write into another injection's verify window
-            _tmux(["tmux", "send-keys", "-t", pane, "-l", cmd], check=True, capture_output=True)
-            time.sleep(0.5)  # let the TUI's slash-command menu settle on the exact match
-            _tmux(["tmux", "send-keys", "-t", pane, "Enter"], check=True, capture_output=True)
-    except PaneLockUnavailable as e:
-        log(f"command {cmd}: {e} (topic {thread_id})")
-        reply(cfg, thread_id, f"Couldn't deliver {cmd} — the terminal is locked by another "
-                              f"delivery that hasn't finished. Try again in a moment.")
+    # #133's verified path, which this relay was left outside of. It used to write the
+    # keystrokes and press Enter blind, then reply "typed {cmd}" whichever of those the pane
+    # had actually done — so a modal already up ate the command and answered its own default
+    # with that Enter, while the owner read a success. `type_line` takes its own pane lock
+    # (#165) and presses Enter only once the text is confirmed in an input box. SETTLE is the
+    # 0.5 s the slash-command menu needs to narrow to the exact match; the relay's whole
+    # purpose is slash commands, and `/compact` already rides this path from the carry-forward
+    # inject.
+    status = type_line(pane, cmd, settle=0.5)
+    log(f"command {cmd} -> pane {pane} (topic {thread_id}): {status}")
+    if status != "sent":
+        # Say what happened, and no more than that. A relay that reports a command it did not
+        # deliver is worse than one that fails: the owner stops watching for the result and
+        # the pane may have answered a modal's default with the Enter instead (#154).
+        #
+        # The two statuses are not merged because they mean different things to the person
+        # reading: "swallowed" is a pane that took keystrokes without showing them, "failed"
+        # is this delivery never starting — type_line returns it for a pane lock held by
+        # another injection, a pane it could not read, and an empty line alike, so the wording
+        # names the possibilities rather than picking one. It absorbs PaneLockUnavailable
+        # itself, which is why this call site no longer catches it.
+        if status == "swallowed":
+            reply(cfg, thread_id, f"Couldn't deliver {cmd} — the terminal took the keystrokes "
+                                  f"but never showed them, so I withheld Enter rather than "
+                                  f"send it into whatever is holding the input box.")
+        else:
+            reply(cfg, thread_id, f"Couldn't deliver {cmd} — the terminal didn't take it. It "
+                                  f"may be busy with another delivery, or unreadable. Try "
+                                  f"again in a moment.")
         return
     reply(cfg, thread_id, f"→ typed {cmd} into the session terminal")
-    log(f"command {cmd} -> pane {pane} (topic {thread_id})")
 
 
 def load_autocf_exempt():
@@ -3442,15 +3862,43 @@ def _session_path():
 SPAWN_ENV = "CLAUDE_CODE_DISABLE_BG_SHELL_PRESSURE_REAP=1"
 
 
-def launch_pane(tmux_name, cwd, launch, prompt=None):
+SPAWN_REASON_MAX = 200  # chars of the owner's words that reach the journal
+
+
+def spawn_reason_env(engine, reason, fallback):
+    """`VAR=<quoted reason>` for the launch environment, where VAR is the shim's own
+    (`CLAUDE_SPAWN_REASON` / `CODEX_SPAWN_REASON`).
+
+    Why here: `~/.local/bin/{claude,codex}` are shims that journal every launch to
+    ~/.claude/model-decisions.jsonl and read the stated reason from that env var. A seat
+    started from Telegram was journaled WITHOUT one, so the one launch route that always
+    HAS an owner's words — the spawn command itself — was the one contributing blind rows.
+
+    The whole rule lives in this one function, so a caller cannot emit an unquoted, uncapped
+    or empty value: the text is folded to single spaces (newlines and tabs included), stripped
+    of anything unprintable, cut to SPAWN_REASON_MAX, and shell-quoted. `fallback` is used
+    when the owner's words sanitise away to nothing; the literal last resort keeps the
+    invariant "never empty" true even for a caller that passes two empty strings."""
+    def clean(text):
+        text = " ".join(str(text or "").split())
+        text = "".join(ch for ch in text if ch.isprintable())
+        return text[:SPAWN_REASON_MAX].strip()
+
+    var = "CODEX_SPAWN_REASON" if engine == "codex" else "CLAUDE_SPAWN_REASON"
+    return f"{var}={shlex.quote(clean(reason) or clean(fallback) or 'spawn')}"
+
+
+def launch_pane(tmux_name, cwd, launch, engine, reason, prompt=None):
     """Start a detached tmux session running `launch` (a full engine command) with the
     hardened spawn env, optionally passing `prompt` as the engine's initial-prompt arg.
+    `reason` is the owner's words for this launch, exported for the shim's journal.
     Returns (new_pane_id, "") on success or (None, error).
 
     Every spawn and every revive comes through here, which is why the reap opt-out below
-    is set here and nowhere else."""
+    — and the spawn reason — is set here and nowhere else."""
     shell_cmd = (f"PATH={shlex.quote(_session_path())} exec env -u CLAUDECODE "
-                 f"{SPAWN_ENV} {launch}")
+                 f"{SPAWN_ENV} {spawn_reason_env(engine, reason, f'spawn: {tmux_name}')} "
+                 f"{launch}")
     if prompt:
         shell_cmd += f" {shlex.quote(prompt)}"
     run = _tmux(
@@ -3544,6 +3992,77 @@ def session_id_for_pane(pane, engine):
 
 # ---- snapshot loop: persist engine + session_id while the pane is live ----
 
+def _heal_registry_cwd(tid, info, sid):
+    """Correct a registry `cwd` that points where this session's transcript is not.
+
+    `cwd` is captured ONCE, by `tg-bridge register`, as the calling process's `os.getcwd()`
+    (`bridge/cli.py`), and nothing ever revises it. A session that ran `register` after a `cd`
+    but whose `claude` was launched somewhere else therefore carries a directory that holds no
+    transcript. `claude --resume` is cwd-scoped, so `revive_one` relaunches into a directory
+    where the resume finds nothing, and the pane dies within a second — on every attempt, at
+    every reboot (#78).
+
+    Revive is only the loud symptom. The same field is the input to `transcript.transcript_path`
+    for the context reader, the carry-forward checks and the model watchdog, and there a wrong
+    cwd is SILENT: the file simply is not there, which reads as "no data" rather than as an
+    error. Correcting the field is one fix for all of them; a fallback inside `revive_one`
+    would be one fix for one of them.
+
+    Two residuals, stated because the fix does not cover them. A fresh entry is healed on the
+    SECOND cycle, not the first: the write waits until the registry carries the session id the
+    directory was derived from, which the same pass stamps a few lines below. And this runs on
+    the snapshot cycle at all, so an entry registered with the wrong cwd whose host reboots
+    before those cycles complete is still stranded on that first revive — and no claim is made about what happens after that, since
+    `restore_on_boot` runs before any loop and a revive that fails fast can be marked ended and
+    skipped from then on.
+
+    Cost: the healthy path is one `os.path.exists`. The glob is a single readdir over
+    `~/.claude/projects/*/`, and it repeats every snapshot for any claude topic whose
+    transcript stays unresolvable — a session that has not written one yet is the common
+    innocent case. There is no backoff, deliberately: a directory scan a minute is cheaper
+    than a state file to remember not to do it."""
+    cwd = info.get("cwd") or os.path.expanduser("~")
+    if os.path.exists(transcript.transcript_path(cwd, sid)):
+        return                      # the healthy path: one stat, no glob, no write
+    real, why = transcript.launch_cwd(sid)
+    if not real:
+        # Not answerable. Guessing here would replace a wrong directory with a different wrong
+        # directory, so the reason is logged and the field is left as it is.
+        log(f"snapshot: topic {tid} cwd {cwd} left as is — {why} ({sid[:8]})")
+        return
+    if os.path.realpath(real) == os.path.realpath(cwd):
+        return
+    healed = []
+
+    def _stamp_cwd(reg, _tid=str(tid), _c=real, _s=sid):
+        # Re-check under update_registry's lock and change nothing but cwd. `info` is a
+        # snapshot taken before the pane probes ran, so the write is bound to the session id
+        # the directory was derived from, and to nothing weaker.
+        #
+        # An entry that does not yet carry that id is REFUSED, not accepted. Two review rounds
+        # went into this one condition: accepting a missing id (to spare a fresh entry one
+        # cycle's delay) let a topic rebound to a new, still-unstamped session on the same pane
+        # take the OLD session's directory. Adding a pane check did not close it — the pane is
+        # the same in that interleaving — and re-reading the live id under the lock would put a
+        # tmux probe inside the registry lock. There is nothing here to triangulate from: the
+        # id is the fact the directory belongs to, so the write waits for the id (#241).
+        cur = reg.get(_tid)
+        if cur is None or cur.get("session_id") != _s:
+            return
+        cur["cwd"] = _c
+        healed.append(_c)
+
+    update_registry(_stamp_cwd)
+    # Written after the lock released and only if the write actually happened: the log is
+    # evidence, and a line claiming a cwd changed when the guard refused it is worse than no
+    # line at all (#233).
+    if healed:
+        log(f"snapshot: topic {tid} cwd {cwd} -> {real} (where {sid[:8]}'s transcript lives)")
+    else:
+        log(f"snapshot: topic {tid} cwd not healed yet — the entry does not carry {sid[:8]} "
+            f"(a fresh entry is stamped this cycle and healed on the next)")
+
+
 def snapshot_once():
     """Record engine + session_id + current boot_id into each live, registered, non-ended,
     non-feed entry. Writes only on change (low registry churn). Never raises out."""
@@ -3584,6 +4103,12 @@ def snapshot_once():
                     update_registry(_stamp_engine)
                     log(f"snapshot: topic {tid} engine={engine} (no session id yet)")
                 continue
+            if engine == "claude":
+                # Before the unchanged-entry shortcut below: a cwd can be stable AND wrong,
+                # which is exactly the case this fixes. Claude only — `claude --resume` is the
+                # cwd-scoped command, and a codex session's cwd comes from its own rollout
+                # metadata (`codex_ctx._meta_cwd`), not from this field.
+                _heal_registry_cwd(tid, info, sid)
             if (info.get("engine") == engine and info.get("session_id") == sid
                     and info.get("boot_id") == boot):
                 continue
@@ -4078,18 +4603,28 @@ def session_cost_sample(sid, cwd):
     return session_context_tokens(sid, cwd), session_age_minutes(sid, cwd)
 
 
+def _picker_expected_for(tokens, age):
+    """The prediction itself, over an already-taken sample.
+
+    Unknown either way is False: this predicts CLAUDE's behaviour, and an unknown gives no
+    grounds to expect a picker. That is the opposite of `_needs_asking_for`, where an unknown
+    size means ask — the two answer different questions and must not be merged."""
+    if tokens is None or age is None:
+        return False
+    return tokens > RESUME_MODAL_TOKENS and age > RESUME_MODAL_AGE_MINUTES
+
+
 def resume_picker_expected(sid, cwd):
     """Will Claude Code offer its own "Resume from summary / full session" picker?
 
     It appears only when the session is BOTH older than RESUME_MODAL_AGE_MINUTES and larger
     than RESUME_MODAL_TOKENS. Asking the owner to choose when no choice will be offered would
     leave the bridge waiting to answer a picker that never renders — so we predict it with
-    Claude's own thresholds rather than always asking."""
-    tokens = session_context_tokens(sid, cwd)
-    age = session_age_minutes(sid, cwd)
-    if tokens is None or age is None:
-        return False
-    return tokens > RESUME_MODAL_TOKENS and age > RESUME_MODAL_AGE_MINUTES
+    Claude's own thresholds rather than always asking.
+
+    One sample, one decision, for the reason `_needs_asking_for` records: reading the size and
+    the age in two passes let the halves disagree when the second stat failed."""
+    return _picker_expected_for(*session_cost_sample(sid, cwd))
 
 
 def _safe_peek(pane, lines=40):
@@ -4652,6 +5187,26 @@ RESUME_MODAL_ROWS = ("Resume from summary", "Resume full session as-is",
                      "Don't ask me again")
 RESUME_MODAL_CHOICE = {"compact": "1", "full": "2"}
 RESUME_MODAL_WAIT = 90        # s to wait for the picker to render after launch
+# One budget for a whole mass restore's picker answering (#277). Without it, N large sessions
+# would each add up to RESUME_MODAL_WAIT before the daemon starts polling.
+RESTORE_PICKER_BUDGET = 300
+# One wording for "the picker is up and nobody has answered it", used by both the path that
+# never had an answer and the path whose automatic answer did not land. The session cannot
+# receive work until it is answered, so this must say so identically either way.
+UNANSWERED_PICKER_NOTICE = (
+    "⚠️ Claude is showing its resume picker and I have no answer from you, so I "
+    "have not pressed anything. The session cannot receive work until it is "
+    "answered — reply `compact` or `full` and I will answer it.")
+# Below this much budget left, a mass restore does not take the choice at all: answering needs
+# time, and claiming a choice we cannot deliver is worse than not claiming one (see revive_one).
+MIN_PICKER_WINDOW = 10
+
+
+def _picker_budget_left(picker_deadline):
+    """Is there still enough of a mass restore's shared budget to answer a picker?
+
+    `None` means no budget applies (the single-session paths), which is always enough."""
+    return picker_deadline is None or picker_deadline - time.time() >= MIN_PICKER_WINDOW
 
 
 def _resume_launch(engine, sid, model=None, effort=None):
@@ -4751,11 +5306,62 @@ def _compaction_settled(pane, tid, window):
     return False
 
 
+def _briefing_exhausted(pane, tid, engine, briefing_tpl, attempt, reason, retry_kwargs=None,
+                        report_now=False):
+    """The ONE answer to "this attempt could not brief the pane — now what?".
+
+    Every give-up point in `deliver_briefing` ends here. It used to be three independent
+    decisions and two of them were wrong: the settle timeout and the final compaction
+    attempt both returned having scheduled nothing and escalated nothing, under a comment
+    saying idle_sweep would cover it. It cannot — `idle_sweep_loop` never calls
+    `deliver_briefing`; it injects `sweep_nudge_text`, which carries no topic id, no re-arm
+    instruction and no restore cause, and for codex it only fires when unread > 0. So a
+    pane that stayed busy through the window was never told it had been revived (#172).
+
+    `report_now` is a flag the caller sets when `type_line` returned `swallowed`. What that
+    status does and does not establish is `type_line`'s to state, and this function does not
+    restate it — four review rounds went into a paragraph here that kept trying to, each
+    version asserting some cause, outcome or timing the code does not observe. Here it means
+    one thing: also report to the owner on this attempt, not only at the cap.
+
+    It lives HERE rather than at the call site so it sits behind the same liveness gate as the
+    escalation below — the review round caught it outside, where a pane that died during
+    `type_line` still produced a "go answer the prompt" message about a pane with no prompt.
+
+    Keeping the rule in one function is the point: a fourth give-up point cannot answer the
+    question differently from the other three, which is how this bug survived two fixes to
+    its siblings."""
+    if not pane_alive(pane):
+        # Nothing to brief and nobody to prompt: every report below asks the owner to answer
+        # a prompt in a pane that no longer exists.
+        log(f"revive: pane {pane} for topic {tid} died before the briefing landed ({reason})")
+        return
+    if attempt < BRIEFING_MAX_ATTEMPTS:
+        if report_now:
+            report_blocked_pane(tid, pane, "its session-revival briefing")
+        threading.Timer(BRIEFING_RETRY_DELAY, deliver_briefing,
+                        args=(pane, tid, engine, briefing_tpl, attempt + 1),
+                        kwargs=retry_kwargs or {}).start()
+        log(f"revive: topic {tid} {reason} — retrying the briefing in "
+            f"{BRIEFING_RETRY_DELAY}s")
+        return
+    # Last attempt: the chain ends here, before type_line's own cap can release, and for a
+    # codex pane with an empty inbox idle_sweep_loop is not a fallback either (it only acts
+    # on unread). Force the escalation past its cooldown so giving up is never silent —
+    # this is the one report that must get through.
+    log(f"revive: giving up on briefing topic {tid} after {attempt} attempts ({reason})")
+    _blocked_reported.pop(str(tid), None)
+    report_blocked_pane(tid, pane,
+                        "its session-revival briefing (final attempt — this "
+                        "session will stay unbriefed until you answer the prompt)")
+
+
 def deliver_briefing(pane, tid, engine, briefing_tpl, attempt=1, settle=None, await_busy=False):
     """Type the briefing into a resumed pane once it is up and idle. Crash-retry safety:
-    never create a second concurrent recv — if a claude recv already listens, skip. If the
-    pane never becomes idle within the window, DO NOT send (a mid-turn inject could corrupt
-    input); leave it for idle_sweep_loop to nudge as a dark session.
+    never create a second concurrent recv — if a claude recv already listens, skip. While
+    the pane is mid-turn the briefing is NOT typed (a mid-turn inject could corrupt input);
+    the attempt ends at `_briefing_exhausted`, which retries on a bounded timer and, on the
+    last attempt, reports the blocked pane to the owner.
 
     A retry (attempt > 1) fires minutes after the pane was captured, so it re-reads the
     registry first and abandons unless the topic is STILL bound to this pane and STILL
@@ -4775,15 +5381,10 @@ def deliver_briefing(pane, tid, engine, briefing_tpl, attempt=1, settle=None, aw
         # idle wait: that returns without typing and schedules nothing (review finding 3),
         # which is precisely what left topic 12999 dark — its retry waited RESTORE_SETTLE,
         # gave up, and ended the chain while compaction was still running.
-        if attempt < BRIEFING_MAX_ATTEMPTS and pane_alive(pane):
-            threading.Timer(BRIEFING_RETRY_DELAY, deliver_briefing,
-                            args=(pane, tid, engine, briefing_tpl, attempt + 1),
-                            kwargs={"settle": settle, "await_busy": True}).start()
-            log(f"revive: topic {tid} still compacting — retrying the briefing in "
-                f"{BRIEFING_RETRY_DELAY}s")
-        else:
-            log(f"revive: topic {tid} still compacting after {attempt} attempts — "
-                f"leaving for idle_sweep")
+        # The retry keeps waiting for compaction specifically, so it carries settle and
+        # await_busy; the other give-up points do not (see the retry comment below).
+        _briefing_exhausted(pane, tid, engine, briefing_tpl, attempt, "still compacting",
+                            {"settle": settle, "await_busy": True})
         return
     deadline, reached = time.time() + window, False
     while time.time() < deadline:
@@ -4795,7 +5396,13 @@ def deliver_briefing(pane, tid, engine, briefing_tpl, attempt=1, settle=None, aw
             break
         time.sleep(1)
     if engine == "claude" and not reached:
-        log(f"revive: topic {tid} not idle within {window}s — leaving for idle_sweep")
+        # A pane busy for the WHOLE window is the case this used to drop: it returned here
+        # having stamped nothing, scheduled nothing and escalated nothing, so a session
+        # revived into a long turn was never told it had been revived and never re-armed
+        # its listener — silent to the owner until something else happened to nudge it
+        # (#172). Same exhaustion path as every other failed attempt.
+        _briefing_exhausted(pane, tid, engine, briefing_tpl, attempt,
+                            f"not idle within {window}s")
         return
     # Revalidate IMMEDIATELY before typing — on EVERY path, including a plain inline first
     # attempt. Review round 2 established why for the waited paths: the checks above run
@@ -4829,30 +5436,18 @@ def deliver_briefing(pane, tid, engine, briefing_tpl, attempt=1, settle=None, aw
             # pane this topic no longer has any claim to.
             return
         if status != "sent":
-            # Leave briefed_boot unset AND schedule the retry here. idle_sweep_loop cannot
-            # stand in for this: for codex it only makes a candidate when unread > 0, and it
-            # sends a generic re-arm nudge, not the briefing. A pane revived into a modal
-            # with an empty inbox would otherwise stay unbriefed until the next inbound
+            # Leave briefed_boot unset AND go through the exhaustion path. idle_sweep_loop
+            # cannot stand in for this: for codex it only makes a candidate when unread > 0,
+            # and it sends a generic re-arm nudge, not the briefing. A pane revived into a
+            # modal with an empty inbox would otherwise stay unbriefed until the next inbound
             # message happened to arrive (#133 review).
             log(f"revive: briefing {status} for topic {tid} (pane {pane}, attempt {attempt})")
-            if attempt < BRIEFING_MAX_ATTEMPTS:
-                if status == "swallowed":
-                    report_blocked_pane(tid, pane, "its session-revival briefing")
-                # Retries do NOT inherit `settle`: they fire BRIEFING_RETRY_DELAY later, by
-                # which time any compaction is long finished, and a 10-minute wait would pin
-                # a Timer thread for no reason.
-                threading.Timer(BRIEFING_RETRY_DELAY, deliver_briefing,
-                                args=(pane, tid, engine, briefing_tpl, attempt + 1)).start()
-            else:
-                # Last attempt: the chain ends here, before type_line's own cap can release,
-                # and for a codex pane with an empty inbox idle_sweep_loop is not a fallback
-                # either (it only acts on unread). Force the escalation past its cooldown so
-                # giving up is never silent — this is the one report that must get through.
-                log(f"revive: giving up on briefing topic {tid} after {attempt} attempts")
-                _blocked_reported.pop(str(tid), None)
-                report_blocked_pane(tid, pane,
-                                    "its session-revival briefing (final attempt — this "
-                                    "session will stay unbriefed until you answer the prompt)")
+            # Retries here do NOT inherit `settle`: they fire BRIEFING_RETRY_DELAY later, by
+            # which time any compaction is long finished, and a 10-minute wait would pin a
+            # Timer thread for no reason. The swallowed case is passed in as `report_now` so
+            # its owner report sits behind the same liveness gate as the final escalation.
+            _briefing_exhausted(pane, tid, engine, briefing_tpl, attempt, f"briefing {status}",
+                                report_now=(status == "swallowed"))
             return
         boot = current_boot_id()
 
@@ -4870,7 +5465,8 @@ def deliver_briefing(pane, tid, engine, briefing_tpl, attempt=1, settle=None, aw
 
 
 def revive_one(cfg, tid, entry, fresh=False, brief=True, taken=None, cause="boot",
-               fresh_requested=None, resume_choice=None, respect_close=False):
+               fresh_requested=None, resume_choice=None, respect_close=False,
+               auto_summary=False, picker_deadline=None):
     """Revive a single session for topic `tid`. Idempotent: if the deterministic revive
     tmux session already exists (crash-retry), verify its engine and rebind instead of
     duplicating. With brief=False, launch+rebind+notice run synchronously and the (slow,
@@ -4889,6 +5485,45 @@ def revive_one(cfg, tid, entry, fresh=False, brief=True, taken=None, cause="boot
     sid = entry.get("session_id")
     tmux_name = _revive_tmux_name(entry, tid, taken)
     do_fresh = fresh or not sid
+
+    # #277: a MASS restore answers the picker "from summary" on the session's behalf. On the
+    # message-revive path the owner is present and #195 asks them; on boot nobody is there,
+    # and the old default — leave it unanswered, resume in full — re-read a ~350k session
+    # twice as fresh cache writes on the most expensive model, for a session that then sat
+    # idle all day. Above Claude's own picker thresholds the summary is the right default:
+    # the prompt cache has long expired, so the full re-read buys nothing a summary does not.
+    #
+    # Decided HERE, not at the call site, because it must see `do_fresh`: a fresh spawn shows
+    # no picker, and a choice passed into one would trip the "you chose X but the picker never
+    # appeared" warning on every reopened session. An explicit `resume_choice` always wins.
+    # Only opt in while there is enough of the shared budget left to actually answer the
+    # picker. With an expired deadline `answer_resume_picker` returns without looking at the
+    # pane, which would leave a rendered picker UNANSWERED — the dark-session bug that
+    # machinery exists to prevent — while still posting "you chose `compact`, but…", a choice
+    # the owner never made. Declining restores the exact pre-#277 path instead: no claim, and
+    # the honest "I have no answer from you" report if a picker does appear.
+    #
+    # Whether this session QUALIFIES for the automatic choice. Deliberately not the choice
+    # itself: three review rounds each found another slow step between deciding and acting —
+    # the sizing read, then the pane launch — and a budget read before either is a claim we
+    # may no longer be able to deliver. So this answers only "would it qualify", and the
+    # choice is taken at the one place that uses it, immediately before the picker call.
+    #
+    # `not do_fresh` matters here: a fresh spawn renders no picker, and a choice passed into
+    # one trips the "you chose X but the picker never appeared" warning on every reopen.
+    auto_qualifies = False
+    if auto_summary and resume_choice is None and not do_fresh and engine == "claude" \
+            and _picker_budget_left(picker_deadline):
+        # The budget test here is only an optimisation — sizing reads a transcript and is not
+        # worth doing with no budget to use the answer. It is NOT the gate; the gate is below.
+        try:
+            auto_qualifies = resume_picker_expected(sid, cwd)
+        except Exception as e:
+            # A cost optimisation must never cost the revive itself. Reading the transcript
+            # can fail (deleted, unreadable, a stat race), and letting that escape would turn
+            # "resume this session in full" into "this session did not come back at all" —
+            # strictly worse than the re-read this feature exists to avoid.
+            log(f"restore: could not size topic {tid} ({e}) — resuming in full")
 
     existing = _tmux(["tmux", "has-session", "-t", "=" + tmux_name],
                               capture_output=True).returncode == 0
@@ -4930,7 +5565,8 @@ def revive_one(cfg, tid, entry, fresh=False, brief=True, taken=None, cause="boot
                 # is exactly the mismatch this stopped reading two sources to avoid.
                 model, effort = last_model_for_session(sid), None
             launch = _resume_launch(engine, sid, model, effort)
-        pane, err = launch_pane(tmux_name, cwd, launch)
+        pane, err = launch_pane(tmux_name, cwd, launch, engine,
+                                f"revive: {entry.get('name') or tid}")
         if not pane:
             log(f"revive: launch failed for topic {tid}: {err}")
             return "failed", {"error": err}
@@ -4938,6 +5574,25 @@ def revive_one(cfg, tid, entry, fresh=False, brief=True, taken=None, cause="boot
 
     picker_outcome = None
     if newly_spawned and engine == "claude":
+        # The gate for the automatic choice, as late as it can be taken (#277). Reviews r2,
+        # r3 and r4 each found another step between this read and the call — the sizing read,
+        # the pane launch, then a flushing `log()` — and there is ALWAYS one more, so the
+        # placement is not what makes this safe. What makes it safe is below: a choice the
+        # DAEMON made is never reported as the owner's, and an unanswered picker is reported
+        # as an unanswered picker whatever the reason. `auto_chosen` is what carries that.
+        #
+        # `auto_qualifies` already encodes "the caller passed no choice" — it is only ever set
+        # in the block above, which requires it. Re-testing it here would be a second site for
+        # one invariant, and an unkillable one: no input can make the two disagree.
+        auto_chosen = False
+        if auto_qualifies:
+            if _picker_budget_left(picker_deadline):
+                resume_choice, auto_chosen = "compact", True
+                log(f"restore: topic {tid} is above the resume-picker thresholds — "
+                    f"defaulting to resume-from-summary")
+            else:
+                log(f"restore: topic {tid} qualifies for resume-from-summary but the "
+                    f"restore's picker budget is spent — resuming in full")
         # Answer Claude's own resume picker before anything else touches the pane. Until it
         # is answered the pane IS a modal: a briefing typed into it is swallowed and the
         # session comes back dark. Nothing else can answer it — no operator is at this
@@ -4947,13 +5602,14 @@ def revive_one(cfg, tid, entry, fresh=False, brief=True, taken=None, cause="boot
         # wrong, and an unanswered picker is the dark-session bug regardless of why we did
         # not expect one. With no choice we only DETECT it; we never guess on their behalf.
         try:
-            picker_outcome = (answer_resume_picker(pane, resume_choice)
+            picker_outcome = (answer_resume_picker(pane, resume_choice,
+                                                   deadline=picker_deadline)
                               if resume_choice else
                               ("present" if _resume_picker_present(_safe_peek(pane)) else "absent"))
         except Exception as e:
             picker_outcome = "failed"
             log(f"resume picker handling failed for topic {tid}: {e}")
-        if resume_choice and picker_outcome != "answered":
+        if resume_choice and picker_outcome != "answered" and not auto_chosen:
             # Fail LOUD. Silently proceeding hands them the full session they did not choose —
             # exactly the spend this feature exists to prevent.
             reply(cfg, tid, (
@@ -4962,11 +5618,21 @@ def revive_one(cfg, tid, entry, fresh=False, brief=True, taken=None, cause="boot
                 f"The session is resuming with its FULL context. Nothing was lost — but the "
                 f"choice was not applied."))
             log(f"resume picker '{resume_choice}' not applied for topic {tid}: {picker_outcome}")
+        elif resume_choice and picker_outcome != "answered":
+            # The DAEMON chose this, not the owner (#277, review r4). "You chose" would be a
+            # lie, and the class of bug that produced it — some step between the budget check
+            # and the picker eating the window — has no last instance to fix, since there is
+            # always one more step. So the reporting stops depending on the timing: say what
+            # is actually true of the pane now. A picker still up is the dark-session case and
+            # must be said; nothing up means it simply resumed in full, which is the ordinary
+            # pre-#277 outcome and needs no message.
+            log(f"restore: automatic resume-from-summary not applied for topic {tid}: "
+                f"{picker_outcome} — resuming in full")
+            if _resume_picker_present(_safe_peek(pane)):
+                reply(cfg, tid, UNANSWERED_PICKER_NOTICE)
+                log(f"unanswered resume picker on topic {tid} — reported, not guessed")
         elif picker_outcome == "present":
-            reply(cfg, tid, (
-                "⚠️ Claude is showing its resume picker and I have no answer from you, so I "
-                "have not pressed anything. The session cannot receive work until it is "
-                "answered — reply `compact` or `full` and I will answer it."))
+            reply(cfg, tid, UNANSWERED_PICKER_NOTICE)
             log(f"unanswered resume picker on topic {tid} — reported, not guessed")
 
     # Findings 9 and (round 2) 6: a revive is not instantaneous — answering the picker alone
@@ -5041,7 +5707,8 @@ def revive_one(cfg, tid, entry, fresh=False, brief=True, taken=None, cause="boot
     already_briefed = entry.get("briefed_boot") == boot
     needs_brief = newly_spawned or engine == "claude" or (engine == "codex" and not already_briefed)
     task = {"pane": pane, "tid": tid, "engine": engine, "tpl": tpl,
-            "needs_brief": needs_brief, "reopened": reopened}
+            "needs_brief": needs_brief, "reopened": reopened,
+            "resume_choice": applied_choice}
 
     if closed_again:
         log(f"revive: topic {tid} was closed again during the revive — session is up, "
@@ -5084,14 +5751,28 @@ def _restore_targets_now(cfg, boot, targets, cause="boot"):
     counts = {"resumed": [], "fresh": [], "reopen_failed": [], "failed": []}
     brief_tasks = []
     taken = set()
+    summarised = []
+    # #277: answering a picker waits for it to render, so N large sessions could hold the
+    # daemon's start for N * RESUME_MODAL_WAIT before it polls at all. ONE budget for the
+    # whole restore bounds that: each session still gets its full per-session wait until the
+    # budget is spent, and after that the remaining ones fall back to a full resume rather
+    # than delaying the fleet further. Queued Telegram messages are not lost meanwhile (the
+    # poll is offset-based), so the trade is responsiveness against a re-read we know is
+    # expensive — but it is bounded either way.
+    budget = time.time() + RESTORE_PICKER_BUDGET
     for tid, info in targets:
         name = info.get("name", "?")
         try:
             status, task = revive_one(cfg, tid, info, brief=False, taken=taken,
-                                      cause=cause)  # defer slow briefing
+                                      cause=cause,  # defer slow briefing
+                                      auto_summary=True,
+                                      picker_deadline=min(time.time() + RESUME_MODAL_WAIT,
+                                                          budget))
         except Exception as e:
             status, task = "failed", None
             log(f"restore: revive failed for topic {tid}: {e}")
+        if task and task.get("resume_choice") == "compact":
+            summarised.append(name)
         counts.setdefault(status, []).append(name)
         # reopen_failed still spawned a live pane, so it still needs briefing; only "failed" doesn't.
         if status != "failed" and task and task.get("needs_brief"):
@@ -5112,11 +5793,17 @@ def _restore_targets_now(cfg, boot, targets, cause="boot"):
                f"{len(counts['fresh'])} fresh, {len(counts['reopen_failed'])} topic-reopen-failed, "
                f"{len(counts['failed'])} failed.")
     detail = []
+    if summarised:
+        summary += f" {len(summarised)} resumed from summary."
     for k, label in (("resumed", "resumed"), ("fresh", "fresh"),
                      ("reopen_failed", "REOPEN-FAILED (pane up, topic still closed)"),
                      ("failed", "FAILED")):
         if counts[k]:
             detail.append(f"{label}: " + ", ".join(counts[k]))
+    if summarised:
+        # Named, because this is the line that says a large context was deliberately NOT
+        # re-read — the saving is invisible otherwise, and so is a wrong call.
+        detail.append("from summary: " + ", ".join(summarised))
     try:
         api(cfg["bot_token"], "sendMessage", {"chat_id": cfg["chat_id"],
             "text": "⚙️ " + summary + ("\n" + "\n".join(detail) if detail else "")})
@@ -5265,23 +5952,55 @@ def _try_send_model(cfg, thread_id, alias, pane, engine, attempt):
             # that window and risks its Enter. Order is always _model_lock → _pane_lock;
             # nothing takes them the other way round.
             try:
-                with _pane_lock(pane):
-                    _tmux(["tmux", "send-keys", "-t", pane, "-l", f"/model {alias}"],
-                                   check=True, capture_output=True)
-                    time.sleep(0.5)  # let the slash-command menu settle on the exact match
-                    _tmux(["tmux", "send-keys", "-t", pane, "Enter"], check=True, capture_output=True)
-                    # Newer Claude Code shows a "Switch model?" confirmation dialog after
-                    # /model; confirm it (default ❯ = option 1, Yes). Only send the extra Enter
-                    # when the dialog is actually present, so on versions without it we don't
-                    # emit a stray empty line. Without this, /model hangs the session on the
-                    # modal (dark-session).
-                    time.sleep(1.0)
-                    cap = _tmux(["tmux", "capture-pane", "-p", "-t", pane, "-S", "-12"],
-                                         capture_output=True, text=True)
-                    if cap.returncode == 0 and ("Switch model" in cap.stdout or "Yes, switch" in cap.stdout):
-                        _tmux(["tmux", "send-keys", "-t", pane, "Enter"], check=True, capture_output=True)
-                msg = f"→ switched model to {alias}."
-                log(f"/model {alias} -> pane {pane} (topic {thread_id})")
+                # The first Enter used to be blind, and the reply below fired regardless.
+                # pane_is_idle() reads "no spinner, no compaction bar" as idle, which any
+                # approval, update or resume modal satisfies — so the alias was swallowed,
+                # that Enter accepted the modal's DEFAULT, and the owner was told the model
+                # had switched. The modal it may answer can be the rate-limit picker, whose
+                # default is a cheaper model: #133's failure reached by another route (#154).
+                # type_line takes the pane lock itself and presses Enter only once the text
+                # is confirmed in an input box; SETTLE keeps the 0.5 s the slash-command menu
+                # needs to narrow to the exact match.
+                status = type_line(pane, f"/model {alias}", settle=0.5)
+                log(f"/model {alias} -> pane {pane} (topic {thread_id}): {status}")
+                if status != "sent":
+                    msg = (f"Didn't switch the model — the terminal didn't take "
+                           f"`/model {alias}` ({status}). Nothing was submitted, so whatever "
+                           f"the session is on has not changed.")
+                else:
+                    with _pane_lock(pane):
+                        # Newer Claude Code shows a "Switch model?" confirmation dialog after
+                        # /model; confirm it (default ❯ = option 1, Yes). Only send the extra
+                        # Enter when the dialog is actually present, so on versions without it
+                        # we don't emit a stray empty line. Without this, /model hangs the
+                        # session on the modal (dark-session). This one stays a raw Enter: it
+                        # answers a dialog identified on the pane, which is a different thing
+                        # from submitting text blind.
+                        #
+                        # The capture is the VISIBLE pane only. It used to be `-S -12`, which
+                        # starts twelve lines up in the SCROLLBACK, so an earlier answered
+                        # dialog still in history matched and this Enter fired with no dialog
+                        # up — into whatever had the input box (found in review). Both the
+                        # title and an option line are required for the same reason: one
+                        # phrase is likelier to occur in ordinary output than the pair.
+                        #
+                        # This narrows the class; it does not close it. A dialog answered a
+                        # moment ago can still be on screen, and no capture can prove the
+                        # dialog is ACTIVE rather than drawn — that is #269's class. What
+                        # limits the exposure is not timing (the wait below is a floor, not a
+                        # bound: scheduling and tmux can stretch it) but reachability — this
+                        # runs on exactly one path, straight after a /model this code has
+                        # already verified as submitted.
+                        time.sleep(1.0)
+                        cap = _tmux(["tmux", "capture-pane", "-p", "-t", pane],
+                                             capture_output=True, text=True)
+                        if cap.returncode == 0 and "Switch model" in cap.stdout \
+                                and "Yes, switch" in cap.stdout:
+                            _tmux(["tmux", "send-keys", "-t", pane, "Enter"], check=True, capture_output=True)
+                    # Says what was delivered, not what the session then did with it: the
+                    # command reached the composer and was submitted. Whether Claude Code
+                    # honoured it is not observed here (#233).
+                    msg = f"→ sent /model {alias} to the session."
             except Exception as e:
                 msg = f"Model switch failed: {e}"
             _pending_model.pop(tid, None)
@@ -5832,6 +6551,181 @@ def _cf_wait_busy(tid, token, pane, timeout):
     return "timeout"
 
 
+def _cf_transcript_cursor(tid):
+    """`(path, cursor)` for a topic's claude transcript, or `(None, None)`.
+
+    The cursor is taken BEFORE `/compact` is injected, and that is the whole point: it turns
+    "is this refusal NEW?" from an argument into a definition. The pane version of that
+    question needed a pre-injection capture, occurrence multisets, and a paragraph about
+    append-and-scroll with a stated residue for repaints (#155, three review rounds). Records
+    appended after a cursor need none of it — a pane that DISPLAYS a past refusal cannot write
+    one.
+
+    **Novelty is not authorship**, and the difference is real rather than pedantic: these
+    records carry no id tying them to this injection, so a `/compact` the OWNER types after
+    the cursor produces a `submitted` record indistinguishable from ours. What each record
+    supports is narrower than "a compaction is running": `submitted` says the command reached the session
+    and nothing more, `completed` says one finished. Neither says which injection it answers,
+    and no comment below should say so.
+    Correlatable provenance would need an identity the transcript shapes do not carry.
+
+    `(path, None)` when the file cannot be read: the caller must treat that as "cannot tell",
+    not as "nothing happened"."""
+    entry = read_registry().get(str(tid)) or {}
+    sid = entry.get("session_id")
+    if not sid or (entry.get("engine") or "claude") != "claude":
+        return None, None       # codex keeps rollouts, not this shape; the pane path serves it
+    path = transcript.transcript_path(entry.get("cwd") or "~", sid)
+    return path, transcript.cursor(path)
+
+
+def _cf_compact_events(path, cur):
+    """`compact_events` over what the session wrote after `cur`, or None if it cannot answer.
+
+    None means UNKNOWN — no cursor, a replaced or truncated file, an unparseable line — and
+    the caller falls back to the pane rather than reading an untrusted absence as "nothing
+    happened yet".
+
+    Stated exactly, because an earlier version of this docstring said "anything not OK falls
+    back" and that is false: **PENDING does not fall back.** A mid-write tail is the ordinary
+    state of a file a session is appending to, so falling back on it would hand most polls to
+    the pane and undo the change.
+
+    PENDING is deliberately NOT None. A half-written tail makes ABSENCE unprovable, but the
+    records that did parse are real, and every use below acts on a record's presence: a
+    refusal or a completion found under PENDING happened. Absence under either status simply
+    keeps the poll loop waiting, which is the correct behaviour in both."""
+    if not path or not cur:
+        return None
+    since = transcript.records_since(path, cur)
+    if since.status == transcript.UNKNOWN:
+        return None
+    return transcript.compact_events(since.records)
+
+
+def _cf_await_started(tid, token, pane, timeout, tpath, tcur, pane_before):
+    """Wait for the injected `/compact` to be answered. `(state, reason)`, where state is
+    "compacting", "refused", "aborted" or "timeout".
+
+    The transcript answers when it can; the pane answers when it cannot. Both fallbacks
+    DELEGATE to the existing `_cf_wait_compacting` and `_cf_hook_block_reason` rather than
+    re-implementing them — that keeps one implementation of the pane behaviour, and it keeps
+    the seam every existing carry-forward test already stubs.
+
+    What each transcript signal establishes, and nothing more:
+
+    * `refusal` — a `system`/`local_command` record carrying the hook's stderr, appended after
+      our cursor. Structural, and NEW by construction. This is what replaces the snapshot
+      multiset: a pane that DISPLAYS an old refusal cannot write a record. It does not
+      establish which injection was refused; see `_cf_transcript_cursor`.
+    * `submitted` — a user record holding the `/compact` command, so the command reached the
+      session. It does NOT say compaction is running, which is why the caller still waits for
+      completion afterwards.
+    * `completed` — compaction finished. On a small context it can land inside this window, so
+      it counts as started too.
+
+    And one signal the transcript cannot give in time (#289). Claude Code writes the `/compact`
+    user record and its stdout record only when the compaction FINISHES — observed file order
+    on a 300k context: summary, then the command record, then stdout, all landed ~2 minutes
+    after the command was typed. So on exactly the sessions a carry-forward is for, the
+    transcript is silent for the whole start window and a clean absence reads as "not
+    submitted". The pane is not silent: it draws the live "Compacting conversation… (Ns)"
+    status. That capture establishes that A compaction is running right now — the same claim
+    `_cf_wait_compacting` has always made from it, and no more: it does not say which
+    injection the compaction answers (see `_cf_transcript_cursor` on novelty vs authorship).
+    A running compaction is what this gate is for, so it counts as started. The transcript is
+    still asked first, so a pane that is quiet or unreadable changes nothing."""
+    if not tpath or not tcur:
+        return _cf_started_from_pane(tid, token, pane, timeout, pane_before)
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        if not _cf_owns(tid, token) or not pane_alive(pane):
+            return "aborted", None
+        events = _cf_compact_events(tpath, tcur)
+        if events is None:
+            # The cursor stopped being trustworthy mid-wait (the file was replaced, rotated,
+            # or a line will not parse). Hand the REMAINING time to the pane rather than
+            # reading an untrusted absence as "nothing happened" (#157 C4).
+            return _cf_started_from_pane(tid, token, pane, max(0.0, deadline - time.time()),
+                                         pane_before)
+        if events["refusal"]:
+            return "refused", events["refusal"]
+        if events["submitted"] or events["completed"]:
+            return "compacting", None
+        if _cf_compacting(pane):
+            # The transcript has nothing yet and the pane shows a live compaction (#289).
+            # A bad capture reads False here, so this only ever adds an answer.
+            return "compacting", None
+        time.sleep(0.5)
+    return "timeout", None
+
+
+def _cf_started_from_pane(tid, token, pane, timeout, pane_before):
+    """The pre-#157 answer, unchanged and in one place: watch for a compaction-specific pane
+    signal, and on anything else look for a refusal that the pre-injection snapshot proves is
+    new."""
+    state = _cf_wait_compacting(tid, token, pane, timeout)
+    if state in ("compacting", "aborted"):
+        return state, None
+    blocked = _cf_hook_block_reason(pane, pane_before)
+    if blocked:
+        return "refused", blocked
+    return state, None
+
+
+def _cf_await_compacted(tid, token, pane, timeout, tpath, tcur):
+    """Wait for compaction to finish AND the pane to be ready for the resume nudge.
+    `(state, reason)` where state is "compacted", "refused", "aborted" or "timeout".
+
+    Two facts from two sources, because they are two facts:
+
+    * compaction FINISHED — the client's own `isCompactSummary` record where the transcript
+      can answer, the pane going quiet where it cannot.
+    * the pane is READY to be typed into — always `_cf_wait_idle`. Transcript-confirmed
+      completion says the compaction is done, NOT that the TUI has finished rendering, and
+      PHASE 3 types into that pane a moment later. The first version of this dropped the idle
+      gate on the transcript path and the review caught it: a resume nudge could land on a
+      still-rendering pane, which is a regression the old single `_cf_wait_idle` did not have.
+
+    A refusal can also arrive HERE. The hook's stderr record can land after the `/compact`
+    user record, so the start gate legitimately sees `submitted`, returns, and the refusal
+    only shows up in this window — reported by the reviewer with a reproduction. Returning
+    "timeout" for that would replace the hook's own words with a generic "didn't settle",
+    which is exactly what #155 exists to stop."""
+    if not tpath or not tcur:
+        return _cf_compacted_from_pane(tid, token, pane, timeout), None
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        if not _cf_owns(tid, token) or not pane_alive(pane):
+            return "aborted", None
+        events = _cf_compact_events(tpath, tcur)
+        if events is None:
+            return _cf_compacted_from_pane(tid, token, pane,
+                                           max(0.0, deadline - time.time())), None
+        if events["refusal"]:
+            return "refused", events["refusal"]
+        if events["completed"]:
+            # Compacted. Now the pane's own answer, for the thing the pane is authoritative
+            # about: whether it is done drawing and can take keystrokes.
+            ready = _cf_compacted_from_pane(tid, token, pane,
+                                            max(0.0, deadline - time.time()))
+            if ready == "compacted":
+                return "compacted", None
+            # Compaction demonstrably finished — the client wrote the record — and the PANE
+            # never became ready. Reporting that as "compaction didn't settle" would be a
+            # false statement to the owner about a thing that provably happened, so the two
+            # outcomes are kept apart all the way to the reply.
+            return ("not-ready", None) if ready == "timeout" else (ready, None)
+        time.sleep(1)
+    return "timeout", None
+
+
+def _cf_compacted_from_pane(tid, token, pane, timeout):
+    """`_cf_wait_idle`'s answer, mapped onto this function's vocabulary."""
+    res = _cf_wait_idle(tid, token, pane, timeout)
+    return "compacted" if res == "idle" else res
+
+
 def _cf_wait_compacting(tid, token, pane, timeout):
     """Compaction-specific saw-started gate (#101): block until the pane shows a REAL
     compaction (_cf_compacting), the flow aborts, or timeout. Replaces the generic
@@ -6055,7 +6949,7 @@ def _carry_forward_worker(cfg, thread_id, pane, cf_file, marker, token, name):
         # specific signal via _cf_wait_compacting (not any busy turn), (3) retry the whole
         # inject a few times. Only a confirmed compaction proceeds to auto-resume.
         _cf_set_phase(tid, token, "compact")
-        started = "timeout"
+        started, refusal = "timeout", None
         for _attempt in range(CF_COMPACT_TRIES):
             if not pane_alive(pane):
                 return
@@ -6065,13 +6959,19 @@ def _carry_forward_worker(cfg, thread_id, pane, cf_file, marker, token, name):
                 return
             if idle != "idle":
                 continue  # still busy after the wait — retry (or fall through to the abort)
-            # Snapshot BEFORE the inject so a refusal found afterwards can be proved fresh (#155).
+            # The transcript cursor is taken BEFORE the inject, so a refusal found afterwards
+            # is NEW rather than displayed — the property that replaces #155's snapshot
+            # reasoning. It does not prove the refusal answered THIS injection; nothing in
+            # these record shapes carries that. The pane snapshot is still taken, for the
+            # fallback that serves a pane with no resolvable transcript.
+            tpath, tcur = _cf_transcript_cursor(tid)
             pane_before = _cf_capture_tail(pane)
             if not _cf_inject_owned(tid, token, pane, "/compact", settle=0.7):
                 return
             time.sleep(CF_MODAL_WAIT)
             _cf_clear_modal(tid, token, pane)
-            started = _cf_wait_compacting(tid, token, pane, CF_COMPACT_START_WAIT)
+            started, refusal = _cf_await_started(tid, token, pane, CF_COMPACT_START_WAIT,
+                                                 tpath, tcur, pane_before)
             if started == "aborted":
                 return
             if started == "compacting":
@@ -6081,13 +6981,12 @@ def _carry_forward_worker(cfg, thread_id, pane, cf_file, marker, token, name):
             # WHY. Report the hook's own words and stop. Note the session cannot fix this
             # itself — CF_WRITE_PROMPT step 4 told it to end its turn, so the hook's
             # "post a comment and re-run compact" instructions reach nobody.
-            blocked = _cf_hook_block_reason(pane, pane_before)
-            if blocked:
+            if started == "refused":
                 log(f"carry-forward: /compact refused by a PreCompact hook "
-                    f"(topic {thread_id}, pane {pane}): {blocked}")
+                    f"(topic {thread_id}, pane {pane}): {refusal}")
                 if _cf_release(tid, token):
                     reply(cfg, thread_id, "⚠️ /compact was refused by a PreCompact hook — NOT "
-                                          f"auto-resuming. The hook said: {blocked}")
+                                          f"auto-resuming. The hook said: {refusal}")
                 return
             _cf_clear_modal(tid, token, pane)  # a beat-late modal may still block the start; clear before retry
         if started != "compacting":
@@ -6095,8 +6994,31 @@ def _carry_forward_worker(cfg, thread_id, pane, cf_file, marker, token, name):
                 reply(cfg, thread_id, f"⚠️ /compact didn't start compacting (retried {CF_COMPACT_TRIES}×) "
                                       "— NOT auto-resuming. Check the session terminal.")
             return
-        res = _cf_wait_idle(tid, token, pane, CF_COMPACT_TIMEOUT)
+        # Compaction FINISHED, from the client's own isCompactSummary record where the
+        # transcript can answer, and from the pane going quiet where it cannot. The pane
+        # answer is an inference — "it stopped looking busy" — and is the fallback only.
+        res, late_refusal = _cf_await_compacted(tid, token, pane, CF_COMPACT_TIMEOUT,
+                                                tpath, tcur)
         if res == "aborted":
+            return
+        if res == "refused":
+            # The hook refused after the /compact record was already written, so the start
+            # gate saw a submission and returned. Same deterministic refusal, same report —
+            # a generic "didn't settle" here would hide the hook's own words (#155).
+            log(f"carry-forward: /compact refused by a PreCompact hook "
+                f"(topic {thread_id}, pane {pane}): {late_refusal}")
+            if _cf_release(tid, token):
+                reply(cfg, thread_id, "⚠️ /compact was refused by a PreCompact hook — NOT "
+                                      f"auto-resuming. The hook said: {late_refusal}")
+            return
+        if res == "not-ready":
+            # Says what happened. The compaction is done and the context IS smaller; what
+            # failed is the pane settling enough to be typed into, so the owner is told that
+            # rather than being sent to look for a compaction that already succeeded.
+            if _cf_release(tid, token):
+                reply(cfg, thread_id, "⚠️ Compaction finished, but the terminal never settled "
+                                      "enough to resume it — NOT auto-resuming. The context "
+                                      "was compacted; nudge the session yourself.")
             return
         if res == "timeout":
             if _cf_release(tid, token):

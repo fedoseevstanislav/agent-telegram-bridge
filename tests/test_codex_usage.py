@@ -117,17 +117,47 @@ def test_usage_claude_arg_forces_account(monkeypatch):
     assert calls["claude"] == 1 and calls["codex"] == []
 
 
-def test_usage_bare_in_codex_topic_scopes_to_cwd(monkeypatch):
+def test_usage_codex_arg_in_codex_topic_scopes_to_cwd(monkeypatch):
     calls, replies = _usage_env(monkeypatch, engine="codex")
-    daemon.handle_command({}, 5, "/usage")
+    daemon.handle_command({}, 5, "/usage codex")
     assert replies == ["CODEX"]
-    assert calls["codex"] == ["/cwd"]      # bare + codex topic -> that session's rollout
+    assert calls["codex"] == ["/cwd"]      # /usage codex + codex topic -> that session's rollout
+    assert calls["claude"] == 0
 
 
-def test_usage_bare_in_claude_topic_uses_account(monkeypatch):
+def test_usage_bare_shows_both_meters_in_one_message(monkeypatch):
+    # #795 C1: one message, both accounts, from a CLAUDE topic and from a CODEX topic alike.
+    for engine in ("claude", "codex"):
+        calls, replies = _usage_env(monkeypatch, engine=engine)
+        daemon.handle_command({}, 5, "/usage")
+        assert replies == ["CLAUDE\nCODEX"]        # exactly ONE reply carrying both lines
+        assert calls["claude"] == 1
+        assert calls["codex"] == [None]            # bare is account-wide for both engines
+
+
+def test_usage_bare_with_no_pane_still_shows_both(monkeypatch):
     calls, replies = _usage_env(monkeypatch, engine="claude")
+    monkeypatch.setattr(daemon, "read_registry", lambda: {})   # topic with no bound pane
     daemon.handle_command({}, 5, "/usage")
-    assert replies == ["CLAUDE"]
+    assert replies == ["CLAUDE\nCODEX"]
+
+
+def test_usage_bare_names_the_missing_source_and_keeps_the_other(monkeypatch):
+    # #795 C1: when one source has no data its line says so IN PLACE; the other still shows.
+    calls, replies = _usage_env(monkeypatch, engine="codex")
+    monkeypatch.setattr(daemon, "codex_usage_line", lambda cwd=None: None)
+    daemon.handle_command({}, 5, "/usage")
+    assert len(replies) == 1
+    claude_line, codex_line = replies[0].split("\n")
+    assert claude_line == "CLAUDE"
+    assert codex_line.startswith("🤖 Codex: no data yet")
+
+    calls, replies = _usage_env(monkeypatch, engine="claude")
+    monkeypatch.setattr(daemon, "account_usage_line", lambda: None)
+    daemon.handle_command({}, 5, "/usage")
+    claude_line, codex_line = replies[0].split("\n")
+    assert claude_line.startswith("👤 Claude: no data yet")
+    assert codex_line == "CODEX"
 
 
 def test_usage_invalid_arg_shows_hint_and_calls_nothing(monkeypatch):
@@ -228,8 +258,8 @@ def test_usage_handler_none_falls_back_to_hint(monkeypatch):
     monkeypatch.setattr(daemon, "codex_usage_line", lambda cwd=None: None)
     replies = []
     monkeypatch.setattr(daemon, "reply", lambda cfg, tid, text: replies.append(text))
-    daemon.handle_command({}, 5, "/usage")
-    assert len(replies) == 1 and replies[0].startswith("No Codex usage data yet")
+    daemon.handle_command({}, 5, "/usage codex")
+    assert len(replies) == 1 and replies[0].startswith("🤖 Codex: no data yet")
 
 
 

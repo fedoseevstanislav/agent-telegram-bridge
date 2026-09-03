@@ -566,10 +566,13 @@ def test_existing_nudge_primitive_returns_success_and_injects_only_recv_cue(monk
     # The recv cue, the verification receipt, the backspaces that remove it, the Enter —
     # and nothing else. What the SESSION sees is still only the cue (#267).
     assert len(keys) == 4
+    # The cue now opens with who it is for (#145): a subagent shares this pane, and it must
+    # read the address before it reads the instruction.
     assert keys[0] == [
         "tmux", "send-keys", "-t", "%42", "-l",
-        "[tg-bridge] New Telegram message in your topic — "
-        "run `tg-bridge recv --topic 8265` and act on it.",
+        "[tg-bridge] For the session registered on topic 8265; other agents in this terminal "
+        "ignore this. New Telegram message in your topic "
+        "— run `tg-bridge recv --topic 8265` and act on it.",
     ]
     assert keys[1][:5] == ["tmux", "send-keys", "-t", "%42", "-l"] and keys[1][-1].isalnum()
     assert set(keys[2][4:]) == {"BSpace"} and len(keys[2][4:]) == len(keys[1][-1])

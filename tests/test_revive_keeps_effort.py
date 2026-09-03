@@ -125,8 +125,9 @@ def capture_launch(monkeypatch):
     """Drive the real revive_one and capture the command it hands to launch_pane."""
     seen = {}
 
-    def _launch_pane(tmux_name, cwd, launch, prompt=None):
+    def _launch_pane(tmux_name, cwd, launch, engine, reason, prompt=None):
         seen["launch"] = launch
+        seen["reason"] = reason
         return None, "stubbed"          # short-circuit: everything after is out of scope
 
     monkeypatch.setattr(daemon, "launch_pane", _launch_pane)

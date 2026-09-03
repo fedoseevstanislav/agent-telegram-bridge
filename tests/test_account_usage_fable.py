@@ -34,10 +34,10 @@ def test_fable_weekly_shown_when_present(tmp_path, monkeypatch):
     monkeypatch.setattr(daemon, "USAGE_CACHE", str(cache))
     line = daemon.account_usage_line()
     assert line is not None
-    assert "Fable week 42% used" in line
+    assert "Fable week 58% left" in line
     # aggregate segments are still present and unchanged
-    assert "5h 15% used" in line
-    assert "week 3% used" in line
+    assert "5h 85% left" in line
+    assert "week 97% left" in line
 
 
 def test_no_fable_segment_when_absent(tmp_path, monkeypatch):
@@ -47,7 +47,7 @@ def test_no_fable_segment_when_absent(tmp_path, monkeypatch):
     line = daemon.account_usage_line()
     assert line is not None
     assert "Fable" not in line
-    assert "week 3% used" in line
+    assert "week 97% left" in line
 
 
 def test_scoped_weekly_pct_helper_case_insensitive_and_absent():
@@ -88,7 +88,7 @@ def test_present_fable_entry_with_null_percent_is_omitted(tmp_path, monkeypatch)
 
 
 def test_scoped_weekly_pct_real_zero_is_shown():
-    # percent == 0 is a real value (0% used), distinct from None — must be returned, not dropped
+    # percent == 0 is a real value (0% used -> 100% left), distinct from None — must be returned, not dropped
     u = {"limits": [
         {"group": "weekly", "percent": 0, "scope": {"model": {"display_name": "Fable"}}},
     ]}
