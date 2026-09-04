@@ -369,14 +369,32 @@ def test_the_erase_is_exactly_the_receipt_length(monkeypatch):
     assert pane.erases == len(NONCE)
 
 
+def _is_wellformed_nonce(nonce):
+    """The shape production promises: alphanumeric, no uppercase, fixed length.
+
+    `nonce == nonce.lower()` rather than `nonce.islower()`: `str.islower()` is False when the
+    string has no cased character at all, so it rejects an all-digit nonce — which the
+    generator draws with probability (10/36)**8, i.e. once per ~141 runs of the 200 draws
+    below (#286)."""
+    return (nonce.isalnum() and nonce == nonce.lower()
+            and len(nonce) == daemon.RECEIPT_NONCE_CHARS)
+
+
+def test_an_all_digit_nonce_is_wellformed():
+    """The draw that made test_every_injection_gets_a_fresh_receipt fail once in CI (#286).
+    It is a legitimate nonce; a shape check that rejects it is checking the wrong thing."""
+    assert _is_wellformed_nonce("0" * daemon.RECEIPT_NONCE_CHARS)
+    assert _is_wellformed_nonce("abcdefgh"[:daemon.RECEIPT_NONCE_CHARS])
+    assert not _is_wellformed_nonce("ABCDEFGH"[:daemon.RECEIPT_NONCE_CHARS])
+
+
 def test_every_injection_gets_a_fresh_receipt(monkeypatch):
     """Unpinned, so this is the real generator. A repeated nonce would be residue like any
     other — the previous injection's copy would authorise the next one."""
     monkeypatch.undo()
     seen = {daemon._receipt_nonce() for _ in range(200)}
     assert len(seen) > 190
-    assert all(n.isalnum() and n.islower() and len(n) == daemon.RECEIPT_NONCE_CHARS
-               for n in seen)
+    assert all(_is_wellformed_nonce(n) for n in seen)
 
 
 def test_a_receipt_already_on_the_pane_is_refused(monkeypatch):

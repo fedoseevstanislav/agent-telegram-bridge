@@ -86,17 +86,18 @@ def test_every_rule_names_an_emoji_the_bot_may_actually_set():
     ("security", "👮‍♂️"),
     ("release-sanitiser", "👮‍♂️"),      # 'sanitiser' is the security rule, which precedes release
     ("POS Memory", "🧠"),
-    ("POS Extraction", "🧠"),
-    ("POS Intake", "🧠"),
+    # the stages of one pipeline have their own rules, so sibling topics differ (#296)
+    ("POS Extraction", "🔭"),
+    ("POS Intake", "📁"),
     ("POS Learning", "📚"),
-    ("Model Research", "📚"),           # research precedes the generic model/ai rule
-    ("Meeting Dedup", "📆"),
+    ("Model Research", "🔬"),           # research precedes learning and the model/ai rule
+    ("Meeting Dedup", "🧼"),           # dedup precedes meeting
     ("realtime-meeting-agent", "📆"),   # meeting precedes agent
     ("Northwind AI transformation", "🤖"),
     ("company-shape", "🏛"),            # a hyphen is a word boundary
     ("acme-fintech", "💰"),
     ("Gym training", "🩺"),
-    ("Murmur debug", "💻"),
+    ("Mesh debug", "🗣"),              # mesh precedes the bridge/debug rule
     # no rule matches -> no icon, deliberately
     ("POS Choice", None),
     ("Willow Harbour", None),
@@ -152,8 +153,9 @@ def test_register_sets_the_themed_icon_on_the_create_call(monkeypatch, tmp_path,
     assert fake.count("editForumTopic") == 0
     entry = written["4242"]
     assert entry["topic_icon"] == "💻"
-    # A4: the message-signature emoji is untouched and still comes from the ICONS palette
-    assert entry["icon"] in cli.ICONS
+    # the signature is a separate value; since #296 it is the same subject emoji, sent as
+    # plain text rather than as the topic's custom_emoji_id
+    assert entry["icon"] == "💻"
 
 
 def test_a_name_matching_no_rule_creates_the_topic_with_no_icon(monkeypatch, tmp_path):
@@ -179,7 +181,8 @@ def test_a_failing_sticker_call_does_not_break_registration(monkeypatch, tmp_pat
 
     assert fake.count("createForumTopic") == 1
     assert "icon_custom_emoji_id" not in fake.of("createForumTopic")[0]
-    assert written["4242"]["icon"] in cli.ICONS
+    # the signature needs no id lookup, so it survives a dead sticker call
+    assert written["4242"]["icon"] == "💻"
 
 
 @pytest.mark.parametrize("stickers", [
@@ -319,3 +322,146 @@ def test_retheme_is_wired_into_the_parser():
     args = cli.build_parser().parse_args(["retheme"])
     assert args.command == "retheme" and args.apply is False
     assert cli.build_parser().parse_args(["retheme", "--apply"]).apply is True
+
+
+# --------------------------------------------------------------------------- #296 (signature)
+#
+# The SIGNATURE icon now reads the same rule table: subject first, generic palette when no
+# rule matches. `reicon` catches up existing topics; hand-set icons are never touched.
+
+
+def test_a_matching_name_gets_its_subject_emoji_as_the_signature():
+    assert cli.pick_icon({}, 4242, "Telegram bridge build") == "💻"
+    assert cli.pick_icon({}, 4242, "security") == "👮‍♂️"
+
+
+def test_a_taken_subject_emoji_falls_through_to_another_matching_rule():
+    reg = {"1": {"icon": "💻", "name": "Telegram bridge build"}}
+    # 'security review' matches security (👮‍♂️) then review (🔎); 'bridge review' matches
+    # bridge (💻, taken) then review (🔎)
+    assert cli.pick_icon(reg, 4242, "bridge review") == "🔎"
+
+
+def test_an_ended_topic_does_not_hold_its_subject_emoji():
+    reg = {"1": {"icon": "💻", "name": "Telegram bridge build", "ended": True}}
+    assert cli.pick_icon(reg, 4242, "Telegram bridge build") == "💻"
+
+
+def test_a_name_matching_no_rule_still_gets_the_generic_palette():
+    assert cli.pick_icon({}, 4242, "Willow Harbour") == cli.ICONS[0]
+    assert cli.pick_icon({}, 4242, None) == cli.ICONS[0]
+
+
+def test_a_name_whose_every_matching_emoji_is_taken_gets_a_generic_icon():
+    # register never shares: an unused generic glyph still separates this session from that one
+    reg = {"1": {"icon": "💻", "name": "bridge"}}
+    assert cli.pick_icon(reg, 4242, "bridge build") == cli.ICONS[0]
+
+
+def test_the_generic_fallback_and_its_exhaustion_are_unchanged():
+    reg = {str(i): {"icon": icon, "name": "Willow Harbour"}
+           for i, icon in enumerate(cli.ICONS)}
+    assert cli.pick_icon(reg, 3, "Willow Harbour") == cli.ICONS[3 % len(cli.ICONS)]
+    assert cli.pick_icon(reg, 3, "Telegram bridge build") == "💻"   # subject icon is free
+
+
+def test_register_stamps_the_subject_signature(monkeypatch, tmp_path):
+    fake = FakeApi()
+    written = _register(monkeypatch, tmp_path, "Telegram bridge build", fake)
+
+    assert written["4242"]["icon"] == "💻"
+
+
+# --- reicon -----------------------------------------------------------------
+
+SIG_REG = {
+    "201": {"name": "Telegram bridge build", "icon": "🦊"},        # generic -> subject
+    "202": {"name": "Gym training", "icon": "💪"},                 # hand-set, must not move
+    "204": {"name": "Willow Harbour", "icon": "🐙"},               # no rule -> keep
+    "205": {"name": "bridge daemon debug", "icon": "🦉"},          # collides with 33
+    "206": {"name": "old build", "icon": "🐳", "ended": True},     # ended -> skipped
+    "207": {"name": "build feed", "icon": "📡", "feed": True},     # feed -> skipped
+    "208": {"name": "security", "icon": "⚡"},                      # generic -> subject
+}
+
+
+def test_the_reicon_plan_covers_only_generic_icons_that_would_change():
+    plan = cli.reicon_plan(SIG_REG)
+
+    assert [(tid, old, new) for tid, _n, old, new, _s in plan] == [
+        (201, "🦊", "💻"), (205, "🦉", "💻"), (208, "⚡", "👮‍♂️")]
+
+
+def test_a_hand_set_icon_is_never_listed_and_holds_its_emoji():
+    reg = {"202": {"name": "Gym training", "icon": "🩺"},           # hand-set = the rule's own
+           "203": {"name": "sleep habit", "icon": "🦊"}}            # same rule, 🩺 already held
+    plan = cli.reicon_plan(reg)
+
+    # 202 is never listed; 203 has no free subject emoji, so it shares 202's and says so
+    assert plan == [(203, "sleep habit", "🦊", "🩺", 202)]
+    assert cli.reicon_plan({"202": reg["202"]}) == []
+
+
+def test_the_shared_icon_is_reported_with_the_topic_that_holds_it():
+    plan = cli.reicon_plan(SIG_REG)
+    shared = {tid: holder for tid, _n, _o, _w, holder in plan}
+
+    assert shared == {201: None, 205: 201, 208: None}
+
+
+def test_reicon_writes_nothing_without_apply(monkeypatch, capsys):
+    monkeypatch.setattr(cli, "read_registry", lambda: {k: dict(v) for k, v in SIG_REG.items()})
+    monkeypatch.setattr(cli, "update_registry",
+                        lambda fn: pytest.fail("registry written during a dry run"))
+
+    cli.cmd_reicon(CFG, type("A", (), {"apply": False})())
+
+    out = capsys.readouterr().out
+    assert "topic 201 Telegram bridge build: 🦊 -> 💻" in out
+    assert "topic 208 security: ⚡ -> 👮‍♂️" in out
+    assert "topic 205 bridge daemon debug: 🦉 -> 💻" in out
+    assert "shared with topic 201" in out            # C3: the collision is on the line
+    assert "3 topic(s) would change" in out and "--apply" in out
+    assert "💪" not in out and "📡" not in out       # hand-set and feed icons never listed
+
+
+def test_reicon_with_apply_writes_the_registry(monkeypatch, capsys):
+    reg = {k: dict(v) for k, v in SIG_REG.items()}
+    monkeypatch.setattr(cli, "read_registry", lambda: {k: dict(v) for k, v in reg.items()})
+    monkeypatch.setattr(cli, "update_registry", lambda fn: fn(reg))
+
+    cli.cmd_reicon(CFG, type("A", (), {"apply": True})())
+
+    assert reg["201"]["icon"] == "💻" and reg["208"]["icon"] == "👮‍♂️"
+    assert reg["205"]["icon"] == "💻"                 # the collision is applied, not skipped
+    assert reg["202"]["icon"] == "💪"                 # hand-set untouched
+    assert reg["204"]["icon"] == "🐙" and reg["206"]["icon"] == "🐳" and reg["207"]["icon"] == "📡"
+    assert "applied to 3" in capsys.readouterr().out
+    assert cli.reicon_plan(reg) == []                # rerunning is a no-op
+
+
+def test_reicon_sends_nothing_to_telegram(monkeypatch):
+    fake = FakeApi()
+    reg = {k: dict(v) for k, v in SIG_REG.items()}
+    monkeypatch.setattr(cli, "api", fake)
+    monkeypatch.setattr(cli, "read_registry", lambda: reg)
+    monkeypatch.setattr(cli, "update_registry", lambda fn: fn(reg))
+
+    cli.cmd_reicon(CFG, type("A", (), {"apply": True})())
+
+    assert fake.calls == []      # the signature lives in the registry only
+
+
+def test_reicon_reports_when_there_is_nothing_to_do(monkeypatch, capsys):
+    monkeypatch.setattr(cli, "read_registry", lambda: {"204": {"name": "Willow Harbour",
+                                                             "icon": "🐙"}})
+
+    cli.cmd_reicon(CFG, type("A", (), {"apply": True})())
+
+    assert "Nothing to reicon" in capsys.readouterr().out
+
+
+def test_reicon_is_wired_into_the_parser():
+    args = cli.build_parser().parse_args(["reicon"])
+    assert args.command == "reicon" and args.apply is False
+    assert cli.build_parser().parse_args(["reicon", "--apply"]).apply is True

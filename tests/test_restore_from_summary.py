@@ -49,6 +49,9 @@ class Revive:
         monkeypatch.setattr(daemon, "last_model_and_effort_for_session",
                             lambda sid, cwd: ("claude-opus-5", None))
         monkeypatch.setattr(daemon, "_safe_peek", lambda pane, lines=40: "")
+        # The live-picker grace is covered in test_live_picker_grace. This harness covers
+        # restore-policy decisions, so its fake pane has no asynchronous UI to await.
+        monkeypatch.setattr(daemon, "_await_live_picker", lambda pane, grace, poll: False)
         monkeypatch.setattr(daemon, "reopen_topic", lambda *a, **k: True)
         monkeypatch.setattr(daemon, "current_boot_id", lambda: "boot-1")
 

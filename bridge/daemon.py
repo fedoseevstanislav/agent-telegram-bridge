@@ -4379,7 +4379,10 @@ def last_model_for_session(sid):
         entry = data.get(sid)
         if not isinstance(entry, dict):
             return None
-        return entry.get("last_model") or None
+        model = entry.get("last_model")
+        # Claude records failed turns as synthetic assistant messages. That marker is not a
+        # selectable launch model, so never return it as the watchdog fallback either.
+        return model if isinstance(model, str) and model and model != "<synthetic>" else None
     except Exception:
         return None
 
@@ -5167,7 +5170,7 @@ def last_model_and_effort_for_session(sid, cwd):
             # the answer has already been consumed that lands in the dead-session state this
             # whole feature exists to remove (Codex review, finding 7).
             model = (record.get("message") or {}).get("model")
-            if not model:
+            if not model or model == "<synthetic>":
                 continue
             effort = record.get("effort")
             return model, (effort if isinstance(effort, str) and effort else None)
@@ -5187,6 +5190,8 @@ RESUME_MODAL_ROWS = ("Resume from summary", "Resume full session as-is",
                      "Don't ask me again")
 RESUME_MODAL_CHOICE = {"compact": "1", "full": "2"}
 RESUME_MODAL_WAIT = 90        # s to wait for the picker to render after launch
+LIVE_PICKER_GRACE = 15
+LIVE_PICKER_POLL = 1
 # One budget for a whole mass restore's picker answering (#277). Without it, N large sessions
 # would each add up to RESUME_MODAL_WAIT before the daemon starts polling.
 RESTORE_PICKER_BUDGET = 300
@@ -5207,6 +5212,21 @@ def _picker_budget_left(picker_deadline):
 
     `None` means no budget applies (the single-session paths), which is always enough."""
     return picker_deadline is None or picker_deadline - time.time() >= MIN_PICKER_WINDOW
+
+
+def _await_live_picker(pane, grace, poll):
+    """Wait briefly for an otherwise-unpredicted Claude resume picker to render.
+
+    This deliberately shares the daemon's wall-clock seam with ``answer_resume_picker``:
+    revive tests replace ``time.time`` and ``time.sleep`` to advance a virtual clock, and
+    using a second clock would make a bounded live wait become a real-time test delay.
+    """
+    deadline = time.time() + grace
+    while time.time() < deadline:
+        if _resume_picker_present(_safe_peek(pane)):
+            return True
+        time.sleep(poll)
+    return False
 
 
 def _resume_launch(engine, sid, model=None, effort=None):
@@ -5598,17 +5618,28 @@ def revive_one(cfg, tid, entry, fresh=False, brief=True, taken=None, cause="boot
         # session comes back dark. Nothing else can answer it — no operator is at this
         # terminal.
         #
-        # Run this even with no choice (Codex review, finding 2): the prediction can be
-        # wrong, and an unanswered picker is the dark-session bug regardless of why we did
-        # not expect one. With no choice we only DETECT it; we never guess on their behalf.
-        try:
-            picker_outcome = (answer_resume_picker(pane, resume_choice,
-                                                   deadline=picker_deadline)
-                              if resume_choice else
-                              ("present" if _resume_picker_present(_safe_peek(pane)) else "absent"))
-        except Exception as e:
-            picker_outcome = "failed"
-            log(f"resume picker handling failed for topic {tid}: {e}")
+        # A prediction can be wrong. Before a briefing touches an unpredicted pane, check the
+        # live picker for a short bounded window and choose its compact option if it renders.
+        if not resume_choice and not auto_chosen:
+            if _await_live_picker(pane, LIVE_PICKER_GRACE, LIVE_PICKER_POLL):
+                try:
+                    resume_choice, auto_chosen = "compact", True
+                    picker_outcome = answer_resume_picker(pane, "compact")
+                    log(f"picker rendered on pane {pane}, no prediction — daemon chose compact")
+                except Exception as e:
+                    picker_outcome = "failed"
+                    log(f"resume picker handling failed for topic {tid}: {e}")
+            else:
+                picker_outcome = "absent"
+        else:
+            try:
+                picker_outcome = (answer_resume_picker(pane, resume_choice,
+                                                       deadline=picker_deadline)
+                                  if resume_choice else
+                                  ("present" if _resume_picker_present(_safe_peek(pane)) else "absent"))
+            except Exception as e:
+                picker_outcome = "failed"
+                log(f"resume picker handling failed for topic {tid}: {e}")
         if resume_choice and picker_outcome != "answered" and not auto_chosen:
             # Fail LOUD. Silently proceeding hands them the full session they did not choose —
             # exactly the spend this feature exists to prevent.

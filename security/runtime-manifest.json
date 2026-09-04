@@ -58,10 +58,10 @@
   ],
   "files": {
     "bin/tg-bridge": "sha256:d694df1981ac2905c0a90f39b7dda72e25ac00594a238e2d126a85017300c345",
-    "bridge/cli.py": "sha256:99b90126482ea73d3cec2a4bc7004cb2664e05ae54aa10e7539bce754627cf1b",
+    "bridge/cli.py": "sha256:866018424b63c80e436f8af6eca62ee6a692aa5aa015bab3d61d4c73c04b5b73",
     "bridge/codex_ctx.py": "sha256:be7e04e6437dd5cdcb82f8f0d1ea7e6420915a1e895f5f24d09b3147ba50c9c1",
     "bridge/common.py": "sha256:9bb80fe49d0b932cd239157984fbd402aa7d490cbbf3cd42c5151e489ece1883",
-    "bridge/daemon.py": "sha256:246a83f3d8b54ac20ffa26b6b78657f2b82ab2495af6480ef88c36496a74d804",
+    "bridge/daemon.py": "sha256:27025baf45edc2c5d91ae006c0664e4769dd8c9ba345886957f298a5a717fab2",
     "bridge/digest.py": "sha256:b4d7d501f90a6cc9d085d93ed24b839a6e67296be0c17d415a8fb4031682e788",
     "bridge/model_watchdog.py": "sha256:8c5b2bb459c90a629692c8e0e844a1adbe9f5e9bea2956468368e595c03ebe76",
     "bridge/restore_cli.py": "sha256:423a91ad87cd8d7044589bf5d2c148d4dc7cd0d65fe7364a4246580b575afb73",

@@ -67,6 +67,27 @@ def test_a_model_that_records_no_effort_yields_None(tmp_path, monkeypatch):
     assert daemon.last_effort_for_session("SID", "/home/user") is None
 
 
+def test_synthetic_tail_records_do_not_hide_the_last_real_model_and_effort(tmp_path, monkeypatch):
+    # A non-home cwd: the public-release ratchet refuses added bytes that look like a private
+    # absolute home path, and this file's older tests were written before that rule.
+    _write_transcript(tmp_path, monkeypatch, [
+        _turn("claude-fable-5-1[1m]", "medium"),
+        _turn("<synthetic>"),
+        _turn("<synthetic>"),
+    ], cwd="/srv/seat")
+
+    assert daemon.last_model_and_effort_for_session("SID", "/srv/seat") == (
+        "claude-fable-5-1[1m]", "medium"
+    )
+
+
+def test_only_synthetic_tail_records_leave_no_model_or_effort(tmp_path, monkeypatch):
+    _write_transcript(tmp_path, monkeypatch, [_turn("<synthetic>"), _turn("<synthetic>")],
+                      cwd="/srv/seat")
+
+    assert daemon.last_model_and_effort_for_session("SID", "/srv/seat") == (None, None)
+
+
 def test_a_missing_transcript_yields_None_and_does_not_raise(tmp_path, monkeypatch):
     monkeypatch.setattr(transcript, "PROJECTS_DIR", str(tmp_path))
     assert daemon.last_effort_for_session("no-such-session", "/home/user") is None

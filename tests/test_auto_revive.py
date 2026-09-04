@@ -51,6 +51,14 @@ def test_last_model_for_session_returns_persisted_model(tmp_path, monkeypatch):
     assert daemon.last_model_for_session("SID") == "claude-fable-5"
 
 
+def test_last_model_for_session_ignores_a_synthetic_watchdog_sample(tmp_path, monkeypatch):
+    watchdog = tmp_path / "model-watchdog.json"
+    watchdog.write_text(json.dumps({"SID": {"last_model": "<synthetic>"}}))
+    monkeypatch.setattr(daemon, "state_path", lambda *parts: str(watchdog))
+
+    assert daemon.last_model_for_session("SID") is None
+
+
 def test_last_model_for_session_returns_none_for_missing_file(tmp_path, monkeypatch):
     watchdog = tmp_path / "missing.json"
     monkeypatch.setattr(daemon, "state_path", lambda *parts: str(watchdog))

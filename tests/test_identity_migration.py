@@ -262,12 +262,22 @@ def test_installer_stops_real_legacy_waiter_before_it_can_recreate_old_state(tmp
     _old_install(home)
     cli = home / ".local" / "share" / OLD / "releases" / "abc" / "bridge" / "cli.py"
     cli.parent.mkdir(parents=True)
+    # The marker is published with os.replace, not write_text. The migrator stops this waiter
+    # with SIGTERM at a moment it does not choose, and SIGTERM is not catchable here — the
+    # process dies wherever it stands. write_text truncates the file and then writes it, so a
+    # kill landing between those two syscalls leaves a zero-length marker that no later step
+    # repairs, and the assertion below reads '' instead of 'live\n' (#286; reproduced at
+    # iteration 13 of a loop under CPU load). Writing a temporary file and renaming it makes
+    # the marker either absent or complete, whatever the timing — the same discipline
+    # bridge/common.py already uses for real state.
     cli.write_text(
-        "import pathlib, time\n"
+        "import os, pathlib, time\n"
         f"state = pathlib.Path({str(home / '.local' / 'share' / OLD)!r})\n"
         "while True:\n"
         "    state.mkdir(parents=True, exist_ok=True)\n"
-        "    (state / 'waiter-was-here').write_text('live\\n')\n"
+        "    tmp = state / 'waiter-was-here.tmp'\n"
+        "    tmp.write_text('live\\n')\n"
+        "    os.replace(tmp, state / 'waiter-was-here')\n"
         "    time.sleep(0.01)\n"
     )
     bindir, log = _fake_systemctl(tmp_path)

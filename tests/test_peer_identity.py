@@ -85,7 +85,8 @@ def test_peer_mirror_is_signed_by_the_source_not_the_target(tmp_path, monkeypatc
     # The peer path also echoes into A's own topic (#140); this test is about attribution,
     # so take the target's mirror specifically instead of assuming it is the only send.
     text, = [t for thread, t in mirrored if thread == B]
-    assert text.startswith(f"{A_ICON} Alpha (topic {A}): ")
+    # Icon only: the label would read as a second identity in the target's thread.
+    assert text.startswith(f"{A_ICON} ") and "(topic" not in text
     # The reported failure, restated: B's own signature must appear nowhere in a message B
     # did not write.
     assert B_ICON not in text
@@ -271,3 +272,48 @@ def test_telegram_ingress_append_still_fsyncs_nothing(tmp_path, monkeypatch):
                                      "kind": "text", "text": "hello"})
 
     assert synced == []
+
+
+# --- owner-only notices: for the owner reading the topic, never for the agent ------------
+
+def test_owner_only_notice_posts_without_touching_the_inbox_or_the_pane(tmp_path, monkeypatch):
+    mirrored = _notify_env(monkeypatch, tmp_path, pane=None)
+    nudged = []
+    monkeypatch.setattr(cli, "maybe_nudge", lambda *args: nudged.append(args) or True,
+                        raising=False)
+
+    result = cli.notify_topic(CFG, B, "usage-guard", "usage-guard:weekly:T10",
+                              "Fable weekly crossed 90%", owner_only=True)
+
+    assert result["status"] == "posted" and result["wake"] == "not-requested"
+    assert nudged == []
+    assert not (tmp_path / "topics" / str(B) / "inbox.jsonl").exists()
+    notices = (tmp_path / "topics" / str(B) / "notices.jsonl").read_text().splitlines()
+    assert json.loads(notices[-1])["idempotency_key"] == "usage-guard:weekly:T10"
+    assert mirrored == [(B, "usage-guard: Fable weekly crossed 90%")]
+
+
+def test_owner_only_notice_is_idempotent_on_its_own_ledger(tmp_path, monkeypatch):
+    mirrored = _notify_env(monkeypatch, tmp_path, pane=None)
+    for _ in range(2):
+        result = cli.notify_topic(CFG, B, "usage-guard", "usage-guard:weekly:T10",
+                                  "Fable weekly crossed 90%", owner_only=True)
+    assert result == {"status": "duplicate", "topic_id": B}
+    assert len(mirrored) == 1
+    # The inbox is untouched, so the SAME key is still deliverable to the agent when
+    # somebody decides the agent should act on it.
+    result = cli.notify_topic(CFG, B, "usage-guard", "usage-guard:weekly:T10",
+                              "Fable weekly crossed 90%")
+    assert result["status"] == "enqueued"
+
+
+def test_owner_only_flag_reaches_notify_from_the_command_line(tmp_path, monkeypatch, capsys):
+    mirrored = _notify_env(monkeypatch, tmp_path, pane=None)
+    monkeypatch.setattr("sys.stdin", io.StringIO("pulse line"))
+    args = cli.build_parser().parse_args(
+        ["notify", "--topic", str(B), "--sender", "pulse", "--idempotency-key", "pulse:1",
+         "--owner-only"])
+    cli.cmd_notify(CFG, args)
+    out = json.loads(capsys.readouterr().out)
+    assert out["status"] == "posted" and out["wake"] == "not-requested"
+    assert mirrored == [(B, "pulse: pulse line")]

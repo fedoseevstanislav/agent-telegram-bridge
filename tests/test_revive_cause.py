@@ -243,6 +243,9 @@ def _revive_harness(monkeypatch, engine="claude"):
     monkeypatch.setattr(daemon, "current_boot_id", lambda: "boot-x")
     monkeypatch.setattr(daemon, "update_registry", lambda fn: None)
     monkeypatch.setattr(daemon, "ensure_codex_trust", lambda cwd: None)
+    # These tests exercise restore wording after a fake pane is launched. The live-picker
+    # timing is covered by test_live_picker_grace; this fake pane has no UI to await.
+    monkeypatch.setattr(daemon, "_await_live_picker", lambda pane, grace, poll: False)
     monkeypatch.setattr(daemon, "reply", lambda cfg, tid, text: notices.append(text))
     monkeypatch.setattr(daemon, "deliver_briefing",
                         lambda pane, tid, eng, tpl, *a, **k: briefed.append(tpl))

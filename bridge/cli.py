@@ -10,6 +10,7 @@ Commands:
                               mirror to Telegram (the sanctioned session -> session path)
   status                      daemon health + registered topics
   retheme [--apply]           give existing topics a theme-relevant forum icon (dry by default)
+  reicon [--apply]            give existing topics a subject-matched signature icon (dry too)
 
 Topic resolution order: --topic flag, TG_BRIDGE_TOPIC env var, ./.tg-bridge-topic file.
 """
@@ -35,7 +36,8 @@ from bridge.daemon import maybe_nudge, pane_alive
 
 CWD_BINDING_FILE = ".tg-bridge-topic"
 
-# Visually distinct session icons — assigned at register time, shown in message headers
+# Visually distinct session icons — the fallback palette for the signature emoji shown in
+# message headers, used when the topic's name matches no subject rule (see pick_icon, #296)
 ICONS = ("🦊", "🐙", "🦉", "🐳", "⚡", "🌵", "🎯", "🧩", "🛰️", "🌶️",
          "🪐", "🦜", "🍄", "🗿", "🌊", "🔥")
 
@@ -46,10 +48,15 @@ _CUSTOM_EMOJI_ID = re.compile(r"[0-9]+")
 # ---- theme-relevant forum-topic icons (#278) ----
 #
 # Two DIFFERENT icons, deliberately. `ICONS`/`pick_icon` above is the message SIGNATURE — one
-# emoji per session, chosen to be visually distinct from its neighbours so a line in General
-# says who is speaking. This is the forum TOPIC icon, the glyph Telegram shows in the topic
-# list, and there the useful property is the opposite one: it should say what the topic is
-# ABOUT, so the list can be scanned by subject. A topic keeps both.
+# emoji per session, so a line in General says who is speaking. This is the forum TOPIC icon,
+# the glyph Telegram shows in the topic list, which says what the topic is ABOUT so the list
+# can be scanned by subject. A topic keeps both.
+#
+# The rules below are read by both (#296): the signature is drawn from this table first and
+# falls back to `ICONS` only when nothing matches, because "what the topic is about" beats a
+# random glyph at telling two sessions apart, and one table means one place to edit. They stay
+# two icons — the topic icon must come from Telegram's bot-settable set and is addressed by a
+# custom_emoji_id, while the signature is the plain emoji, prepended as text.
 #
 # Bots may only use the icons in `getForumTopicIconStickers` (112 of them; premium custom
 # emoji are settable from a user account only), and each is addressed by a `custom_emoji_id`
@@ -57,6 +64,9 @@ _CUSTOM_EMOJI_ID = re.compile(r"[0-9]+")
 # never written down here. The rules below name EMOJI; the resolution to an id is a lookup.
 #
 # First match wins, so order is precedence: the specific rules come before the general ones.
+# Since the signature reads this table too (#296), stages of one pipeline that used to share a
+# rule — intake, extraction, memory; research, learning — have their own, so sibling topics get
+# different glyphs instead of one broad subject's.
 # `\b` boundaries matter — an unanchored "ops" matched "Chronops" and "ai" matched "email".
 # Every emoji here was checked against a live `getForumTopicIconStickers` response — a rule
 # naming a glyph outside that set silently degrades to no icon, which looks like a matching
@@ -64,13 +74,18 @@ _CUSTOM_EMOJI_ID = re.compile(r"[0-9]+")
 # recorded copy of the set).
 TOPIC_ICON_RULES = (
     (r"\b(security|secret|auth|token|vuln|sanitiser|sanitizer)\b", "👮‍♂️"),
+    (r"\b(dedup|dedupe|duplicates?)\b", "🧼"),
+    (r"\b(mesh|messaging|chatter)\b", "🗣"),
     (r"\b(meeting|calendar|schedule|agenda|standup)\b", "📆"),
     (r"\b(release|launch|ship|milestone|rollout)\b", "🏁"),
     (r"\b(review|audit|verify|qa)\b", "🔎"),
     (r"\b(test|experiment|eval|trial|benchmark)\b", "🧪"),
     (r"\b(bridge|daemon|cli|repo|build|deploy|refactor|bug|patch|debug|infra)\b", "💻"),
-    (r"\b(graph|memory|ontology|extraction|intake|embedding|recall)\b", "🧠"),
-    (r"\b(research|study|learn(ing)?|paper|wiki|knowledge|docs?)\b", "📚"),
+    (r"\b(intake|ingest(ion)?|inbox|capture)\b", "📁"),
+    (r"\b(extract(ion|or)?|parser?|mining)\b", "🔭"),
+    (r"\b(graph|memory|ontology|embedding|recall)\b", "🧠"),
+    (r"\b(research|study|survey)\b", "🔬"),
+    (r"\b(learn(ing)?|paper|wiki|knowledge|docs?)\b", "📚"),
     (r"\b(client|consult(ing)?|deck|proposal|pitch|gtm|sales|lead)\b", "💼"),
     (r"\b(growth|metric|analytics|revenue|funnel|market(ing)?|seo)\b", "📈"),
     (r"\b(money|invoice|billing|budget|cost|pricing|tax|fintech|finance)\b", "💰"),
@@ -142,8 +157,35 @@ def theme_icon_id(cfg, name):
     return icon_emoji_ids(cfg).get(emoji) if emoji else None
 
 
-def pick_icon(registry, topic_id):
+def subject_icon(name, taken):
+    """(emoji, shared) for a topic name from the #278 rule table, or (None, False) — no match.
+
+    Several rules can match one name and table order is precedence, so the alternates of a
+    name are its later matches: the first emoji no live topic carries wins, which keeps two
+    neighbours on the same broad subject apart when the name gives anything to tell them by.
+    `shared` is True when every matching emoji is already carried; the caller decides whether
+    sharing beats its own fallback."""
+    if not isinstance(name, str):
+        return None, False
+    matches = [emoji for pattern, emoji in TOPIC_ICON_RULES
+               if re.search(pattern, name, re.IGNORECASE)]
+    for emoji in matches:
+        if emoji not in taken:
+            return emoji, False
+    return (matches[0], True) if matches else (None, False)
+
+
+def pick_icon(registry, topic_id, name=None):
+    """The message-signature emoji for a topic: its subject's icon when one is free (#296),
+    otherwise the generic distinct-from-neighbours palette exactly as before.
+
+    A subject icon that is already carried is NOT taken here: at register time an unused
+    generic glyph still separates this session from that one, and sharing is left to `reicon`,
+    where the alternative is a glyph that says nothing."""
     taken = {info.get("icon") for info in registry.values() if not info.get("ended")}
+    emoji, shared = subject_icon(name, taken)
+    if emoji and not shared:
+        return emoji
     for icon in ICONS:
         if icon not in taken:
             return icon
@@ -188,7 +230,7 @@ def cmd_register(cfg, args):
 
     def _add(reg):
         if not args.feed:
-            entry["icon"] = pick_icon(reg, topic_id)
+            entry["icon"] = pick_icon(reg, topic_id, name)
             if os.environ.get("TMUX_PANE"):
                 entry["pane"] = os.environ["TMUX_PANE"]
         reg[str(topic_id)] = entry
@@ -259,6 +301,69 @@ def cmd_retheme(cfg, args):
                         reg[t].__setitem__("topic_icon", w) if t in reg else None)
         changed += 1
     print(f"Retheme applied to {changed} topic(s).")
+
+
+def reicon_plan(registry):
+    """[(topic_id, name, current, wanted, shared_with)] for live topics whose SIGNATURE icon
+    would change (#296).
+
+    Only an icon still from the generic `ICONS` palette is a candidate — that is the set this
+    command exists to replace. An icon outside it was either set by hand, or is a feed's 📡, or
+    is a subject icon a post-#296 registration already chose; the registry does not record
+    which, and none of the three wants overwriting. Those topics are skipped and their icons
+    are held against the plan so a subject icon never duplicates one.
+
+    Topics are walked in id order and each assignment is held too, so an earlier topic's icon
+    is taken for the later ones. `shared_with` is the topic already holding the emoji when no
+    other matching rule was free: this command exists to replace glyphs that say nothing, and
+    a shared subject icon still says what the topic is about, so the collision is reported
+    rather than avoided."""
+    holder = {}          # emoji -> topic id currently expected to carry it
+    changeable = []
+    for tid, info in sorted(registry.items(), key=lambda kv: int(kv[0])):
+        if not isinstance(info, dict) or info.get("ended"):
+            continue
+        icon = info.get("icon")
+        if info.get("feed") or icon not in ICONS:
+            holder.setdefault(icon, int(tid))
+            continue
+        changeable.append((int(tid), info.get("name"), icon))
+    plan = []
+    for tid, name, icon in changeable:
+        want, shared = subject_icon(name, set(holder))
+        if not want or want == icon:
+            holder.setdefault(icon, tid)     # keeps what it has; still occupies that glyph
+            continue
+        plan.append((tid, name, icon, want, holder.get(want) if shared else None))
+        holder.setdefault(want, tid)
+    return plan
+
+
+def cmd_reicon(cfg, args):
+    """Give existing topics a signature icon matched to their subject. Dry unless --apply.
+
+    Registry-only: the signature is prepended to outgoing text, so nothing is sent to Telegram
+    and no past message changes — only what future messages from these topics are stamped
+    with."""
+    plan = reicon_plan(read_registry())
+    if not plan:
+        print("Nothing to reicon.")
+        return
+    for tid, name, old, new, shared_with in plan:
+        line = f"  topic {tid} {name}: {old} -> {new}"
+        if shared_with:
+            line += f"  (shared with topic {shared_with}: no other subject icon free)"
+        print(line)
+    if not args.apply:
+        print(f"{len(plan)} topic(s) would change. Re-run with --apply to write them.")
+        return
+
+    def _write(reg):
+        for tid, _name, _old, new, _shared in plan:
+            if str(tid) in reg:
+                reg[str(tid)]["icon"] = new
+    update_registry(_write)
+    print(f"Reicon applied to {len(plan)} topic(s).")
 
 
 def send_typing(cfg, topic_id):
@@ -710,8 +815,13 @@ def cmd_current_topic(_cfg, _args):
     print(json.dumps(current_topic_metadata(), ensure_ascii=False, sort_keys=True))
 
 
-def notify_topic(cfg, topic_id, sender, idempotency_key, text):
+def notify_topic(cfg, topic_id, sender, idempotency_key, text, owner_only=False):
     """Enqueue one local event into a topic's inbox, wake its pane, then mirror to Telegram.
+
+    `owner_only`: the event is for the OWNER reading the topic, not for the agent — a usage
+    alert, a daily pulse. It is posted to Telegram with the same attribution and the same
+    idempotency, but recorded in `notices.jsonl` instead of the inbox, so `recv` never returns
+    it and the pane is not woken (usage alerts were waking an idle seat for nothing).
 
     Two sender paths, decided by whether the caller resolves to a dialog topic of its own:
 
@@ -749,12 +859,15 @@ def notify_topic(cfg, topic_id, sender, idempotency_key, text):
     }
     if caller is not None:
         record["sender_topic_id"] = caller["topic_id"]
-    inbox = state_path("topics", str(topic_id), "inbox.jsonl")
+    ledger = "notices.jsonl" if owner_only else "inbox.jsonl"
+    inbox = state_path("topics", str(topic_id), ledger)
     appended, wake_claim = append_jsonl_once(inbox, record)
     if not appended:
         return {"status": "duplicate", "topic_id": topic_id}
 
-    if wake_claim is not None:
+    if owner_only:
+        wake = "not-requested"
+    elif wake_claim is not None:
         nudge_result = maybe_nudge(topic_id, info["pane"], wake_claim)
         if nudge_result is True:
             wake = "nudged"
@@ -770,8 +883,10 @@ def notify_topic(cfg, topic_id, sender, idempotency_key, text):
     # target's own thread signed as the target. Compose the attribution here and call
     # send_message directly, keeping the same HTML/splitting/plain-text-fallback path.
     if caller is not None:
+        # The icon IS the signature (owner request, 2026-09-03: no "Name (topic N):" in the body);
+        # the name+topic label stays in the inbox record and in the sender's own echo.
         icon = caller.get("icon")
-        mirror = f"{icon} {from_label}: {text}" if icon else f"{from_label}: {text}"
+        mirror = f"{icon} {text}" if icon else f"{from_label}: {text}"
     else:
         mirror = f"{from_label}: {text}"  # un-iconed: no session identity to sign with
     try:
@@ -788,8 +903,9 @@ def notify_topic(cfg, topic_id, sender, idempotency_key, text):
     echo = outbound_echo(cfg, caller, topic_id, info.get("name"), text)
     return {
         # Not "delivered": the record is durably enqueued and the pane wake is best effort.
-        # Nothing here proves the target agent read it (§4.1 M6 of the design).
-        "status": "enqueued",
+        # Nothing here proves the target agent read it (§4.1 M6 of the design). An owner-only
+        # notice was never enqueued for the agent at all, and says so.
+        "status": "posted" if owner_only else "enqueued",
         "topic_id": topic_id,
         "wake": wake,
         "telegram": telegram,
@@ -799,8 +915,11 @@ def notify_topic(cfg, topic_id, sender, idempotency_key, text):
 
 def cmd_notify(cfg, args):
     text = sys.stdin.read()
+    # The flag is passed only when set, so the call shape every existing caller and test
+    # stub knows stays the same for an ordinary notify.
+    extra = {"owner_only": True} if getattr(args, "owner_only", False) else {}
     result = notify_topic(
-        cfg, args.topic, args.sender, args.idempotency_key, text,
+        cfg, args.topic, args.sender, args.idempotency_key, text, **extra,
     )
     print(json.dumps(result, ensure_ascii=False, sort_keys=True))
     if result.get("telegram") in ("ambiguous", "failed"):
@@ -998,7 +1117,8 @@ def build_parser():
 
     p = sub.add_parser(
         "notify",
-        help="read an event from stdin, enqueue it once into a topic's inbox, wake, and mirror",
+        help="read an event from stdin, enqueue it once into a topic's inbox, wake, and mirror "
+             "(--owner-only: mirror for the owner, no inbox record, no wake)",
     )
     p.add_argument("--topic", required=True, type=int, help="target dialog topic id")
     p.add_argument("--sender",
@@ -1006,6 +1126,10 @@ def build_parser():
                         "for a session pane (which derives its identity from its own topic)")
     p.add_argument("--idempotency-key", required=True,
                    help="durable retry key, unique per logical event")
+    p.add_argument("--owner-only", action="store_true",
+                   help="post for the owner only: same attribution and idempotency, but the "
+                        "event is recorded in notices.jsonl, never in the agent's inbox, and "
+                        "the pane is not woken (usage alerts, pulses)")
 
     sub.add_parser("status", help="daemon health and registered topics")
 
@@ -1015,6 +1139,14 @@ def build_parser():
     )
     p.add_argument("--apply", action="store_true",
                    help="actually call editForumTopic (without this, nothing is written)")
+
+    p = sub.add_parser(
+        "reicon",
+        help="show which live topics would get a subject-matched signature icon; --apply to "
+             "write them",
+    )
+    p.add_argument("--apply", action="store_true",
+                   help="actually write the registry (without this, nothing is written)")
     return parser
 
 
@@ -1027,7 +1159,8 @@ def main():
     cfg = load_config()
     {"register": cmd_register, "send": cmd_send, "recv": cmd_recv,
      "ask": cmd_ask, "status": cmd_status, "typing": cmd_typing,
-     "notify": cmd_notify, "retheme": cmd_retheme}[args.command](cfg, args)
+     "notify": cmd_notify, "retheme": cmd_retheme,
+     "reicon": cmd_reicon}[args.command](cfg, args)
 
 
 if __name__ == "__main__":

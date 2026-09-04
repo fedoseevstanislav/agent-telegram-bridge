@@ -378,6 +378,7 @@ def test_a_revive_with_no_choice_does_not_touch_the_picker(tmp_path, monkeypatch
     monkeypatch.setattr(daemon, "last_model_for_session", lambda sid: "claude-fable-5")
     monkeypatch.setattr(daemon, "last_effort_for_session", lambda sid, cwd: None)
     monkeypatch.setattr(daemon, "_resume_picker_present", lambda screen: False)
+    monkeypatch.setattr(daemon, "_await_live_picker", lambda pane, grace, poll: False)
     monkeypatch.setattr(daemon, "reopen_topic",
                         lambda cfg, tid: (_ for _ in ()).throw(RuntimeError("stop here")))
 
@@ -775,6 +776,7 @@ def _revive_harness(monkeypatch, registry, picker="answered"):
                         lambda argv, **kw: type("R", (), {"returncode": 1, "stdout": ""})())
     monkeypatch.setattr(daemon, "launch_pane", lambda *a, **k: ("%77", None))
     monkeypatch.setattr(daemon, "answer_resume_picker", lambda pane, choice, **k: picker)
+    monkeypatch.setattr(daemon, "_await_live_picker", lambda pane, grace, poll: False)
     monkeypatch.setattr(daemon, "read_registry", lambda: registry)
     monkeypatch.setattr(daemon, "reopen_topic",
                         lambda cfg, tid: seen["reopened"].append(str(tid)) or True)

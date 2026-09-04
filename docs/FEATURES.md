@@ -72,10 +72,19 @@ Plain text in **General** gets an immediate hint instead of vanishing: no sessio
 **Topic icons.** A new topic gets a forum icon matched to its name — 💻 for a build, 📆 for a
 meeting, 🧠 for graph or memory work, 👮‍♂️ for security — so the topic list can be scanned by
 subject. A name that matches nothing keeps Telegram's default rather than being given a guess.
-This is separate from the per-session signature emoji in message headers, which is unchanged.
 Existing topics are caught up with `tg-bridge retheme`, which prints what it would change and
 writes only with `--apply`. Bots may only use Telegram's free icon set, so the palette is
 whatever `getForumTopicIconStickers` offers.
+
+The per-session **signature emoji** in message headers is a second, separate icon, and it is
+matched from the same name rules: a build topic signs 💻, a security topic 👮‍♂️. When another
+live topic already carries that emoji, a later rule the name also matches is used instead, and
+a name matching nothing falls back to the old palette of visually distinct glyphs. Existing
+topics are caught up with `tg-bridge reicon` — dry by default, `--apply` writes the registry.
+It changes only icons still from that generic palette, so an icon set by hand — or already
+matched to its subject — stays; when two topics can only end up with the same subject emoji the
+dry run says so on the line and applies it anyway, a shared subject icon being more useful than
+a random one.
 
 ### Starting a session
 
