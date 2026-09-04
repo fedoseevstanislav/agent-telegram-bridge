@@ -435,6 +435,7 @@ def send_files(cfg, topic_id, paths, caption=None, as_document=False):
     """
     info = read_registry().get(str(topic_id), {})
     icon = info.get("icon")
+    emoji_id = custom_emoji_id(topic_id, info)
     for path in paths:
         file_send_plan(path, as_document)      # raises with a one-line reason; sends nothing
 
@@ -446,9 +447,11 @@ def send_files(cfg, topic_id, paths, caption=None, as_document=False):
 
     for index, path in enumerate(paths):
         try:
+            extra = ({"icon_custom_emoji": (icon, emoji_id)}
+                     if index == 0 and caption and icon and emoji_id else {})
             delivery = send_file(cfg["bot_token"], cfg["chat_id"], path,
                                  caption=caption if index == 0 else None,
-                                 thread_id=topic_id, as_document=as_document)
+                                 thread_id=topic_id, as_document=as_document, **extra)
         except PossiblyDelivered as e:
             # The text path journals a lost ACK; a file must too, or an ambiguous upload
             # leaves no evidence at all and a human cannot tell whether to resend (#211

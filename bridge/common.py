@@ -591,7 +591,8 @@ def read_file_for_upload(path, as_document=False):
     return method, field, payload, hashlib.sha256(payload).hexdigest()
 
 
-def send_file(token, chat_id, path, caption=None, thread_id=None, as_document=False):
+def send_file(token, chat_id, path, caption=None, thread_id=None, as_document=False,
+              *, icon_custom_emoji=None):
     """Post one file into a chat/topic AS THE BOT. Returns a delivery dict carrying the
     sha256 of the bytes actually uploaded."""
     method, field, payload, digest = read_file_for_upload(path, as_document)
@@ -600,6 +601,8 @@ def send_file(token, chat_id, path, caption=None, thread_id=None, as_document=Fa
         params["message_thread_id"] = thread_id
     if caption:
         params["caption"] = md_to_telegram_html(caption)
+        if icon_custom_emoji:
+            params["caption"] = wrap_custom_emoji(params["caption"], *icon_custom_emoji)
         params["parse_mode"] = "HTML"
     delivery = {"path": path, "size": len(payload), "method": method,
                 "content_sha256": digest}

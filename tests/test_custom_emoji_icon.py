@@ -117,21 +117,56 @@ def test_verbatim_sends_are_untouched(monkeypatch):
     assert "parse_mode" not in rec.calls[0]
 
 
-# ---- C4: only send_text reads the field --------------------------------------
+# ---- C4: file captions use the same entity helper ----------------------------
 
-def test_file_captions_keep_the_plain_icon(tmp_path, monkeypatch):
-    monkeypatch.setattr(common, "STATE_DIR", str(tmp_path))
-    monkeypatch.setattr(cli, "read_registry",
-                        lambda: {"55": {"icon": ICON, "icon_custom_emoji_id": EMOJI_ID}})
+def test_file_caption_wraps_the_first_icon_after_html_conversion(tmp_path, monkeypatch):
+    rec = _env(tmp_path, monkeypatch,
+               {"icon": ICON, "icon_custom_emoji_id": EMOJI_ID})
     monkeypatch.setattr(cli, "file_send_plan", lambda *_a, **_k: None)
-    sent = []
+    monkeypatch.setattr(common, "read_file_for_upload",
+                        lambda *_a, **_k: ("sendDocument", "document", b"file", "digest"))
+    uploads = []
+    monkeypatch.setattr(common, "api_upload",
+                        lambda _token, _method, params, *_a: uploads.append(params) or {"message_id": 1})
 
-    def send_file(_token, _chat, path, caption=None, thread_id=None, as_document=False):
-        sent.append(caption)
-        return {"result": {"message_id": 1}, "path": path, "size": 1, "content_sha256": "x"}
+    cli.send_files(CFG, 55, ["first.txt", "second.txt"], caption=BODY)
 
-    monkeypatch.setattr(cli, "send_file", send_file)
+    assert uploads[0]["caption"] == (
+        f'<tg-emoji emoji-id="{EMOJI_ID}">{ICON}</tg-emoji> {BODY_HTML}'
+    )
+    assert uploads[0]["parse_mode"] == "HTML"
+    assert "caption" not in uploads[1]
 
-    cli.send_files(CFG, 55, ["/tmp/a.png"], caption="hi")
 
-    assert sent == [f"{ICON} hi"]
+def test_file_caption_without_custom_emoji_is_unchanged(tmp_path, monkeypatch):
+    _env(tmp_path, monkeypatch, {"icon": ICON})
+    monkeypatch.setattr(cli, "file_send_plan", lambda *_a, **_k: None)
+    monkeypatch.setattr(common, "read_file_for_upload",
+                        lambda *_a, **_k: ("sendDocument", "document", b"file", "digest"))
+    uploads = []
+    monkeypatch.setattr(common, "api_upload",
+                        lambda _token, _method, params, *_a: uploads.append(params) or {"message_id": 1})
+
+    cli.send_files(CFG, 55, ["first.txt"], caption=BODY)
+
+    assert uploads[0]["caption"] == f"{ICON} {BODY_HTML}"
+
+
+def test_over_limit_file_caption_keeps_the_text_message_fallback(tmp_path, monkeypatch):
+    _env(tmp_path, monkeypatch,
+         {"icon": ICON, "icon_custom_emoji_id": EMOJI_ID})
+    monkeypatch.setattr(cli, "file_send_plan", lambda *_a, **_k: None)
+    sent_text = []
+    monkeypatch.setattr(cli, "send_text",
+                        lambda _cfg, topic_id, text: sent_text.append((topic_id, text)))
+    uploads = []
+    monkeypatch.setattr(cli, "send_file",
+                        lambda *_a, **_k: uploads.append(_k) or {
+                            "result": {"message_id": 1}, "path": "first.txt",
+                            "size": 1, "content_sha256": "digest"})
+    caption = "x" * (cli.CAPTION_LIMIT + 1)
+
+    cli.send_files(CFG, 55, ["first.txt"], caption=caption)
+
+    assert sent_text == [(55, caption)]
+    assert uploads[0]["caption"] is None
