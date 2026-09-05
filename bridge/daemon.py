@@ -985,11 +985,21 @@ def mark_ended(thread_id, observed_pane):
 
 
 def lifecycle_loop(cfg):
-    """Detect dead session terminals: notify the topic, close it, retire the registry entry."""
+    """Detect dead session terminals and ask parked topics with unread inbox records to revive."""
     while True:
         time.sleep(LIFECYCLE_POLL)
         try:
             for thread_id, info in read_registry().items():
+                if info.get("ended") and info.get("parked"):
+                    # A pending reopen question (or a revive already in flight) makes
+                    # maybe_auto_revive return early; say "requested" once, not every poll.
+                    if (unread_count(thread_id) > 0
+                            and str(thread_id) not in pending_reopens
+                            and str(thread_id) not in _auto_reviving):
+                        log(f"lifecycle: parked topic {thread_id}: record appended, "
+                            "revive requested via unread inbox")
+                        maybe_auto_revive(cfg, thread_id)
+                    continue
                 pane = info.get("pane")
                 if not pane or info.get("ended"):
                     continue  # no pane = liveness unknowable; ended = already handled
@@ -1051,10 +1061,11 @@ def load_park_exempt():
 
 
 def _session_last_activity(info):
-    """Epoch of the session's last real turn, from its OWN artifact — the transcript for
-    claude, the rollout for codex — or None when it cannot be aged. The statusline ctx
-    record is NOT used: measured stale by WEEKS on live panes (#158 accepts any age), it
-    would park working sessions and spare dead ones (#273 A1). Unageable is unparkable."""
+    """Epoch of the last timestamped record in the session's OWN artifact — the transcript
+    for claude, the rollout for codex — falling back to its mtime when it has no timestamped
+    record, or None when it cannot be aged. The statusline ctx record is NOT used: measured
+    stale by WEEKS on live panes (#158 accepts any age), it would park working sessions and
+    spare dead ones (#273 A1). Unageable is unparkable."""
     sid = info.get("session_id")
     if not sid:
         return None
@@ -1065,7 +1076,37 @@ def _session_last_activity(info):
     if not path:
         return None
     try:
-        return os.stat(path).st_mtime
+        mtime = os.stat(path).st_mtime
+        # Claude Code can touch a quiet transcript without adding a record. Start at its tail
+        # because live transcripts can be tens of MiB; only walk back when this window has no
+        # timestamped record at all, and stop at the first one seen in reverse record order.
+        with open(path, "rb") as f:
+            end = f.seek(0, os.SEEK_END)
+            partial = b""
+            while end:
+                # Keep the byte before a window boundary in this bounded read. It tells us
+                # whether the first fragment continues a record from the previous window.
+                boundary = max(0, end - (256 * 1024 - 1))
+                start = boundary - 1 if boundary else 0
+                f.seek(start)
+                data = f.read(end - start)
+                before_boundary = data[:1] if boundary else b"\n"
+                lines = data[1 if boundary else 0:].splitlines()
+                if partial and lines:
+                    lines[-1] += partial
+                    partial = b""
+                if boundary and before_boundary not in (b"\n", b"\r") and lines:
+                    partial = lines.pop(0)
+                for line in reversed(lines):
+                    try:
+                        timestamp = json.loads(line).get("timestamp")
+                        if isinstance(timestamp, str) and timestamp.endswith("Z"):
+                            return datetime.fromisoformat(
+                                timestamp.replace("Z", "+00:00")).timestamp()
+                    except (AttributeError, ValueError, OverflowError, OSError):
+                        pass
+                end = boundary
+        return mtime
     except OSError:
         return None
 
@@ -1332,8 +1373,8 @@ def _park_one(cfg, tid, pane, occupant, cutoff):
             last = _session_last_activity(entry_now) or time.time()
             idle_h = (time.time() - last) / 3600
         with contextlib.suppress(Exception):
-            log(f"idle-park: parked topic {tid} ({name}), pane {pane}, "
-                f"idle {'?' if idle_h is None else f'{idle_h:.1f}'}h")
+            log(f"idle-park: parked topic {tid} ({name}), pane {pane}, last timestamped "
+                f"record (or mtime fallback) {'?' if idle_h is None else f'{idle_h:.1f}'}h ago")
         try:
             hours = "many" if idle_h is None else f"{idle_h:.0f}"
             reply(cfg, int(tid), (
@@ -2366,27 +2407,35 @@ def codex_usage_line(cwd=None):
     if not u:
         return None
     plan = _plan_label(u.get("plan_type"))
-    segments = []
-    for pct_key, win_key, reset_key in (
-        ("primary_pct", "primary_window_min", "primary_reset"),
-        ("secondary_pct", "secondary_window_min", "secondary_reset"),
-    ):
-        left = _pct_left(u.get(pct_key))
-        if left is None:
-            continue  # window absent/unusable for this snapshot — omit, don't print "n/a"
-        win_min = u.get(win_key)
-        seg = f"{_codex_window_label(win_min) or '?'} {left}% left"
-        reset = _usable_epoch(u.get(reset_key))
-        if reset is not None:
-            # short (≈5h) windows show just HH:MM; longer ones show the full datetime.
-            short = _finite_number(win_min)
-            if short is not None and short <= 360:
-                seg += f" (resets {local_hhmm(reset)} UTC+{TZ_OFFSET})"
-            else:
-                seg += f" (resets {local_datetime(reset)})"
-        segments.append(seg)
+    def windows(prefix=""):
+        segments = []
+        for pct_key, win_key, reset_key in (
+            (prefix + "primary_pct", prefix + "primary_window_min", prefix + "primary_reset"),
+            (prefix + "secondary_pct", prefix + "secondary_window_min", prefix + "secondary_reset"),
+        ):
+            left = _pct_left(u.get(pct_key))
+            if left is None:
+                continue  # window absent/unusable for this snapshot — omit, don't print "n/a"
+            win_min = u.get(win_key)
+            seg = f"{_codex_window_label(win_min) or '?'} {left}% left"
+            reset = _usable_epoch(u.get(reset_key))
+            if reset is not None:
+                # short (≈5h) windows show just HH:MM; longer ones show the full datetime.
+                short = _finite_number(win_min)
+                if short is not None and short <= 360:
+                    seg += f" (resets {local_hhmm(reset)} UTC+{TZ_OFFSET})"
+                else:
+                    seg += f" (resets {local_datetime(reset)})"
+            segments.append(seg)
+        return segments
+
+    segments = windows()
     if not segments:
         return None
+    model_name = u.get("model_limit_name")
+    model_segments = windows("model_") if isinstance(model_name, str) and model_name else []
+    if model_segments:
+        segments.append(f"{model_name}: " + " · ".join(model_segments))
     return f"🤖 Codex usage ({plan}): " + " · ".join(segments)
 
 

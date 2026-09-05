@@ -13,6 +13,7 @@ lands inside the claim. The tests here include the reviewer's five r2 interleavi
 import os
 import time
 import types
+from datetime import datetime, timezone
 
 import pytest
 
@@ -961,9 +962,8 @@ def test_pane_occupant_resolves_the_foreground_group_not_the_shell(monkeypatch):
         assert tpgid == int(fields[5]), "identity must be the tpgid, not the first pid"
 
 
-def test_activity_comes_from_the_session_artifact_not_the_ctx_record(monkeypatch, tmp_path):
-    """A1: the ager stats the transcript/rollout; the stale-by-weeks ctx record is never
-    consulted."""
+def test_activity_falls_back_to_artifact_mtime_without_a_timestamp(monkeypatch, tmp_path):
+    """C3: a timestamp-less artifact uses its mtime and never the stale ctx record."""
     t = tmp_path / "sid.jsonl"
     t.write_text("{}")
     monkeypatch.setattr(daemon.transcript, "transcript_path",
@@ -977,6 +977,112 @@ def test_activity_comes_from_the_session_artifact_not_the_ctx_record(monkeypatch
 
     assert last == pytest.approx(t.stat().st_mtime)
     assert reads == [], "parked on the statusline ctx record (A1)"
+
+
+def test_activity_uses_last_timestamped_record_not_fresh_mtime(monkeypatch, tmp_path):
+    """C1: a transcript touch cannot make an old recorded turn look new."""
+    t = tmp_path / "sid.jsonl"
+    stamp = datetime.fromtimestamp(time.time() - 7 * 3600, timezone.utc).isoformat().replace(
+        "+00:00", "Z")
+    t.write_text('{"timestamp": "' + stamp + '"}\n')
+    fresh_mtime = time.time() - 10 * 60
+    os.utime(t, (fresh_mtime, fresh_mtime))
+    monkeypatch.setattr(daemon.transcript, "transcript_path", lambda cwd, sid: str(t))
+
+    last = daemon._session_last_activity(
+        {"session_id": "sid", "engine": "claude", "cwd": "/srv/seat"})
+
+    assert last == pytest.approx(datetime.fromisoformat(stamp.replace("Z", "+00:00")).timestamp(),
+                                 abs=1)
+    assert last != pytest.approx(fresh_mtime)
+
+
+def test_activity_skips_timestamp_less_records_after_the_last_timestamp(monkeypatch, tmp_path):
+    """C2: bridge metadata after a turn does not become a newer turn."""
+    t = tmp_path / "sid.jsonl"
+    stamp = "2026-09-05T01:02:03Z"
+    t.write_text("\n".join([
+        '{"timestamp": "' + stamp + '"}',
+        '{"type": "bridge-session"}',
+        '{"type": "history-suppression"}',
+    ]) + "\n")
+    monkeypatch.setattr(daemon.transcript, "transcript_path", lambda cwd, sid: str(t))
+
+    assert daemon._session_last_activity(
+        {"session_id": "sid", "engine": "claude", "cwd": "/srv/seat"}) == pytest.approx(
+            datetime.fromisoformat(stamp.replace("Z", "+00:00")).timestamp(), abs=1)
+
+
+def test_activity_uses_last_timestamped_codex_rollout_record(monkeypatch, tmp_path):
+    """C4: Codex rollouts use their own final timestamped record too."""
+    rollout = tmp_path / "rollout.jsonl"
+    rollout.write_text("\n".join([
+        '{"timestamp": "2026-09-05T01:02:03Z"}',
+        '{"timestamp": "2026-09-05T04:05:06Z"}',
+    ]) + "\n")
+    monkeypatch.setattr(daemon.codex_ctx, "rollout_for_session", lambda sid: str(rollout))
+
+    assert daemon._session_last_activity({"session_id": "sid", "engine": "codex"}) == \
+        pytest.approx(datetime.fromisoformat("2026-09-05T04:05:06+00:00").timestamp(), abs=1)
+
+
+def test_activity_walks_back_one_tail_window_without_reading_a_large_transcript(
+        monkeypatch, tmp_path):
+    """C5: a record just beyond the tail remains discoverable without a whole-file read."""
+    window = 256 * 1024
+    t = tmp_path / "sid.jsonl"
+    stamp = "2026-09-05T01:02:03Z"
+    suffix = b'{}\n' * ((window + 102) // 3)
+    t.write_bytes(b'{}\n' * ((1024 * 1024) // 3) +
+                  ('{"timestamp": "' + stamp + '"}\n').encode() + suffix)
+    assert t.stat().st_size > 1024 * 1024
+    monkeypatch.setattr(daemon.transcript, "transcript_path", lambda cwd, sid: str(t))
+    real_open = open
+    bytes_read = []
+
+    class TrackingFile:
+        def __init__(self, *args, **kwargs):
+            self._file = real_open(*args, **kwargs)
+
+        def __enter__(self):
+            self._file.__enter__()
+            return self
+
+        def __exit__(self, *args):
+            return self._file.__exit__(*args)
+
+        def seek(self, *args):
+            return self._file.seek(*args)
+
+        def read(self, size=-1):
+            data = self._file.read(size)
+            bytes_read.append(len(data))
+            return data
+
+    monkeypatch.setattr(daemon, "open", TrackingFile, raising=False)
+
+    assert daemon._session_last_activity(
+        {"session_id": "sid", "engine": "claude", "cwd": "/srv/seat"}) == pytest.approx(
+            datetime.fromisoformat(stamp.replace("Z", "+00:00")).timestamp(), abs=1)
+    assert len(bytes_read) == 2
+    assert all(size <= window for size in bytes_read)
+    assert sum(bytes_read) <= 2 * window
+
+
+def test_activity_reassembles_a_timestamped_record_across_tail_windows(monkeypatch, tmp_path):
+    """C5: the first record fragment in a tail window is joined to its preceding bytes."""
+    window = 256 * 1024
+    t = tmp_path / "sid.jsonl"
+    old_stamp = "2026-09-05T01:02:03Z"
+    stamp = "2026-09-05T04:05:06Z"
+    t.write_text(
+        '{"timestamp": "' + old_stamp + '"}\n' +
+        '{"timestamp": "' + stamp + '", "payload": "' + "x" * window + '"}\n')
+    monkeypatch.setattr(daemon.transcript, "transcript_path", lambda cwd, sid: str(t))
+
+    assert daemon._session_last_activity(
+        {"session_id": "sid", "engine": "claude", "cwd": "/srv/seat"}) == pytest.approx(
+            datetime.fromisoformat(stamp.replace("Z", "+00:00")).timestamp(), abs=1)
 
 
 def test_zero_hours_disables_the_loop():

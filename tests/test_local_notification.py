@@ -120,7 +120,7 @@ def test_append_jsonl_once_is_durable_and_idempotent(tmp_path):
     path = tmp_path / "inbox.jsonl"
     record = {
         "ts": "2026-08-02T12:00:00+0000",
-        "from": "orchestra",
+        "from": "reviewer",
         "kind": "notification",
         "text": "review finished",
         "provenance": "local-notify",
@@ -136,7 +136,7 @@ def test_append_jsonl_once_same_key_is_atomic_under_concurrency(tmp_path):
     path = tmp_path / "inbox.jsonl"
     record = {
         "ts": "2026-08-02T12:00:00+0000",
-        "from": "orchestra",
+        "from": "reviewer",
         "kind": "notification",
         "text": "review finished",
         "provenance": "local-notify",
@@ -168,7 +168,7 @@ def test_telegram_and_local_writers_choose_one_first_unread_under_concurrency(tm
     }
     local_record = {
         "ts": "2026-08-02T12:00:01+0000",
-        "from": "orchestra",
+        "from": "reviewer",
         "kind": "notification",
         "text": "Local event",
         "provenance": "local-notify",
@@ -268,12 +268,12 @@ def test_notify_persists_before_wake_then_posts_to_telegram(monkeypatch, tmp_pat
     result = cli.notify_topic(
         _CFG,
         8265,
-        sender="orchestra",
+        sender="reviewer",
         idempotency_key="review-125-r1",
         text="Review finished",
     )
 
-    assert events == ["persist", "wake", ("telegram", "orchestra: Review finished")]
+    assert events == ["persist", "wake", ("telegram", "reviewer: Review finished")]
     assert result == {
         "status": "enqueued",
         "topic_id": 8265,
@@ -284,7 +284,7 @@ def test_notify_persists_before_wake_then_posts_to_telegram(monkeypatch, tmp_pat
     record = json.loads((tmp_path / "topics/8265/inbox.jsonl").read_text())
     assert record.pop("ts")
     assert record == {
-        "from": "orchestra",
+        "from": "reviewer",
         "kind": "notification",
         "text": "Review finished",
         "provenance": "local-notify",
@@ -301,14 +301,14 @@ def test_notify_command_reads_event_text_from_stdin(monkeypatch, capsys):
         return {"status": "duplicate", "topic_id": topic}
 
     monkeypatch.setattr(cli, "notify_topic", notify)
-    args = SimpleNamespace(topic=8265, sender="orchestra", idempotency_key="key-1")
+    args = SimpleNamespace(topic=8265, sender="reviewer", idempotency_key="key-1")
 
     cli.cmd_notify({"chat_id": -100}, args)
 
     assert seen == {
         "cfg": {"chat_id": -100},
         "topic": 8265,
-        "sender": "orchestra",
+        "sender": "reviewer",
         "key": "key-1",
         "text": "event from automation\n",
     }
@@ -327,7 +327,7 @@ def test_notify_command_keeps_wake_log_off_json_stdout(monkeypatch, tmp_path, ca
     monkeypatch.setattr(daemon.time, "sleep", lambda _seconds: None)
     monkeypatch.setattr(daemon, "_tmux", _echoing_tmux())
     monkeypatch.setattr(cli, "send_message", lambda *_args: None)
-    args = SimpleNamespace(topic=8265, sender="orchestra", idempotency_key="key-1")
+    args = SimpleNamespace(topic=8265, sender="reviewer", idempotency_key="key-1")
 
     cli.cmd_notify(_CFG, args)
 
@@ -354,14 +354,38 @@ def test_notify_duplicate_has_no_second_inbox_nudge_or_telegram_side_effect(
                         raising=False)
     monkeypatch.setattr(cli, "send_message", lambda *args: telegram.append(args))
 
-    first = cli.notify_topic(_CFG, 8265, "orchestra", "same-key", "Finished")
-    duplicate = cli.notify_topic(_CFG, 8265, "orchestra", "same-key", "Finished")
+    first = cli.notify_topic(_CFG, 8265, "reviewer", "same-key", "Finished")
+    duplicate = cli.notify_topic(_CFG, 8265, "reviewer", "same-key", "Finished")
 
     assert first["status"] == "enqueued"
     assert duplicate == {"status": "duplicate", "topic_id": 8265}
     assert len((tmp_path / "topics/8265/inbox.jsonl").read_text().splitlines()) == 1
     assert len(nudges) == 1
     assert len(telegram) == 1
+
+
+def test_notify_to_a_parked_topic_enqueues_without_a_pane_nudge(monkeypatch, tmp_path):
+    nudges = []
+    telegram = []
+    monkeypatch.setattr(common, "STATE_DIR", str(tmp_path))
+    monkeypatch.setattr(
+        cli,
+        "read_registry",
+        lambda: {"8265": _dialog(ended="2026-08-02T12:30:00+0000", parked=True)},
+    )
+    monkeypatch.setattr(cli, "maybe_nudge", lambda *args: nudges.append(args) or True,
+                        raising=False)
+    monkeypatch.setattr(cli, "send_message", lambda *args: telegram.append(args))
+
+    first = cli.notify_topic(_CFG, 8265, "scheduler", "parked-key", "Finished")
+    duplicate = cli.notify_topic(_CFG, 8265, "scheduler", "parked-key", "Finished")
+
+    assert first["status"] == "enqueued"
+    assert first["wake"] == "parked-revive-requested"
+    assert duplicate == {"status": "duplicate", "topic_id": 8265}
+    assert len((tmp_path / "topics/8265/inbox.jsonl").read_text().splitlines()) == 1
+    assert nudges == []
+    assert telegram == [("token", -100, "scheduler: Finished", 8265)]
 
 
 def test_notify_different_key_is_deliverable_without_redundant_unread_nudge(
@@ -376,8 +400,8 @@ def test_notify_different_key_is_deliverable_without_redundant_unread_nudge(
                         raising=False)
     monkeypatch.setattr(cli, "send_message", lambda *args: telegram.append(args))
 
-    cli.notify_topic(_CFG, 8265, "orchestra", "key-1", "First")
-    result = cli.notify_topic(_CFG, 8265, "orchestra", "key-2", "Second")
+    cli.notify_topic(_CFG, 8265, "reviewer", "key-1", "First")
+    result = cli.notify_topic(_CFG, 8265, "reviewer", "key-2", "Second")
 
     assert result["status"] == "enqueued"
     assert result["wake"] == "already-unread"
@@ -405,7 +429,7 @@ def test_notify_different_keys_atomically_create_one_first_unread_nudge(
     monkeypatch.setattr(cli, "send_message", lambda *args: telegram.append(args))
 
     def notify(key):
-        return cli.notify_topic(_CFG, 8265, "orchestra", key, f"event {key}")
+        return cli.notify_topic(_CFG, 8265, "reviewer", key, f"event {key}")
 
     with ThreadPoolExecutor(max_workers=2) as executor:
         futures = [
@@ -445,7 +469,7 @@ def test_stale_first_unread_owner_cannot_nudge_a_later_batch(monkeypatch, tmp_pa
     monkeypatch.setattr(cli, "append_jsonl_once", append_once)
 
     def notify(key):
-        return cli.notify_topic(_CFG, 8265, "orchestra", key, key)
+        return cli.notify_topic(_CFG, 8265, "reviewer", key, key)
 
     with ThreadPoolExecutor(max_workers=2) as executor:
         first = executor.submit(notify, "batch-a")
@@ -475,7 +499,7 @@ def test_notify_reports_failed_wake_without_losing_local_or_telegram_delivery(
     monkeypatch.setattr(cli, "maybe_nudge", lambda *args: False, raising=False)
     monkeypatch.setattr(cli, "send_message", lambda *args: telegram.append(args))
 
-    result = cli.notify_topic(_CFG, 8265, "orchestra", "key", "event")
+    result = cli.notify_topic(_CFG, 8265, "reviewer", "key", "event")
 
     assert result["wake"] == "failed"
     assert result["telegram"] == "posted"
@@ -484,15 +508,18 @@ def test_notify_reports_failed_wake_without_losing_local_or_telegram_delivery(
 
 
 @pytest.mark.parametrize(
-    "registry",
+    ("registry", "message"),
     [
-        {},
-        {"8265": _dialog(feed=True)},
-        {"8265": _dialog(ended="2026-08-02T12:30:00+0000")},
-        {"8265": {"name": "unbound"}},
+        ({}, "not in the local registry"),
+        ({"8265": _dialog(feed=True)}, "is a feed, not a dialog"),
+        ({"8265": _dialog(ended="2026-08-02T12:30:00+0000", parked=True, feed=True)},
+         "is a feed, not a dialog"),
+        ({"8265": _dialog(ended="2026-08-02T12:30:00+0000")},
+         "ended at 2026-08-02T12:30:00\\+0000"),
+        ({"8265": {"name": "unbound"}}, "has no bound pane"),
     ],
 )
-def test_notify_invalid_topic_has_no_side_effects(monkeypatch, registry):
+def test_notify_invalid_topic_has_no_side_effects(monkeypatch, registry, message):
     side_effects = []
     monkeypatch.setattr(cli, "read_registry", lambda: registry)
     monkeypatch.setattr(cli, "pane_alive", lambda pane: True, raising=False)
@@ -502,8 +529,8 @@ def test_notify_invalid_topic_has_no_side_effects(monkeypatch, registry):
                         raising=False)
     monkeypatch.setattr(cli, "send_message", lambda *args: side_effects.append("telegram"))
 
-    with pytest.raises(SystemExit):
-        cli.notify_topic(_CFG, 8265, "orchestra", "key", "event")
+    with pytest.raises(SystemExit, match=message):
+        cli.notify_topic(_CFG, 8265, "reviewer", "key", "event")
     assert side_effects == []
 
 
@@ -515,7 +542,7 @@ def test_notify_dead_pane_has_no_side_effects(monkeypatch):
                         raising=False)
 
     with pytest.raises(SystemExit, match="not live"):
-        cli.notify_topic(_CFG, 8265, "orchestra", "key", "event")
+        cli.notify_topic(_CFG, 8265, "reviewer", "key", "event")
     assert side_effects == []
 
 
@@ -530,7 +557,7 @@ def test_notify_telegram_ambiguity_keeps_local_delivery_successful(monkeypatch, 
 
     monkeypatch.setattr(cli, "send_message", ambiguous)
 
-    result = cli.notify_topic(_CFG, 8265, "orchestra", "key", "event")
+    result = cli.notify_topic(_CFG, 8265, "reviewer", "key", "event")
 
     assert result["status"] == "enqueued"
     assert result["wake"] == "nudged"
@@ -550,7 +577,7 @@ def test_notify_tmux_timeout_is_bounded_and_has_no_side_effects(monkeypatch):
                         raising=False)
 
     with pytest.raises(SystemExit, match="timed out"):
-        cli.notify_topic(_CFG, 8265, "orchestra", "key", "event")
+        cli.notify_topic(_CFG, 8265, "reviewer", "key", "event")
     assert side_effects == []
 
 

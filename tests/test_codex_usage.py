@@ -9,12 +9,16 @@ from bridge import codex_ctx, daemon
 
 # ---- codex_ctx: account-wide rollout lookup ----------------------------------
 
-def _write_rollout(path, cwd, primary_pct=15, secondary_pct=11, plan="pro"):
+def _write_rollout(path, cwd, primary_pct=15, secondary_pct=11, plan="pro", *,
+                   limit_id="codex", limit_name=None, timestamp="2026-09-05T12:00:00Z"):
     with open(path, "w") as f:
         f.write(json.dumps({"type": "session_meta", "payload": {"cwd": cwd}}) + "\n")
         f.write(json.dumps({
             "type": "event_msg",
+            "timestamp": timestamp,
             "payload": {"type": "token_count", "rate_limits": {
+                "limit_id": limit_id,
+                "limit_name": limit_name,
                 "primary": {"used_percent": primary_pct, "window_minutes": 300, "resets_at": 1},
                 "secondary": {"used_percent": secondary_pct, "window_minutes": 10080, "resets_at": 2},
                 "plan_type": plan,
@@ -83,6 +87,55 @@ def test_usage_for_cwd_still_filters_by_cwd(tmp_path, monkeypatch):
 
 def test_usage_from_rollout_none_path():
     assert codex_ctx._usage_from_rollout(None) is None
+
+
+def test_usage_from_rollout_uses_account_snapshot_before_a_model_snapshot(tmp_path, monkeypatch):
+    d = _sessions_dir(tmp_path, monkeypatch)
+    path = str(d / "rollout-mixed.jsonl")
+    _write_rollout(path, "/srv/seat", primary_pct=16, secondary_pct=16)
+    with open(path, "a") as f:
+        f.write(json.dumps({
+            "type": "event_msg", "timestamp": "2026-09-05T13:00:00Z",
+            "payload": {"type": "token_count", "rate_limits": {
+                "limit_id": "codex_spark", "limit_name": "GPT-5.3-Codex-Spark",
+                "primary": {"used_percent": 0, "window_minutes": 300, "resets_at": 1},
+                "secondary": {"used_percent": 0, "window_minutes": 10080, "resets_at": 2},
+            }},
+        }) + "\n")
+    usage = codex_ctx._usage_from_rollout(path)
+    assert (usage["primary_pct"], usage["secondary_pct"]) == (16, 16)
+
+
+def test_usage_latest_uses_newest_account_event_not_newest_file(tmp_path, monkeypatch):
+    d = _sessions_dir(tmp_path, monkeypatch)
+    newer, older = str(d / "rollout-newer.jsonl"), str(d / "rollout-older.jsonl")
+    _write_rollout(newer, "/srv/newer", primary_pct=30, timestamp="2026-09-02T12:00:00Z")
+    _write_rollout(older, "/srv/older", primary_pct=10, timestamp="2026-09-05T11:00:00Z")
+    os.utime(newer, (2000, 2000))
+    os.utime(older, (1000, 1000))
+    assert codex_ctx.usage_latest()["primary_pct"] == 10
+
+
+def test_usage_for_cwd_falls_back_when_its_rollout_is_model_scoped(tmp_path, monkeypatch):
+    d = _sessions_dir(tmp_path, monkeypatch)
+    account, model = str(d / "rollout-account.jsonl"), str(d / "rollout-model.jsonl")
+    _write_rollout(account, "/srv/account", primary_pct=16)
+    _write_rollout(model, "/srv/seat", primary_pct=0, limit_id="codex_spark",
+                   limit_name="GPT-5.3-Codex-Spark")
+    os.utime(account, (1000, 1000))
+    os.utime(model, (2000, 2000))
+    usage = codex_ctx.usage_for_cwd("/srv/seat")
+    assert usage["primary_pct"] == 16
+    assert usage["model_limit_name"] == "GPT-5.3-Codex-Spark"
+
+
+def test_usage_latest_reads_at_most_the_bounded_number_of_rollouts(monkeypatch):
+    paths = [f"/srv/rollout-{index}.jsonl" for index in range(10)]
+    seen = []
+    monkeypatch.setattr(codex_ctx, "_rollouts_newest_first", lambda: paths)
+    monkeypatch.setattr(codex_ctx, "_usage_from_rollout", lambda path: seen.append(path) or None)
+    assert codex_ctx.usage_latest() is None
+    assert seen == paths[:codex_ctx.USAGE_LATEST_ROLLOUTS]
 
 
 # ---- /usage arg routing in handle_command ------------------------------------
@@ -237,6 +290,19 @@ def test_codex_usage_line_none_when_no_window_has_pct(monkeypatch):
         "plan_type": "pro",
     })
     assert daemon.codex_usage_line(None) is None
+
+
+def test_codex_usage_line_shows_fresh_model_limit_after_account_limit(monkeypatch):
+    monkeypatch.setattr(codex_ctx, "usage_latest", lambda: {
+        "primary_pct": 16, "primary_window_min": 300, "primary_reset": None,
+        "secondary_pct": 16, "secondary_window_min": 10080, "secondary_reset": None,
+        "plan_type": "pro", "model_limit_name": "GPT-5.3-Codex-Spark",
+        "model_primary_pct": 0, "model_primary_window_min": 300, "model_primary_reset": None,
+        "model_secondary_pct": 0, "model_secondary_window_min": 10080, "model_secondary_reset": None,
+    })
+    assert daemon.codex_usage_line() == (
+        "🤖 Codex usage (pro): 5h 84% left · weekly 84% left · "
+        "GPT-5.3-Codex-Spark: 5h 100% left · weekly 100% left")
 
 
 def test_codex_window_label_weekly_band_edges():

@@ -17,9 +17,11 @@ modified one for that cwd.
 
 import json
 import os
+from datetime import datetime
 
 SESSIONS_DIR = os.path.expanduser("~/.codex/sessions")
 PROC_DIR = "/proc"  # overridable so the fd/pid-tree walk is testable without a real /proc
+USAGE_LATEST_ROLLOUTS = 8  # bounded global lookup; account snapshots live in recent rollouts
 
 
 def session_meta(path):
@@ -210,11 +212,14 @@ def _last_token_info(path):
     return info
 
 
-def _last_rate_limits(path):
-    """The `rate_limits` dict of the last token_count event that carries one, or
-    None. Some token_count events only carry `info` (no rate_limits) — those are
-    skipped so we return the freshest non-empty rate_limits snapshot."""
-    rate_limits = None
+def _rate_limit_snapshots(path):
+    """Freshest rate-limit snapshot and account snapshot (`limit_id == "codex"`).
+
+    Returns `(freshest, account, account_event_time)`. Some token_count events only
+    carry `info`, so they do not replace either non-empty snapshot. Event times are
+    parsed here because the account snapshot may not be the rollout's last record.
+    """
+    freshest = account = account_event_time = None
     try:
         with open(path) as f:
             for line in f:
@@ -225,22 +230,54 @@ def _last_rate_limits(path):
                 pl = o.get("payload") or {}
                 if o.get("type") == "event_msg" and pl.get("type") == "token_count":
                     rl = pl.get("rate_limits")
-                    if rl:
-                        rate_limits = rl
+                    if not isinstance(rl, dict) or not rl:
+                        continue
+                    freshest = rl
+                    if rl.get("limit_id") != "codex":
+                        continue
+                    account = rl
+                    timestamp = o.get("timestamp")
+                    if isinstance(timestamp, str):
+                        try:
+                            account_event_time = datetime.fromisoformat(
+                                timestamp.replace("Z", "+00:00")).timestamp()
+                        except ValueError:
+                            account_event_time = None
     except OSError:
-        return None
-    return rate_limits
+        return None, None, None
+    return freshest, account, account_event_time
 
 
-def _usage_from_rollout(path):
-    """Rate-limit usage dict from a specific rollout file, or None. `primary` is the 5h
-    window, `secondary` is the weekly window."""
-    rate_limits = _last_rate_limits(path) if path else None
+def _last_rate_limits(path):
+    """The last account snapshot (`limit_id == "codex"`) in a rollout, or None."""
+    _freshest, account, _event_time = _rate_limit_snapshots(path)
+    return account
+
+
+def _model_usage_fields(rate_limits):
+    """Display fields for a freshest model-scoped snapshot, or an empty mapping."""
+    if not rate_limits or rate_limits.get("limit_id") == "codex":
+        return {}
+    primary = rate_limits.get("primary") or {}
+    secondary = rate_limits.get("secondary") or {}
+    return {
+        "model_limit_name": rate_limits.get("limit_name"),
+        "model_primary_pct": primary.get("used_percent"),
+        "model_primary_window_min": primary.get("window_minutes"),
+        "model_primary_reset": primary.get("resets_at"),
+        "model_secondary_pct": secondary.get("used_percent"),
+        "model_secondary_window_min": secondary.get("window_minutes"),
+        "model_secondary_reset": secondary.get("resets_at"),
+    }
+
+
+def _usage_from_snapshots(freshest, rate_limits, event_time):
+    """Account usage from a rollout's account snapshot (`limit_id == "codex"`)."""
     if not rate_limits:
         return None
     primary = rate_limits.get("primary") or {}
     secondary = rate_limits.get("secondary") or {}
-    return {
+    usage = {
         "primary_pct": primary.get("used_percent"),
         "primary_window_min": primary.get("window_minutes"),
         "primary_reset": primary.get("resets_at"),
@@ -248,13 +285,33 @@ def _usage_from_rollout(path):
         "secondary_window_min": secondary.get("window_minutes"),
         "secondary_reset": secondary.get("resets_at"),
         "plan_type": rate_limits.get("plan_type"),
+        "event_time": event_time,
     }
+    usage.update(_model_usage_fields(freshest))
+    return usage
+
+
+def _usage_from_rollout(path):
+    """Account usage from a rollout's account snapshot (`limit_id == "codex"`)."""
+    if not path:
+        return None
+    return _usage_from_snapshots(*_rate_limit_snapshots(path))
 
 
 def usage_for_cwd(cwd):
-    """Codex account rate-limit usage for the live session launched in `cwd`, or
-    None if no rollout / no rate_limits data is found."""
-    return _usage_from_rollout(latest_rollout_for_cwd(cwd))
+    """Account usage for `cwd`, falling back when its rollout has no account snapshot."""
+    path = latest_rollout_for_cwd(cwd)
+    if not path:
+        return None
+    freshest, account, event_time = _rate_limit_snapshots(path)
+    usage = _usage_from_snapshots(freshest, account, event_time)
+    if usage:
+        return usage
+    usage = usage_latest()
+    if usage:
+        usage = dict(usage)
+        usage.update(_model_usage_fields(freshest))
+    return usage
 
 
 def _rollouts_newest_first():
@@ -282,16 +339,24 @@ def latest_rollout_any():
 
 
 def usage_latest():
-    """Account-wide Codex rate-limit usage from the most recent rollout that CARRIES a
-    rate-limit snapshot, or None. Codex limits are account-scoped, so this powers a global
-    `/usage codex` with no live pane. A freshly-started session's newest rollout may not
-    have logged rate_limits yet, so we skip past it to the newest rollout that has one —
-    rather than reporting 'no data' while an older rollout still holds the account usage."""
-    for path in _rollouts_newest_first():
+    """Account usage with the newest account snapshot by event timestamp.
+
+    Only the newest `USAGE_LATEST_ROLLOUTS` files by mtime are examined. A timestamp-less
+    account snapshot falls back to its file mtime for compatibility with older rollouts.
+    """
+    newest = None
+    for path in _rollouts_newest_first()[:USAGE_LATEST_ROLLOUTS]:
         u = _usage_from_rollout(path)
-        if u:
-            return u
-    return None
+        if not u:
+            continue
+        try:
+            event_time = u.get("event_time")
+            when = event_time if event_time is not None else os.path.getmtime(path)
+        except OSError:
+            continue
+        if newest is None or when > newest[0]:
+            newest = when, u
+    return newest[1] if newest else None
 
 
 def ctx_pct_for_cwd(cwd):

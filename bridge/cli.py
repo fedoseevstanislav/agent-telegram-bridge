@@ -821,6 +821,9 @@ def cmd_current_topic(_cfg, _args):
 def notify_topic(cfg, topic_id, sender, idempotency_key, text, owner_only=False):
     """Enqueue one local event into a topic's inbox, wake its pane, then mirror to Telegram.
 
+    An ended parked topic has no live pane to nudge. Its appended inbox record instead asks
+    the lifecycle sweep to revive it; every other target keeps `require_live_dialog`'s contract.
+
     `owner_only`: the event is for the OWNER reading the topic, not for the agent — a usage
     alert, a daily pulse. It is posted to Telegram with the same attribution and the same
     idempotency, but recorded in `notices.jsonl` instead of the inbox, so `recv` never returns
@@ -851,7 +854,10 @@ def notify_topic(cfg, topic_id, sender, idempotency_key, text, owner_only=False)
                 "--sender must not be empty (required for a caller with no dialog topic "
                 "of its own; a session pane derives its identity instead)"
             )
-    info = require_live_dialog(topic_id)
+    target = read_registry().get(str(topic_id))
+    parked = (isinstance(target, dict) and bool(target.get("ended"))
+              and bool(target.get("parked")) and not target.get("feed"))
+    info = target if parked else require_live_dialog(topic_id)
     record = {
         "ts": now_iso(),
         "from": from_label,
@@ -870,6 +876,8 @@ def notify_topic(cfg, topic_id, sender, idempotency_key, text, owner_only=False)
 
     if owner_only:
         wake = "not-requested"
+    elif parked:
+        wake = "parked-revive-requested"
     elif wake_claim is not None:
         nudge_result = maybe_nudge(topic_id, info["pane"], wake_claim)
         if nudge_result is True:

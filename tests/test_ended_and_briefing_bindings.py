@@ -122,6 +122,39 @@ def test_the_sweep_still_announces_a_real_end(registry, monkeypatch):
     assert "ended" in common.read_registry()["235"]
 
 
+def test_lifecycle_sweep_requests_one_revive_for_each_parked_topic_with_unread_inbox(
+        registry, monkeypatch):
+    """A parked topic's unread inbox is the durable revive request; live and empty topics wait."""
+    registry({
+        "235": {"pane": "%A", "name": "unread", "session_id": "sid",
+                "ended": "2026-08-02T12:30:00+0000", "parked": True},
+        "236": {"pane": "%B", "name": "empty", "session_id": "sid",
+                "ended": "2026-08-02T12:30:00+0000", "parked": True},
+        "237": {"pane": "%C", "name": "live", "session_id": "sid"},
+    })
+    revives = []
+    logs = []
+    monkeypatch.setattr(daemon, "unread_count", lambda tid: 1 if str(tid) == "235" else 0)
+    monkeypatch.setattr(daemon, "maybe_auto_revive", lambda cfg, tid: revives.append((cfg, tid)))
+    monkeypatch.setattr(daemon, "pane_alive", lambda _pane: True)
+    monkeypatch.setattr(daemon, "log", logs.append)
+
+    calls = {"n": 0}
+
+    def _sleep_once(_secs):
+        calls["n"] += 1
+        if calls["n"] > 1:
+            raise KeyboardInterrupt
+
+    monkeypatch.setattr(daemon.time, "sleep", _sleep_once)
+    cfg = {"bot_token": "t", "chat_id": 1}
+    with pytest.raises(KeyboardInterrupt):
+        daemon.lifecycle_loop(cfg)
+
+    assert revives == [(cfg, "235")]
+    assert logs == ["lifecycle: parked topic 235: record appended, revive requested via unread inbox"]
+
+
 # ---------------------------------------------------------------------------
 # #238 — deliver_briefing, plain first attempt
 # ---------------------------------------------------------------------------
