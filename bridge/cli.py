@@ -32,6 +32,7 @@ from bridge.common import (
     commit_cursor_if_inbox_current, file_send_plan, load_config, now_iso, read_registry,
     send_file, send_message, state_path, update_registry,
 )
+from bridge import codex_ctx
 from bridge.daemon import maybe_nudge, pane_alive
 
 CWD_BINDING_FILE = ".tg-bridge-topic"
@@ -1163,6 +1164,11 @@ def build_parser():
 
 def main():
     secure_process_umask()
+    if os.environ.get("TMUX_PANE"):
+        try:
+            codex_ctx.record_current_pane_rollout()
+        except Exception:
+            pass
     args = build_parser().parse_args()
     if args.command == "current-topic":
         cmd_current_topic(None, args)

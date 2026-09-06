@@ -17,7 +17,10 @@ modified one for that cwd.
 
 import json
 import os
+import uuid
 from datetime import datetime
+
+from bridge.common import state_path
 
 SESSIONS_DIR = os.path.expanduser("~/.codex/sessions")
 PROC_DIR = "/proc"  # overridable so the fd/pid-tree walk is testable without a real /proc
@@ -147,6 +150,124 @@ def open_rollout_for_pid_tree(pid):
     return open_rollout_for_pids(process_tree(pid))
 
 
+def _proc_status_value(pid, key):
+    """Value of one `/proc/<pid>/status` field, or None when it cannot be read."""
+    try:
+        with open(os.path.join(PROC_DIR, str(pid), "status")) as f:
+            for line in f:
+                name, separator, value = line.partition(":")
+                if separator and name == key:
+                    return value.strip()
+    except OSError:
+        pass
+    return None
+
+
+def _proc_start_ticks(pid):
+    """Linux `/proc/<pid>/stat` start time, or None when it cannot be read."""
+    try:
+        with open(os.path.join(PROC_DIR, str(pid), "stat"), "rb") as f:
+            fields = f.read().rsplit(b")", 1)[-1].split()
+        # `fields[0]` is stat field 3 after stripping the `(comm)` field, so field 22 is 19.
+        return int(fields[19])
+    except (OSError, ValueError, IndexError):
+        return None
+
+
+def _pane_record_path(pid):
+    return state_path("codex-panes", f"{pid}.json")
+
+
+def _rollout_session_id(path):
+    """Thread UUID encoded at the end of a Codex rollout filename, or None."""
+    name = os.path.basename(path)
+    if not (name.startswith("rollout-") and name.endswith(".jsonl")):
+        return None
+    suffix = ".jsonl"
+    candidate = name[-(36 + len(suffix)):-len(suffix)]
+    try:
+        return str(uuid.UUID(candidate))
+    except ValueError:
+        return None
+
+
+def write_pane_record(pid, rollout):
+    """Atomically record this live pane's one classified root rollout.
+
+    The caller is in the pane's process namespace, where the rollout fd is observable;
+    readers later verify the recorded process identity from its start ticks.
+    """
+    start_ticks = _proc_start_ticks(pid)
+    session_id = _rollout_session_id(rollout)
+    if start_ticks is None or session_id is None:
+        return False
+    record = {
+        "pid": pid,
+        "start_ticks": start_ticks,
+        "session_id": session_id,
+        "rollout": rollout,
+        "ts": datetime.now().isoformat(),
+    }
+    path = _pane_record_path(pid)
+    tmp = f"{path}.{os.getpid()}.tmp"
+    try:
+        with open(tmp, "w") as f:
+            json.dump(record, f)
+        os.replace(tmp, path)
+    except OSError:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        return False
+    return True
+
+
+def recorded_rollout_for_pane(pid):
+    """Recorded rollout for a live pane whose pid has not been recycled, or None."""
+    try:
+        with open(_pane_record_path(pid)) as f:
+            record = json.load(f)
+    except (OSError, ValueError):
+        return None
+    if not isinstance(record, dict) or record.get("pid") != pid:
+        return None
+    start_ticks = record.get("start_ticks")
+    rollout = record.get("rollout")
+    if (not isinstance(start_ticks, int) or isinstance(start_ticks, bool)
+            or _proc_start_ticks(pid) != start_ticks or not isinstance(rollout, str)):
+        return None
+    return rollout
+
+
+def _pane_ancestry(pid=None):
+    """(pane pid, ancestor pids) for this process below a tmux server, or (None, [])."""
+    current = os.getpid() if pid is None else pid
+    ancestors = []
+    while current and current not in ancestors:
+        ancestors.append(current)
+        parent = _proc_status_value(current, "PPid")
+        try:
+            parent = int(parent)
+        except (TypeError, ValueError):
+            return None, []
+        if _proc_status_value(parent, "Name") == "tmux: server":
+            return current, ancestors
+        current = parent
+    return None, []
+
+
+def record_current_pane_rollout():
+    """Write this Codex seat's pane record when its ancestry has one root rollout."""
+    pane_pid, ancestors = _pane_ancestry()
+    if pane_pid is None:
+        return False
+    _opened, roots = open_rollouts_for_pids(ancestors)
+    if len(roots) != 1:
+        return False
+    return write_pane_record(pane_pid, roots[0])
+
+
 def root_rollouts_for_cwd(cwd):
     """Non-sub-agent rollouts launched in `cwd`, newest first."""
     if not cwd or not os.path.isdir(SESSIONS_DIR):
@@ -164,11 +285,18 @@ def rollout_for_pane(pid, cwd):
     readout exists to be trusted, and the cwd lookup's failure mode is answering with
     some OTHER thread's file, which is worse than answering nothing (#123).
     """
+    try:
+        pid = int(pid)
+    except (TypeError, ValueError):
+        pid = None
     opened, roots = open_rollouts_for_pids(process_tree(pid))
     if len(roots) == 1:
         return roots[0]
     if opened:
         return None
+    recorded = recorded_rollout_for_pane(pid)
+    if recorded is not None:
+        return recorded
     candidates = root_rollouts_for_cwd(cwd)
     return candidates[0] if len(candidates) == 1 else None
 
