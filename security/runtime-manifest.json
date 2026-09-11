@@ -61,7 +61,7 @@
     "bridge/cli.py": "sha256:1ab866fc293cea6224a5fad9efebb1d584635c77e3cbcd1a2ea9e98b877fe495",
     "bridge/codex_ctx.py": "sha256:f3fa23a14401e80783443357fc2096f18a6437432dea994e89e9e8c0ea3e08c2",
     "bridge/common.py": "sha256:fabcbd417f8553bc2555042fbbec6d86b97811dcba38e29d57e8fc0e95afd0ac",
-    "bridge/daemon.py": "sha256:41058de536a5ca3e54282e9b35c829f47041d4d881e5ac85f485ec1e96956a8d",
+    "bridge/daemon.py": "sha256:debe04ecec4ec6346bf02cb70c3f2b93123cae837003f0fe426e999f86f587b1",
     "bridge/digest.py": "sha256:b4d7d501f90a6cc9d085d93ed24b839a6e67296be0c17d415a8fb4031682e788",
     "bridge/model_watchdog.py": "sha256:8c5b2bb459c90a629692c8e0e844a1adbe9f5e9bea2956468368e595c03ebe76",
     "bridge/restore_cli.py": "sha256:423a91ad87cd8d7044589bf5d2c148d4dc7cd0d65fe7364a4246580b575afb73",

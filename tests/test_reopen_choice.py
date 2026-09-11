@@ -222,13 +222,10 @@ def test_no_pending_choice_is_a_clean_no(answer):
     assert calls["full"] == []
 
 
-# ---- the bridge RELAYS Claude's own picker; it does not reimplement compaction -
+# ---- picker present: the bridge answers Claude's own picker -------------------
 
 def test_the_compact_answer_drives_a_revive_that_answers_the_picker(monkeypatch):
-    """Two earlier drafts reimplemented this badly — one resumed then drove a carry-forward
-    (three reads of the context to save it once), one substituted `--autocompact`. Claude
-    Code already offers "Resume from summary (recommended)" and states the age and tokens
-    itself; all the bridge has to do is relay the answer, because nobody is at the terminal."""
+    """A visible picker remains the native path; the fallback is only for its absence."""
     seen = {}
     monkeypatch.setattr(daemon, "revive_one",
                         lambda cfg, tid, entry, **kw: (seen.update(kw) or ("resumed", None)))
@@ -251,7 +248,7 @@ def test_the_full_answer_relays_full(monkeypatch):
 
 
 def test_the_launch_command_carries_no_compaction_flag_of_ours():
-    # The substitute is gone: compaction is Claude's, chosen in its picker.
+    # The bridge injects `/compact` only after a missing picker, never as a launch flag.
     cmd = daemon._resume_launch("claude", "SID", "claude-fable-5", "medium")
     assert "--autocompact" not in cmd
 

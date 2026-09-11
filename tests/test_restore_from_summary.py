@@ -282,7 +282,7 @@ def test_an_OWNERS_choice_that_did_not_land_is_still_reported_to_them(monkeypatc
 
     daemon.revive_one({}, "33", dict(ENTRY), brief=False, resume_choice="compact")
 
-    assert any("You chose `compact`" in t for _tid, t in r.replies)
+    assert any("choice was not applied" in t for _tid, t in r.replies)
 
 
 @pytest.mark.parametrize("slow_step", ["sizing", "launch"])
@@ -355,9 +355,14 @@ def test_the_restore_summary_counts_and_names_the_summarised_sessions(monkeypatc
     posted = []
 
     def _revive(cfg, tid, info, **kw):
+        # `from_summary` is what revive_one now reports for a picker that was ANSWERED;
+        # `resume_choice` alone no longer separates it from the injected fallback,
+        # which re-reads the full context first. The stub tracks the real producer's
+        # shape — every assertion below is unchanged.
         choice = "compact" if tid == "33" else None
         return "resumed", {"pane": "%1", "tid": tid, "engine": "claude", "tpl": "",
-                           "needs_brief": False, "reopened": None, "resume_choice": choice}
+                           "needs_brief": False, "reopened": None, "resume_choice": choice,
+                           "from_summary": choice == "compact"}
 
     monkeypatch.setattr(daemon, "revive_one", _revive)
     monkeypatch.setattr(daemon, "save_boot_id", lambda b: None)

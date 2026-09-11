@@ -4741,18 +4741,18 @@ def answer_resume_picker(pane, choice, deadline=None):
 def reopen_question(entry, tokens):
     """The question, worded once so the first ask and every re-ask are identical.
 
-    It must describe what the code ACTUALLY does — relay Claude Code's own picker, whose
-    cheap option is "Resume from summary". An earlier build still promised a carry-forward
-    here long after that implementation was removed, and the owner caught it: the message is the
-    only part of this feature they can see, so a stale description misinforms the exact
-    decision the feature exists to support (C2)."""
+    It must describe what the code ACTUALLY does. The bridge asks before a costly full
+    resume and, on `compact`, runs `/compact` itself if Claude's picker is unavailable.
+    The message is the only part of this feature the owner can see, so stale wording
+    misinforms the exact decision the feature exists to support (C2)."""
     if tokens:
         cost = f"re-read about {tokens:,} tokens ({tokens / 10_000:.0f}% of a 1M window)"
     else:
         cost = "re-read its whole history (size unknown — no usage record found)"
     return (
         f"🔄 Reopening '{entry.get('name', '?')}'. Resuming the full session will {cost}.\n\n"
-        f"Reply `compact` to resume from a summary — Claude's own recommended option — or "
+        f"Reply `compact` to choose Claude's summary option if its resume picker appears; "
+        f"otherwise the bridge resumes the session and then runs `/compact` — or "
         f"`full` to resume the whole session as-is.\n"
         f"Nothing starts until you answer; the question waits and anything else re-asks it."
     )
@@ -4994,14 +4994,11 @@ def _start_fresh_session(cfg, thread_id, entry):
 
 
 def _revive_with_choice(cfg, thread_id, entry, choice):
-    """Revive, then answer Claude's own resume picker with `choice`.
+    """Revive, then apply the requested resume choice.
 
-    The bridge does not implement compaction here — Claude Code already offers "Resume from
-    summary (recommended)" vs "Resume full session as-is" and states the age and token count
-    itself. An earlier draft resumed and then drove a carry-forward (three reads of the
-    context to save it once), and a second substituted `--autocompact`; both reimplemented a
-    native flow badly. All the bridge has to do is relay the answer, because there is nobody
-    at the terminal to give it.
+    When Claude renders its picker, `revive_one` answers it. When it does not render, the
+    compact choice is injected only after the resumed pane is observed idle. This wrapper
+    starts the worker and keeps the pending-question lifecycle consistent while it runs.
 
     Held in `_auto_reviving` throughout: revive_one reopens the topic before clearing
     `ended`, and that service message would otherwise come back and offer the choice again."""
@@ -5172,7 +5169,7 @@ def check_pending_reopen(cfg, thread_id, text):
             log(f"reopen revive did not start for topic {tid}; question left armed")
             return True
         reply(cfg, thread_id, "Resuming the full session as-is." if choice == "full"
-              else "Resuming from a summary.")
+              else "Reopening with the bridge compaction option.")
         return True
     # Not an answer: ask again and leave the question armed. There is no deadline, so this
     # can repeat indefinitely without ever stranding the session (A1).
@@ -5373,6 +5370,69 @@ def _compaction_settled(pane, tid, window):
                 return True
         time.sleep(1)
     return False
+
+
+def _clear_composer(pane):
+    """Send C-u to the pane so a withheld `/compact` cannot ride out with a later briefing.
+
+    Best effort, and it says so: the keystroke is sent and never verified by a re-capture,
+    so this establishes that the clear was ATTEMPTED, not that the composer is empty."""
+    try:
+        _tmux(["tmux", "send-keys", "-t", pane, "C-u"], check=True, capture_output=True)
+    except Exception as e:
+        log(f"reopen: could not clear the withheld /compact from pane {pane}: {e}")
+
+
+def _compact_after_absent_picker(pane):
+    """Inject `/compact` after a missing resume picker and observe its first outcome.
+
+    The picker is not a safe place to type. Wait for a sustained-idle pane before using
+    `type_line`, which serializes the injection and withholds Enter unless the text reaches
+    Claude's input box. The carry-forward worker has additional ownership and retry rules;
+    this reopen path owns a newly spawned pane and deliberately makes one attempt only.
+
+    Returns ``("injected" | "refused" | "failed", reason_or_None)``. ``injected`` means
+    the bridge injected `/compact` and a capture then showed compaction in progress; it does
+    not claim that compaction has finished.
+    """
+    idle_streak, deadline = 0, time.time() + CF_COMPACT_IDLE_WAIT
+    while time.time() < deadline:
+        if not pane_alive(pane):
+            return "failed", None
+        if pane_is_idle(pane):
+            idle_streak += 1
+            if idle_streak >= CF_IDLE_SAMPLES:
+                break
+        else:
+            idle_streak = 0
+        time.sleep(CF_IDLE_INTERVAL)
+    else:
+        return "failed", None
+
+    # This snapshot lets the existing refusal helper distinguish a new hook refusal from
+    # stale pane scrollback. Without it, no refusal reason is established, so do not inject:
+    # a later visible refusal could be stale and neither safe retry nor its wording is known.
+    pane_before = _cf_capture_tail(pane)
+    if pane_before is None:
+        return "failed", None
+    if type_line(pane, "/compact", settle=0.7) != "sent":
+        # type_line withholds Enter when it cannot establish that the text is safe to submit.
+        # In that case its text can still be in the composer; clear it before a later briefing
+        # gets a chance to append to and submit the withheld command.
+        _clear_composer(pane)
+        return "failed", None
+
+    deadline = time.time() + CF_COMPACT_START_WAIT
+    while time.time() < deadline:
+        if not pane_alive(pane):
+            return "failed", None
+        if _cf_compacting(pane):
+            return "injected", None
+        refusal = _cf_hook_block_reason(pane, pane_before)
+        if refusal:
+            return "refused", refusal
+        time.sleep(0.5)
+    return "failed", None
 
 
 def _briefing_exhausted(pane, tid, engine, briefing_tpl, attempt, reason, retry_kwargs=None,
@@ -5689,16 +5749,42 @@ def revive_one(cfg, tid, entry, fresh=False, brief=True, taken=None, cause="boot
             except Exception as e:
                 picker_outcome = "failed"
                 log(f"resume picker handling failed for topic {tid}: {e}")
-        if resume_choice and picker_outcome != "answered" and not auto_chosen:
+        if resume_choice == "compact" and picker_outcome == "absent":
+            compact_outcome, refusal = _compact_after_absent_picker(pane)
+            if compact_outcome == "injected":
+                picker_outcome = "injected"
+                reply(cfg, tid,
+                      "Claude's picker did not appear, so the bridge resumed the session and "
+                      "ran `/compact`.")
+                log(f"reopen: injected /compact on pane {pane} for topic {tid} after the "
+                    "resume picker was absent")
+            elif compact_outcome == "refused":
+                picker_outcome = "refused"
+                reply(cfg, tid, "⚠️ /compact was refused by a PreCompact hook. The hook said: "
+                      f"{refusal}. Resuming in full.")
+                log(f"reopen: /compact refused by a PreCompact hook on pane {pane} for "
+                    f"topic {tid}: {refusal}")
+            else:
+                picker_outcome = "injection_failed"
+                if _resume_picker_present(_safe_peek(pane)):
+                    reply(cfg, tid, UNANSWERED_PICKER_NOTICE)
+                else:
+                    reply(cfg, tid,
+                          "⚠️ Claude's picker did not appear and the bridge could not inject "
+                          "/compact. The session is resuming in full; the choice was not applied.")
+                log(f"reopen: could not inject /compact on pane {pane} for topic {tid} after "
+                    "the resume picker was absent")
+        if resume_choice and picker_outcome == "failed" and not auto_chosen:
             # Fail LOUD. Silently proceeding hands them the full session they did not choose —
             # exactly the spend this feature exists to prevent.
             reply(cfg, tid, (
-                f"⚠️ You chose `{resume_choice}`, but Claude's resume picker "
-                f"{'never appeared' if picker_outcome == 'absent' else 'could not be answered'}. "
-                f"The session is resuming with its FULL context. Nothing was lost — but the "
-                f"choice was not applied."))
-            log(f"resume picker '{resume_choice}' not applied for topic {tid}: {picker_outcome}")
-        elif resume_choice and picker_outcome != "answered":
+                f"⚠️ You chose `{resume_choice}`, but Claude's resume picker could not "
+                "be answered. The session is resuming with its FULL context. Nothing was "
+                "lost — but the choice was not applied."))
+            log(f"resume picker '{resume_choice}' not applied for topic {tid}: "
+                f"{picker_outcome}")
+        elif auto_chosen and resume_choice and picker_outcome not in (
+                "answered", "injected", "refused", "injection_failed"):
             # The DAEMON chose this, not the owner (#277, review r4). "You chose" would be a
             # lie, and the class of bug that produced it — some step between the budget check
             # and the picker eating the window — has no last instance to fix, since there is
@@ -5771,10 +5857,12 @@ def revive_one(cfg, tid, entry, fresh=False, brief=True, taken=None, cause="boot
     # notice sent the owner looking for an incident (#236 review r1, C1). `None` degrades to
     # "on request", which is all that is certain on that path — the warning above already
     # carries the detail, and adding a second claim about the context would be inventing one.
-    applied_choice = resume_choice if picker_outcome == "answered" else None
+    applied_choice = resume_choice if picker_outcome in ("answered", "injected") else None
     tpl, notice = _restore_wording(engine, cause, fresh=do_fresh,
                                    fresh_requested=asked_for_fresh, reopened=reopened,
                                    resume_choice=applied_choice)
+    if picker_outcome == "injected" and cause == "reopen" and not do_fresh:
+        notice = "♻️ Resumed, then compacted by the bridge."
     if reopened is False:
         # `is False` means reopen_topic was CALLED and failed. None means it was never called
         # (the reopen-choice path), which is not a failure to report: on that path the topic
@@ -5786,9 +5874,18 @@ def revive_one(cfg, tid, entry, fresh=False, brief=True, taken=None, cause="boot
     # already briefed this boot (crash-retry — codex has no recv to detect).
     already_briefed = entry.get("briefed_boot") == boot
     needs_brief = newly_spawned or engine == "claude" or (engine == "codex" and not already_briefed)
+    compacting = resume_choice == "compact" and picker_outcome in ("answered", "injected")
     task = {"pane": pane, "tid": tid, "engine": engine, "tpl": tpl,
             "needs_brief": needs_brief, "reopened": reopened,
-            "resume_choice": applied_choice}
+            "resume_choice": applied_choice, "compacting": compacting,
+            # Two different things the batch line used to report as one. "answered" means
+            # Claude's own picker built the summary and the full context was never re-read;
+            # "injected" means the session WAS re-read in full and the bridge compacted it
+            # afterwards. Counting the second as "resumed from summary" states the opposite
+            # of what happened on exactly the line that exists to make the saving visible
+            # (review r2, remaining finding).
+            "from_summary": picker_outcome == "answered",
+            "bridge_compacted": picker_outcome == "injected"}
 
     if closed_again:
         log(f"revive: topic {tid} was closed again during the revive — session is up, "
@@ -5804,7 +5901,6 @@ def revive_one(cfg, tid, entry, fresh=False, brief=True, taken=None, cause="boot
         # skipped and the session sat dark. Measured on topic 11722 (2026-08-25): picker
         # answered 15:56:31, compaction finished 15:58:21 — 110s against a 20s window, and it
         # took a manual nudge to arm the listener.
-        compacting = resume_choice == "compact" and picker_outcome == "answered"
         deliver_briefing(pane, tid, engine, tpl, await_busy=compacting,
                          settle=COMPACT_SETTLE if compacting else None)
     status = "resumed" if not do_fresh else "fresh"
@@ -5832,6 +5928,7 @@ def _restore_targets_now(cfg, boot, targets, cause="boot"):
     brief_tasks = []
     taken = set()
     summarised = []
+    compacted = []
     # #277: answering a picker waits for it to render, so N large sessions could hold the
     # daemon's start for N * RESUME_MODAL_WAIT before it polls at all. ONE budget for the
     # whole restore bounds that: each session still gets its full per-session wait until the
@@ -5851,8 +5948,10 @@ def _restore_targets_now(cfg, boot, targets, cause="boot"):
         except Exception as e:
             status, task = "failed", None
             log(f"restore: revive failed for topic {tid}: {e}")
-        if task and task.get("resume_choice") == "compact":
+        if task and task.get("from_summary"):
             summarised.append(name)
+        elif task and task.get("bridge_compacted"):
+            compacted.append(name)
         counts.setdefault(status, []).append(name)
         # reopen_failed still spawned a live pane, so it still needs briefing; only "failed" doesn't.
         if status != "failed" and task and task.get("needs_brief"):
@@ -5862,11 +5961,19 @@ def _restore_targets_now(cfg, boot, targets, cause="boot"):
     # wait up to RESTORE_SETTLE for the pane to go idle — synchronous would block getUpdates
     # for RESTORE_SETTLE * N sessions).
     for task in brief_tasks:
-        threading.Thread(
-            target=deliver_briefing,
-            args=(task["pane"], task["tid"], task["engine"], task["tpl"]),
-            daemon=True,
-        ).start()
+        if task.get("compacting"):
+            threading.Thread(
+                target=deliver_briefing,
+                args=(task["pane"], task["tid"], task["engine"], task["tpl"]),
+                kwargs={"await_busy": True, "settle": COMPACT_SETTLE},
+                daemon=True,
+            ).start()
+        else:
+            threading.Thread(
+                target=deliver_briefing,
+                args=(task["pane"], task["tid"], task["engine"], task["tpl"]),
+                daemon=True,
+            ).start()
     headline = ("Reboot restore" if cause == "boot"
                 else "Recovery restore (panes were dead; reboot NOT confirmed)")
     summary = (f"♻️ {headline}: {len(counts['resumed'])} resumed, "
@@ -5875,6 +5982,8 @@ def _restore_targets_now(cfg, boot, targets, cause="boot"):
     detail = []
     if summarised:
         summary += f" {len(summarised)} resumed from summary."
+    if compacted:
+        summary += f" {len(compacted)} resumed in full, then compacted by the bridge."
     for k, label in (("resumed", "resumed"), ("fresh", "fresh"),
                      ("reopen_failed", "REOPEN-FAILED (pane up, topic still closed)"),
                      ("failed", "FAILED")):
@@ -5884,6 +5993,9 @@ def _restore_targets_now(cfg, boot, targets, cause="boot"):
         # Named, because this is the line that says a large context was deliberately NOT
         # re-read — the saving is invisible otherwise, and so is a wrong call.
         detail.append("from summary: " + ", ".join(summarised))
+    if compacted:
+        # The context WAS re-read here; naming these separately keeps the line above honest.
+        detail.append("compacted after a full resume: " + ", ".join(compacted))
     try:
         api(cfg["bot_token"], "sendMessage", {"chat_id": cfg["chat_id"],
             "text": "⚙️ " + summary + ("\n" + "\n".join(detail) if detail else "")})
