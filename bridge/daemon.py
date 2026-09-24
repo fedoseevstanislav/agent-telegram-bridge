@@ -82,11 +82,22 @@ IDLE_PARK_RECHECK = int(os.environ.get("TG_BRIDGE_IDLE_PARK_RECHECK", "5"))  # s
 WARN_START = 20  # first warning threshold (%)
 WARN_STEP = 10  # then every additional 10%
 
-# Auto carry-forward (#92): when a session's context crosses AUTOCF_PCT, the daemon
-# auto-fires the full carry-forward procedure (write → issue → /compact → resume), so a
-# session self-manages its context without the owner typing /carryforward. 0 disables it.
+# Auto context management (#92): when a session's context crosses AUTOCF_PCT, the daemon
+# acts so the session self-manages its context without the owner typing anything. 0 disables it.
 # Re-arms once context falls below AUTOCF_REARM_PCT (post-compact) so it can fire again.
-AUTOCF_PCT = int(os.environ.get("TG_BRIDGE_AUTOCF_PCT", "60"))
+#
+# WHAT it does is CARRY_FORWARD. Default OFF since 2026-09-21, when the owner dropped the cycle
+# for every session on the machine: the daemon types /compact and nothing else. The evidence was
+# a study of one coordinator's own history: across 13 sampled compactions no case was found where
+# the carry-forward preserved something the built-in summary lost, while the cycle cost a
+# dedicated turn and ~10 KB every time.
+#
+# Setting TG_BRIDGE_CARRY_FORWARD=1 restores the ENTIRE previous behaviour — the write → issue →
+# /compact → resume-from-next-steps cycle AND its 60% threshold — because the decision was taken
+# as an experiment and may be reverted. That is the whole revert: one environment variable.
+CARRY_FORWARD = os.environ.get("TG_BRIDGE_CARRY_FORWARD", "0").strip().lower() \
+    not in ("", "0", "no", "off", "false")
+AUTOCF_PCT = int(os.environ.get("TG_BRIDGE_AUTOCF_PCT", "60" if CARRY_FORWARD else "50"))
 AUTOCF_REARM_PCT = max(0, AUTOCF_PCT - 10)  # hysteresis so it can't flap at the boundary
 # ...but a run that ends BEFORE compaction never lowers the context, so the post-compact
 # drop that re-arms the topic never comes and auto-CF is dead for the session's life
@@ -2547,6 +2558,19 @@ def dashboard_loop(cfg):
         time.sleep(DASH_POLL)
 
 
+# /help has to describe what /carryforward and the auto-trigger ACTUALLY do, and since
+# 2026-09-21 that depends on CARRY_FORWARD. Written as one substitution on the literal rather
+# than two copies of the whole help text, so the rest of the list cannot drift between modes.
+_HELP_CF_CYCLE = (
+    "/carryforward (or /cf) — bridge-driven: the session writes its carry-forward "
+    "(state + next-steps) to a GitHub issue (creating one if none), then I run /compact "
+    "and auto-resume it from those next-steps. Send any message to halt."
+)
+_HELP_CF_COMPACT = (
+    "/carryforward (or /cf) — bridge-driven: I wait for the session to go idle, run /compact, "
+    "then tell it to carry on from the summary. Send any message to halt."
+)
+
 HELP_TEXT = """Bridge commands (work in any session topic):
 /help — this list
 /sessions — all Claude sessions running in tmux (topic, context, unread)
@@ -2565,6 +2589,9 @@ any other /command (e.g. /compact, /cost) — typed into the session's terminal
 
 Convention: sessions echo their understanding of a request and wait for your "go" \
 (да/давай/ok also work). Put "go" inside the request itself to skip the wait."""
+if not CARRY_FORWARD:
+    HELP_TEXT = HELP_TEXT.replace(_HELP_CF_CYCLE, _HELP_CF_COMPACT)
+
 
 
 SPAWN_RE = re.compile(
@@ -3129,8 +3156,11 @@ def _process_autocf(cfg, thread_id, info, pane, pct, engine, exempt, autocf_fire
         # without it would compact and resume a session with its owner told nothing and given
         # no way to halt it. If the topic can't receive the notice, don't start (#161).
         if not reply(cfg, int(thread_id),
-                     f"🔄 Auto carry-forward at {pct}% context — writing the carry-forward, "
-                     f"compacting, then resuming from its next-steps."):
+                     (f"🔄 Auto carry-forward at {pct}% context — writing the carry-forward, "
+                      f"compacting, then resuming from its next-steps."
+                      if CARRY_FORWARD else
+                      f"🔄 Auto-compacting at {pct}% context — the session keeps working "
+                      f"from the summary.")):
             autocf_fired[thread_id] = False        # re-arm: nothing ran
             return False
         # handle_carry_forward posts a second notice with the halt instruction and aborts if
@@ -3254,7 +3284,7 @@ _last_sweep_nudge = {}
 
 def has_live_recv(tid):
     """Is a `tg-bridge recv --topic <tid>` process actually running? Boundary-matched so
-    topic 6 doesn't match 606. Returns None on error so callers can err toward 'not dark'."""
+    topic 6 doesn't match 604. Returns None on error so callers can err toward 'not dark'."""
     try:
         out = subprocess.run(
             ["pgrep", "-af", f"tg-bridge recv --topic {tid}"],
@@ -3896,7 +3926,7 @@ def _session_path():
 # ~5.3 GB — so session `recv --wait` listeners were being reaped, and a reap usually woke
 # the session for a full turn that drained an empty inbox and re-armed. Those turns are
 # appended to its context, so idle sessions climbed toward a context warning doing
-# nothing: topic 6258 did it 10x in 4 idle hours, topic 212 five times in 80 seconds
+# nothing: one topic did it 10x in 4 idle hours, another five times in 80 seconds
 # (#178).
 #
 # Two limits worth knowing before relying on this:
@@ -4702,7 +4732,7 @@ def answer_resume_picker(pane, choice, deadline=None):
 
     THIS is what the bridge was missing: a headless revive left that picker unanswered, so a
     large old session came back sitting on a modal, and the briefing typed into it was
-    swallowed (observed twice on topic 14886). Nothing else answers it — there is no operator
+    swallowed (observed twice on one long-running topic). Nothing else answers it — there is no operator
     at the terminal.
 
     Verified before acting, never blind: the picker's own text must be on screen. Pressing a
@@ -5275,6 +5305,30 @@ def _await_live_picker(pane, grace, poll):
     return False
 
 
+def revive_model(model):
+    """The model a revived claude session wakes on: the one it last ran, or its configured successor.
+
+    The transcript is the record of what a session ran, and it cannot be changed after the fact,
+    so a fleet moving to a newer model needs one place that says "wake X as Y". That is
+    `revive_model_map` in config, e.g. {"claude-opus-5": "claude-opus-5-5[1m]"} — and it also
+    restores the [1m] window the transcript never records. Read per call, like spawn_flags. Any
+    config this cannot use leaves the recorded model alone: waking on the model a session last
+    ran is today's behaviour, never an error.
+    """
+    try:
+        cfg = load_config()
+    except (OSError, ValueError, TypeError, RecursionError, SystemExit):
+        return model
+    mapping = cfg.get("revive_model_map") if isinstance(cfg, dict) else None
+    # The whole map or none of it: one malformed entry means the file is not what someone meant
+    # to write, and guessing which of its other entries still hold is the wrong direction.
+    if not isinstance(mapping, dict) or not all(
+            isinstance(k, str) and k.strip() and isinstance(v, str) and v.strip()
+            for k, v in mapping.items()):
+        return model
+    return mapping.get(model, model)
+
+
 def _resume_launch(engine, sid, model=None, effort=None):
     if engine == "codex":
         # The bypass flag is a ROOT flag, not a `resume` subcommand option — it must precede
@@ -5282,7 +5336,8 @@ def _resume_launch(engine, sid, model=None, effort=None):
         # Codex carries its own model+effort in the rollout and takes neither as a flag.
         return _command("codex", spawn_flags("codex"), "resume", shlex.quote(sid))
     launch = _command("claude", "--resume", shlex.quote(sid),
-                      "--model", shlex.quote(model or SPAWN_MODEL), spawn_flags("claude"))
+                      "--model", shlex.quote(revive_model(model) if model else SPAWN_MODEL),
+                      spawn_flags("claude"))
     if effort:
         # Omitted when unknown: `--effort` on a model that does not take one is a launch
         # failure, which would turn a recoverable "wrong effort" into a dead revive.
@@ -5323,7 +5378,7 @@ def _compaction_settled(pane, tid, window):
 
     #200: "idle right now" is not "ready". The pane stays idle for about a second between the
     answer and compaction rendering, so the plain idle wait exited immediately and typed into
-    a pane about to go busy. Measured on topic 12999 (2026-08-26): picker answered 14:28:21,
+    a pane about to go busy. Measured on a live topic (2026-08-26): picker answered 14:28:21,
     briefing typed 14:28:22, swallowed — and it then sat unsubmitted in the composer for over
     two minutes while the session came back dark.
 
@@ -5508,7 +5563,7 @@ def deliver_briefing(pane, tid, engine, briefing_tpl, attempt=1, settle=None, aw
     if await_busy and engine == "claude" and not _compaction_settled(pane, tid, window):
         # Compaction was observed and did not finish. Do NOT fall through to the ordinary
         # idle wait: that returns without typing and schedules nothing (review finding 3),
-        # which is precisely what left topic 12999 dark — its retry waited RESTORE_SETTLE,
+        # which is precisely what left that topic dark — its retry waited RESTORE_SETTLE,
         # gave up, and ended the chain while compaction was still running.
         # The retry keeps waiting for compaction specifically, so it carries settle and
         # await_busy; the other give-up points do not (see the retry comment below).
@@ -5537,7 +5592,7 @@ def deliver_briefing(pane, tid, engine, briefing_tpl, attempt=1, settle=None, aw
     # attempt. Review round 2 established why for the waited paths: the checks above run
     # before a wait that can last COMPACT_SETTLE, and in that window the topic can be
     # rebound, another chain can brief it, or a live recv can start. Reproduced — attempt 2
-    # validated 12999 -> %178, the binding moved to %999 mid-wait, and it typed into %178
+    # validated topic 7007 -> %178, the binding moved to %999 mid-wait, and it typed into %178
     # then stamped briefed_boot on %999, which had received nothing: the #133 r2 failure
     # reached through a longer wait.
     #
@@ -5898,7 +5953,7 @@ def revive_one(cfg, tid, entry, fresh=False, brief=True, taken=None, cause="boot
     if brief and needs_brief:
         # A `compact` answer drops Claude straight into compaction, which runs for minutes.
         # RESTORE_SETTLE is sized for a plain resume and cannot cover it, so the briefing was
-        # skipped and the session sat dark. Measured on topic 11722 (2026-08-25): picker
+        # skipped and the session sat dark. Measured on a live topic (2026-08-25): picker
         # answered 15:56:31, compaction finished 15:58:21 — 110s against a 20s window, and it
         # took a manual nudge to arm the listener.
         deliver_briefing(pane, tid, engine, tpl, await_busy=compacting,
@@ -6366,6 +6421,14 @@ CF_WRITE_PROMPT = (
     "contains a REAL issue reference (never a placeholder) — if you somehow could not create/find an "
     "issue, still create the marker but leave it empty and I will create the issue myself. "
     "Step 4 — then STOP and end your turn: do not compact, do not start new work."
+)
+# What a seat is told after a compaction the daemon drove, when the carry-forward cycle is off.
+# One short line by design (the owner, 17:22Z): the built-in summary already carries the state,
+# so the nudge only has to re-anchor the seat in its plan and hand control back.
+COMPACT_RESUME_PROMPT = (
+    "[tg-bridge] Compaction is complete. If your work has a program plan, say which node of it "
+    "you are on, then continue. The owner can steer or stop you at any time by messaging this "
+    "topic — their message arrives in your normal inbox."
 )
 CF_RESUME_PROMPT = (
     "[tg-bridge carry-forward resume] Compaction is complete. Re-read your carry-forward at {path}, "
@@ -7031,6 +7094,10 @@ def handle_carry_forward(cfg, thread_id, text, info, pane):
         f"🧭 Carry-forward ({info.get('name', '?')}): waiting for the session to settle, then "
         f"writing state → /compact → auto-resuming from its next-steps. "
         f"Send any message here to halt."
+        if CARRY_FORWARD else
+        f"🧭 Compacting ({info.get('name', '?')}): waiting for the session to settle, then "
+        f"/compact. The session continues from the summary. "
+        f"Send any message here to halt."
     )):
         # Same contract as the auto path: the halt instruction is IN this notice, so a
         # carry-forward the owner cannot see or stop must not begin (#161).
@@ -7073,70 +7140,74 @@ def handle_carry_forward(cfg, thread_id, text, info, pane):
 def _carry_forward_worker(cfg, thread_id, pane, cf_file, marker, token, name):
     tid = str(thread_id)
     try:
-        # PHASE 1 — WRITE: let any in-flight turn settle, inject the CF prompt, then
-        # wait DETERMINISTICALLY for the session's done-marker (#85 bug 2) — a pure
-        # idle gate false-fired on mid-task lulls and ran /compact mid-turn.
-        _cf_cleanup_marker(marker)  # clear any stale marker so it can't short-circuit the gate
-        if _cf_wait_idle(tid, token, pane, CF_SETTLE_WAIT) != "idle":
-            if _cf_owns(tid, token):
-                _cf_release(tid, token)
-                # Not "try /cf again once it's idle" any more: the daemon now retries this
-                # itself (#239), and a notice that sends the owner to do by hand what is
-                # already coming is the same defect as the one that prompted the fix — a
-                # bridge message that misdescribes what the bridge will do. But only where
-                # the retry can actually happen: a `/cf` typed by hand on an exempt topic, or
-                # with auto-CF switched off entirely, gets no retry, and promising one there
-                # would be the same defect pointing the other way (#240 review r1, finding 5).
-                # Wrapped: this notice is required to reach the owner (C5), and working out
-                # which wording to use must not be able to stop it. `load_autocf_exempt`
-                # catches OSError and ValueError, but a pathological exemption file raises
-                # RecursionError out of json.load, which the worker's outer handler would
-                # turn into silence (#240 review r2, finding 4). Anything unexpected falls
-                # back to the wording that promises nothing.
-                try:
-                    retried = bool(AUTOCF_PCT) and tid not in load_autocf_exempt()
-                except Exception:
-                    retried = False
-                reply(cfg, thread_id, "⚠️ Session stayed mid-turn — carry-forward aborted. "
-                      + ("The daemon will try again on its own; /cf forces one now."
-                         if retried else "Try /cf again once it's idle."))
-            return
-        if not pane_alive(pane):
-            return
-        if not _cf_inject_owned(tid, token, pane, CF_WRITE_PROMPT.format(path=cf_file, marker=marker)):
-            return  # halted between the settle gate and the inject
-        time.sleep(CF_SETTLE)  # let the write turn actually start
-        res = _cf_wait_done(tid, token, pane, cf_file, marker, CF_WRITE_TIMEOUT)
-        if res == "aborted":
-            return
-        if res == "timeout":
-            if _cf_release(tid, token):
-                # the session may be stuck on an interactive prompt it shouldn't have
-                # opened; Escape dismisses it so we don't leave the pane blocked.
-                if pane_alive(pane):
-                    _tmux(["tmux", "send-keys", "-t", pane, "Escape"], capture_output=True)
-                reply(cfg, thread_id, "⚠️ Carry-forward didn't signal completion in time — aborted "
-                                      "before /compact (dismissed any open prompt). Session left as-is.")
-            return
+        # The carry-forward cycle — write the file, record it to an issue, then compact —
+        # runs ONLY when it is switched back on. Off, this whole phase is the thing the
+        # owner deleted: the built-in summary already carries the state it was writing.
+        if CARRY_FORWARD:
+            # PHASE 1 — WRITE: let any in-flight turn settle, inject the CF prompt, then
+            # wait DETERMINISTICALLY for the session's done-marker (#85 bug 2) — a pure
+            # idle gate false-fired on mid-task lulls and ran /compact mid-turn.
+            _cf_cleanup_marker(marker)  # clear any stale marker so it can't short-circuit the gate
+            if _cf_wait_idle(tid, token, pane, CF_SETTLE_WAIT) != "idle":
+                if _cf_owns(tid, token):
+                    _cf_release(tid, token)
+                    # Not "try /cf again once it's idle" any more: the daemon now retries this
+                    # itself (#239), and a notice that sends the owner to do by hand what is
+                    # already coming is the same defect as the one that prompted the fix — a
+                    # bridge message that misdescribes what the bridge will do. But only where
+                    # the retry can actually happen: a `/cf` typed by hand on an exempt topic, or
+                    # with auto-CF switched off entirely, gets no retry, and promising one there
+                    # would be the same defect pointing the other way (#240 review r1, finding 5).
+                    # Wrapped: this notice is required to reach the owner (C5), and working out
+                    # which wording to use must not be able to stop it. `load_autocf_exempt`
+                    # catches OSError and ValueError, but a pathological exemption file raises
+                    # RecursionError out of json.load, which the worker's outer handler would
+                    # turn into silence (#240 review r2, finding 4). Anything unexpected falls
+                    # back to the wording that promises nothing.
+                    try:
+                        retried = bool(AUTOCF_PCT) and tid not in load_autocf_exempt()
+                    except Exception:
+                        retried = False
+                    reply(cfg, thread_id, "⚠️ Session stayed mid-turn — carry-forward aborted. "
+                          + ("The daemon will try again on its own; /cf forces one now."
+                             if retried else "Try /cf again once it's idle."))
+                return
+            if not pane_alive(pane):
+                return
+            if not _cf_inject_owned(tid, token, pane, CF_WRITE_PROMPT.format(path=cf_file, marker=marker)):
+                return  # halted between the settle gate and the inject
+            time.sleep(CF_SETTLE)  # let the write turn actually start
+            res = _cf_wait_done(tid, token, pane, cf_file, marker, CF_WRITE_TIMEOUT)
+            if res == "aborted":
+                return
+            if res == "timeout":
+                if _cf_release(tid, token):
+                    # the session may be stuck on an interactive prompt it shouldn't have
+                    # opened; Escape dismisses it so we don't leave the pane blocked.
+                    if pane_alive(pane):
+                        _tmux(["tmux", "send-keys", "-t", pane, "Escape"], capture_output=True)
+                    reply(cfg, thread_id, "⚠️ Carry-forward didn't signal completion in time — aborted "
+                                          "before /compact (dismissed any open prompt). Session left as-is.")
+                return
 
-        # WRITE done — enforce the "always a durable GitHub record" contract (#85 blocker 3):
-        # prefer the issue ref the session wrote into the marker; if it's absent/invalid, the
-        # daemon creates the issue itself from the CF file. Proceed to /compact either way (the
-        # local CF file is a durable record); only warn if even the fallback couldn't record it.
-        if not _cf_owns(tid, token):
-            return
-        issue_ref, _issue_src = _cf_verify_or_create_issue(cfg, thread_id, name, cf_file, marker)
-        if issue_ref is None:
-            reply(cfg, thread_id,
-                  f"⚠️ Carry-forward saved LOCALLY only — could not create a GitHub issue "
-                  f"(gh may be down/unauthenticated). Durable file: {cf_file}")
+            # WRITE done — enforce the "always a durable GitHub record" contract (#85 blocker 3):
+            # prefer the issue ref the session wrote into the marker; if it's absent/invalid, the
+            # daemon creates the issue itself from the CF file. Proceed to /compact either way (the
+            # local CF file is a durable record); only warn if even the fallback couldn't record it.
+            if not _cf_owns(tid, token):
+                return
+            issue_ref, _issue_src = _cf_verify_or_create_issue(cfg, thread_id, name, cf_file, marker)
+            if issue_ref is None:
+                reply(cfg, thread_id,
+                      f"⚠️ Carry-forward saved LOCALLY only — could not create a GitHub issue "
+                      f"(gh may be down/unauthenticated). Durable file: {cf_file}")
 
         # PHASE 2 — COMPACT (#101). The WRITE→issue-record step just above runs a gh call
         # (up to ~60s), a window in which a heavy session can pick up a QUEUED turn — so a
         # /compact injected blindly here would QUEUE behind that turn instead of compacting.
         # The old gate then watched for GENERIC busy (esc-to-interrupt / ✽ spinner) and
         # misread that ordinary turn as "compaction started" and its end as "done" → the
-        # false success that left t212 uncompacted. Fix: (1) wait for the pane to actually
+        # false success that left one topic uncompacted. Fix: (1) wait for the pane to actually
         # go IDLE before injecting /compact (so it can't queue), (2) confirm a COMPACTION-
         # specific signal via _cf_wait_compacting (not any busy turn), (3) retry the whole
         # inject a few times. Only a confirmed compaction proceeds to auto-resume.
@@ -7254,12 +7325,15 @@ def _carry_forward_worker(cfg, thread_id, pane, cf_file, marker, token, name):
         # lock BEFORE the send (halts cleanly — the session isn't resumed yet) or finds the
         # flow already gone AFTER (delivered normally). No in-between window can halt an
         # already-resumed session (#88 review r2).
-        if not _cf_inject_owned(tid, token, pane, CF_RESUME_PROMPT.format(path=cf_file),
-                                release_after=True):
+        nudge = (CF_RESUME_PROMPT.format(path=cf_file) if CARRY_FORWARD
+                 else COMPACT_RESUME_PROMPT)
+        if not _cf_inject_owned(tid, token, pane, nudge, release_after=True):
             return
         log(f"carry-forward: auto-resume injected + kill-switch disarmed (topic {thread_id}, pane {pane})")
         reply(cfg, thread_id, "▶️ Compaction done — session resumed from its carry-forward "
-                              "next-steps. Carry-forward complete.")
+                              "next-steps. Carry-forward complete."
+                              if CARRY_FORWARD else
+                              "▶️ Compaction done — the session is working on from the summary.")
     except Exception as e:
         log(f"carry-forward worker error (topic {thread_id}): {e}")
     finally:
@@ -7288,7 +7362,7 @@ def halt_carry_forward(cfg, thread_id, reason):
     # Tell the SESSION, not just the owner (#134). It was already handed the /carryforward
     # instruction; left untold, it completes the protocol and then waits forever for a
     # /compact that can never come — listener armed, inbox drained, every health signal
-    # green — while the owner reads it as ignoring them. Measured on topic 4367
+    # green — while the owner reads it as ignoring them. Measured on a live topic
     # (2026-08-06): three hours parked, recovered by exactly this one line typed by hand.
     # After the pop on purpose: the flow is dead before the pane is told, so a session
     # mid-write cannot see the notice, finish the flow, and be told twice.

@@ -787,7 +787,7 @@ def outbound_echo(cfg, caller, target_id, target_name, text):
     """Show the sender's own topic what it just sent. Telegram only — never an inbox record.
 
     The target's mirror alone leaves each thread holding only the half it received: the
-    first real peer exchange (topics 6258 ↔ 8713) put four questions in one topic and their
+    first real peer exchange between two topics put four questions in one topic and their
     four answers in the other, so neither read as a conversation. This posts the outbound
     half where the sender's own thread already carries its icon.
 

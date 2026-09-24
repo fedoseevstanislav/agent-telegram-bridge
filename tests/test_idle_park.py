@@ -76,7 +76,7 @@ def test_an_idle_session_is_parked(registry, park_env, monkeypatch):
     """C1: kill exactly the pane, stamp ended+parked, release the claim, notify —
     topic left open."""
     tmux_calls, replies = park_env
-    registry({"5935": {"pane": "%1", "name": "x", "session_id": "sid"}})
+    registry({"7001": {"pane": "%1", "name": "x", "session_id": "sid"}})
     _one_sweep(monkeypatch)
 
     with pytest.raises(KeyboardInterrupt):
@@ -87,7 +87,7 @@ def test_an_idle_session_is_parked(registry, park_env, monkeypatch):
         "not surgical (C4): the kill must be the exact examined pane, never the "
         "enclosing session (#274 r1, finding 1)"
     )
-    entry = common.read_registry()["5935"]
+    entry = common.read_registry()["7001"]
     assert entry.get("ended"), "not stamped ended"
     assert entry.get("parked") is True
     assert "park_claim" not in entry, "the claim token must be released after the kill"
@@ -98,12 +98,12 @@ def test_an_idle_session_is_parked(registry, park_env, monkeypatch):
 
 def test_a_parked_entry_is_revivable(registry, park_env, monkeypatch):
     """C3: after the park, the existing message path would revive it."""
-    registry({"5935": {"pane": "%1", "name": "x", "session_id": "sid"}})
+    registry({"7001": {"pane": "%1", "name": "x", "session_id": "sid"}})
     _one_sweep(monkeypatch)
     with pytest.raises(KeyboardInterrupt):
         daemon.idle_park_loop({"bot_token": "t", "chat_id": 1})
 
-    assert daemon.should_auto_revive(common.read_registry()["5935"])
+    assert daemon.should_auto_revive(common.read_registry()["7001"])
 
 
 @pytest.mark.parametrize("why,mutate", [
@@ -112,14 +112,14 @@ def test_a_parked_entry_is_revivable(registry, park_env, monkeypatch):
     ("mid-turn pane", lambda mp, reg: mp.setattr(
         daemon, "pane_is_idle", lambda p: False)),
     ("exempted topic", lambda mp, reg: mp.setattr(
-        daemon, "load_park_exempt", lambda: {"5935"})),
+        daemon, "load_park_exempt", lambda: {"7001"})),
     ("feed topic", lambda mp, reg: common.update_registry(
-        lambda r: r["5935"].__setitem__("feed", True))),
+        lambda r: r["7001"].__setitem__("feed", True))),
     ("dead pane", lambda mp, reg: mp.setattr(daemon, "pane_alive", lambda p: False)),
     ("unageable session", lambda mp, reg: mp.setattr(
         daemon, "_session_last_activity", lambda info: None)),
     ("already ended", lambda mp, reg: common.update_registry(
-        lambda r: r["5935"].__setitem__("ended", "2026-01-01T00:00:00+0000"))),
+        lambda r: r["7001"].__setitem__("ended", "2026-01-01T00:00:00+0000"))),
     ("active carry-forward", lambda mp, reg: mp.setattr(
         daemon, "carry_forward_active", lambda tid: True)),
     ("unread message waiting", lambda mp, reg: mp.setattr(
@@ -136,7 +136,7 @@ def test_a_parked_entry_is_revivable(registry, park_env, monkeypatch):
     ("occupant younger than the idleness", lambda mp, reg: mp.setattr(
         daemon, "_pane_occupant", lambda p, _o=(4242, time.time() - 60): _o)),
     ("stale claim token on the entry", lambda mp, reg: common.update_registry(
-        lambda r: r["5935"].__setitem__("park_claim", "deadbeef"))),
+        lambda r: r["7001"].__setitem__("park_claim", "deadbeef"))),
     ("message drained by a dying listener (r4 f3)", lambda mp, reg: mp.setattr(
         daemon, "recent_inbox_drop",
         lambda tid, now, window=None: {"from": "S", "text": "hi"})),
@@ -146,7 +146,7 @@ def test_a_parked_entry_is_revivable(registry, park_env, monkeypatch):
 def test_never_parked_when(registry, park_env, monkeypatch, why, mutate):
     """C2: every gate refuses on its own."""
     tmux_calls, replies = park_env
-    registry({"5935": {"pane": "%1", "name": "x", "session_id": "sid"}})
+    registry({"7001": {"pane": "%1", "name": "x", "session_id": "sid"}})
     mutate(monkeypatch, None)
     _one_sweep(monkeypatch)
 
@@ -165,7 +165,7 @@ def test_an_occupant_change_during_the_recheck_is_refused(registry, park_env, mo
     persistent shell and only the foreground group changes underneath it. The post-sleep
     battery re-resolves the occupant and refuses."""
     tmux_calls, replies = park_env
-    registry({"5935": {"pane": "%1", "name": "x", "session_id": "sid"}})
+    registry({"7001": {"pane": "%1", "name": "x", "session_id": "sid"}})
     old = (100, time.time() - 8 * 3600)
     new_fg = (200, time.time() - 9 * 3600)  # same shell, new foreground group — old
     occupants = iter([old])                 # enough to predate the transcript too
@@ -178,17 +178,17 @@ def test_an_occupant_change_during_the_recheck_is_refused(registry, park_env, mo
     assert not any("kill-pane" in c for c in tmux_calls), (
         "killed a pane whose foreground occupant changed (#274 r2 f1 / r3 f1)"
     )
-    assert "ended" not in common.read_registry()["5935"]
+    assert "ended" not in common.read_registry()["7001"]
 
 
 def test_an_exemption_added_during_the_recheck_is_honored(registry, park_env, monkeypatch):
     """#274 r3, finding 3: the operator exempts the topic while the sweep sleeps. The
     battery re-reads the exemption file itself, never the sweep's snapshot."""
     tmux_calls, replies = park_env
-    registry({"5935": {"pane": "%1", "name": "x", "session_id": "sid"}})
+    registry({"7001": {"pane": "%1", "name": "x", "session_id": "sid"}})
     exempt = {"now": set()}
     monkeypatch.setattr(daemon, "load_park_exempt", lambda: set(exempt["now"]))
-    _one_sweep(monkeypatch, on_recheck=lambda: exempt.__setitem__("now", {"5935"}))
+    _one_sweep(monkeypatch, on_recheck=lambda: exempt.__setitem__("now", {"7001"}))
 
     with pytest.raises(KeyboardInterrupt):
         daemon.idle_park_loop({"bot_token": "t", "chat_id": 1})
@@ -196,7 +196,7 @@ def test_an_exemption_added_during_the_recheck_is_honored(registry, park_env, mo
     assert not any("kill-pane" in c for c in tmux_calls), (
         "killed a topic the operator had just exempted (#274 r3, finding 3)"
     )
-    assert "ended" not in common.read_registry()["5935"]
+    assert "ended" not in common.read_registry()["7001"]
 
 
 def test_an_exempt_file_turning_unreadable_during_the_recheck_fails_closed(
@@ -205,7 +205,7 @@ def test_an_exempt_file_turning_unreadable_during_the_recheck_fails_closed(
     screen and turns unreadable during the sleep — the battery must fail closed on its
     own, not ride the sweep's earlier read."""
     tmux_calls, _ = park_env
-    registry({"5935": {"pane": "%1", "name": "x", "session_id": "sid"}})
+    registry({"7001": {"pane": "%1", "name": "x", "session_id": "sid"}})
     state = {"exempt": set()}
     monkeypatch.setattr(daemon, "load_park_exempt", lambda: state["exempt"])
     _one_sweep(monkeypatch, on_recheck=lambda: state.__setitem__("exempt", None))
@@ -216,7 +216,7 @@ def test_an_exempt_file_turning_unreadable_during_the_recheck_fails_closed(
     assert not any("kill-pane" in c for c in tmux_calls), (
         "an unreadable exemption authority was treated as empty (#274 r4, finding 4)"
     )
-    assert "ended" not in common.read_registry()["5935"]
+    assert "ended" not in common.read_registry()["7001"]
 
 
 def test_a_message_that_beats_the_kill_is_repaired_by_an_immediate_revive(
@@ -225,7 +225,7 @@ def test_a_message_that_beats_the_kill_is_repaired_by_an_immediate_revive(
     after its own gate passed loses the race — so _park_one re-checks AFTER the kill and
     revives on the spot instead of stranding the topic until a second message."""
     tmux_calls, replies = park_env
-    registry({"5935": {"pane": "%1", "name": "x", "session_id": "sid"}})
+    registry({"7001": {"pane": "%1", "name": "x", "session_id": "sid"}})
     inbox = {"n": 0}
     monkeypatch.setattr(daemon, "unread_count", lambda tid: inbox["n"])
     revived = []
@@ -245,7 +245,7 @@ def test_a_message_that_beats_the_kill_is_repaired_by_an_immediate_revive(
         daemon.idle_park_loop({"bot_token": "t", "chat_id": 1})
 
     assert any("kill-pane" in c for c in tmux_calls)  # the race WAS lost
-    assert revived == ["5935"], (
+    assert revived == ["7001"], (
         "a message that beat the kill left the topic stranded (#274 r3, finding 2)"
     )
 
@@ -254,7 +254,7 @@ def test_the_repair_runs_even_when_the_park_notice_fails(registry, park_env, mon
     """#274 r4, finding 1: nothing between the kill and the repair may skip the repair —
     every post-kill step is individually guarded."""
     tmux_calls, _ = park_env
-    registry({"5935": {"pane": "%1", "name": "x", "session_id": "sid"}})
+    registry({"7001": {"pane": "%1", "name": "x", "session_id": "sid"}})
     inbox = {"n": 0}
     monkeypatch.setattr(daemon, "unread_count", lambda tid: inbox["n"])
     monkeypatch.setattr(daemon, "reply",
@@ -275,7 +275,7 @@ def test_the_repair_runs_even_when_the_park_notice_fails(registry, park_env, mon
     with pytest.raises(KeyboardInterrupt):
         daemon.idle_park_loop({"bot_token": "t", "chat_id": 1})
 
-    assert revived == ["5935"], (
+    assert revived == ["7001"], (
         "a failed park notice skipped the repair for a kill that already happened "
         "(#274 r4, finding 1)"
     )
@@ -285,7 +285,7 @@ def test_an_unreadable_authority_counts_as_a_lost_race(registry, park_env, monke
     """#274 r4, finding 1: each repair authority is sampled in its own guard, and a read
     failure means the race cannot be proven won — repair, don't assume."""
     tmux_calls, _ = park_env
-    registry({"5935": {"pane": "%1", "name": "x", "session_id": "sid"}})
+    registry({"7001": {"pane": "%1", "name": "x", "session_id": "sid"}})
     state = {"killed": False}
     monkeypatch.setattr(daemon, "unread_count",
                         lambda tid: (_ for _ in ()).throw(OSError("inbox unreadable"))
@@ -306,7 +306,7 @@ def test_an_unreadable_authority_counts_as_a_lost_race(registry, park_env, monke
     with pytest.raises(KeyboardInterrupt):
         daemon.idle_park_loop({"bot_token": "t", "chat_id": 1})
 
-    assert revived == ["5935"], (
+    assert revived == ["7001"], (
         "an unreadable inbox was treated as a won race (#274 r4, finding 1)"
     )
 
@@ -316,7 +316,7 @@ def test_a_drained_message_is_reappended_before_the_revive(registry, park_env, m
     to unread_count) is re-appended to the inbox so the revive replays it — a duplicate
     that says so beats a silent lost turn."""
     tmux_calls, _ = park_env
-    registry({"5935": {"pane": "%1", "name": "x", "session_id": "sid"}})
+    registry({"7001": {"pane": "%1", "name": "x", "session_id": "sid"}})
     state = {"killed": False}
     rec = {"from": "S", "text": "the message that was drained", "message_id": 7}
     monkeypatch.setattr(daemon, "recent_inbox_drop",
@@ -340,9 +340,9 @@ def test_a_drained_message_is_reappended_before_the_revive(registry, park_env, m
     with pytest.raises(KeyboardInterrupt):
         daemon.idle_park_loop({"bot_token": "t", "chat_id": 1})
 
-    assert revived == ["5935"]
+    assert revived == ["7001"]
     (path, record), = appended
-    assert path.endswith("topics/5935/inbox.jsonl")
+    assert path.endswith("topics/7001/inbox.jsonl")
     assert "the message that was drained" in record["text"]
     assert "re-delivery" in record["text"], (
         "a replayed message must say it may be a duplicate (#274 r4, finding 3)"
@@ -355,7 +355,7 @@ def test_a_repair_the_revive_machinery_declines_still_tells_the_owner(
     choice, an undeliverable question). When nothing durable is in flight the repair
     says so in the topic — the notice is the recovery path the owner can always see."""
     tmux_calls, replies = park_env
-    registry({"5935": {"pane": "%1", "name": "x", "session_id": "sid"}})
+    registry({"7001": {"pane": "%1", "name": "x", "session_id": "sid"}})
     inbox = {"n": 0}
     monkeypatch.setattr(daemon, "unread_count", lambda tid: inbox["n"])
     monkeypatch.setattr(daemon, "maybe_auto_revive",
@@ -382,13 +382,13 @@ def test_a_repair_the_revive_machinery_declines_still_tells_the_owner(
 def test_a_repair_with_a_real_revive_does_not_warn(registry, park_env, monkeypatch):
     """The inverse pin: when the revive actually claims the topic, no scary notice."""
     tmux_calls, replies = park_env
-    registry({"5935": {"pane": "%1", "name": "x", "session_id": "sid"}})
+    registry({"7001": {"pane": "%1", "name": "x", "session_id": "sid"}})
     inbox = {"n": 0}
     monkeypatch.setattr(daemon, "unread_count", lambda tid: inbox["n"])
 
     def _revive(cfg, tid, cause="auto"):
-        common.update_registry(lambda r: (r["5935"].pop("ended", None),
-                                          r["5935"].pop("parked", None)))
+        common.update_registry(lambda r: (r["7001"].pop("ended", None),
+                                          r["7001"].pop("parked", None)))
     monkeypatch.setattr(daemon, "maybe_auto_revive", _revive)
 
     def _tmux(argv, **kw):
@@ -410,7 +410,7 @@ def test_the_repair_runs_even_when_log_itself_raises(registry, park_env, monkeyp
     """#274 r5, finding 1: `log` writes to stderr and can raise; after a successful kill
     even that must not skip the repair — the repair sits in a finally."""
     tmux_calls, _ = park_env
-    registry({"5935": {"pane": "%1", "name": "x", "session_id": "sid"}})
+    registry({"7001": {"pane": "%1", "name": "x", "session_id": "sid"}})
     state = {"killed": False}
     inbox = {"n": 0}
     monkeypatch.setattr(daemon, "unread_count", lambda tid: inbox["n"])
@@ -435,7 +435,7 @@ def test_the_repair_runs_even_when_log_itself_raises(registry, park_env, monkeyp
     with pytest.raises(KeyboardInterrupt):
         daemon.idle_park_loop({"bot_token": "t", "chat_id": 1})
 
-    assert revived == ["5935"], (
+    assert revived == ["7001"], (
         "a raising log skipped the repair after a successful kill (#274 r5, finding 1)"
     )
 
@@ -445,7 +445,7 @@ def test_a_failed_replay_append_forces_the_resend_notice(registry, park_env, mon
     behind the cursor and nothing will replay it — even a successful revive must not
     silence the notice, and the notice must ask for a resend."""
     tmux_calls, replies = park_env
-    registry({"5935": {"pane": "%1", "name": "x", "session_id": "sid"}})
+    registry({"7001": {"pane": "%1", "name": "x", "session_id": "sid"}})
     state = {"killed": False}
     rec = {"from": "S", "text": "drained", "message_id": 7}
     monkeypatch.setattr(daemon, "recent_inbox_drop",
@@ -454,8 +454,8 @@ def test_a_failed_replay_append_forces_the_resend_notice(registry, park_env, mon
                         lambda path, record: (_ for _ in ()).throw(OSError("disk full")))
 
     def _revive(cfg, tid, cause="auto"):  # the revive SUCCEEDS
-        common.update_registry(lambda r: (r["5935"].pop("ended", None),
-                                          r["5935"].pop("parked", None)))
+        common.update_registry(lambda r: (r["7001"].pop("ended", None),
+                                          r["7001"].pop("parked", None)))
     monkeypatch.setattr(daemon, "maybe_auto_revive", _revive)
 
     def _tmux(argv, **kw):
@@ -482,7 +482,7 @@ def test_durability_is_an_outcome_not_the_in_flight_marker(registry, park_env, m
     live entry or a pending question is. A revive 'in flight' that never lands must
     still produce the owner notice."""
     tmux_calls, replies = park_env
-    registry({"5935": {"pane": "%1", "name": "x", "session_id": "sid"}})
+    registry({"7001": {"pane": "%1", "name": "x", "session_id": "sid"}})
     inbox = {"n": 0}
     monkeypatch.setattr(daemon, "unread_count", lambda tid: inbox["n"])
 
@@ -518,7 +518,7 @@ def test_a_prepared_reopen_record_is_not_durable(registry, park_env, monkeypatch
     future auto-revive until restart — the repair must not call it durable; it clears
     the stuck record (so the next message re-asks) and warns the owner."""
     tmux_calls, replies = park_env
-    registry({"5935": {"pane": "%1", "name": "x", "session_id": "sid"}})
+    registry({"7001": {"pane": "%1", "name": "x", "session_id": "sid"}})
     inbox = {"n": 0}
     monkeypatch.setattr(daemon, "unread_count", lambda tid: inbox["n"])
 
@@ -545,19 +545,19 @@ def test_a_prepared_reopen_record_is_not_durable(registry, park_env, monkeypatch
             "an unanswerable prepared record was treated as durable (#274 r6, f1)"
         )
         with daemon._pending_reopen_lock:
-            assert "5935" not in daemon.pending_reopens, (
+            assert "7001" not in daemon.pending_reopens, (
                 "the stuck prepared record was left to block every future revive"
             )
     finally:
         with daemon._pending_reopen_lock:
-            daemon.pending_reopens.pop("5935", None)
+            daemon.pending_reopens.pop("7001", None)
 
 
 def test_a_delivered_reopen_question_is_durable(registry, park_env, monkeypatch):
     """The inverse pin: an answerable delivered question IS the ask-first durable
     outcome — no warning, record kept."""
     tmux_calls, replies = park_env
-    registry({"5935": {"pane": "%1", "name": "x", "session_id": "sid"}})
+    registry({"7001": {"pane": "%1", "name": "x", "session_id": "sid"}})
     inbox = {"n": 0}
     monkeypatch.setattr(daemon, "unread_count", lambda tid: inbox["n"])
 
@@ -582,16 +582,16 @@ def test_a_delivered_reopen_question_is_durable(registry, park_env, monkeypatch)
 
         assert not any("parked in the same instant" in t for _tid, t in replies)
         with daemon._pending_reopen_lock:
-            assert daemon.pending_reopens.get("5935", {}).get("state") == "delivered"
+            assert daemon.pending_reopens.get("7001", {}).get("state") == "delivered"
     finally:
         with daemon._pending_reopen_lock:
-            daemon.pending_reopens.pop("5935", None)
+            daemon.pending_reopens.pop("7001", None)
 
 
 def test_a_clean_park_does_not_trigger_the_repair(registry, park_env, monkeypatch):
     """The repair only fires on an actually-lost race — a clean park must not revive
     the session it just parked."""
-    registry({"5935": {"pane": "%1", "name": "x", "session_id": "sid"}})
+    registry({"7001": {"pane": "%1", "name": "x", "session_id": "sid"}})
     revived = []
     monkeypatch.setattr(daemon, "maybe_auto_revive",
                         lambda cfg, tid, cause="auto": revived.append(str(tid)))
@@ -600,7 +600,7 @@ def test_a_clean_park_does_not_trigger_the_repair(registry, park_env, monkeypatc
     with pytest.raises(KeyboardInterrupt):
         daemon.idle_park_loop({"bot_token": "t", "chat_id": 1})
 
-    assert common.read_registry()["5935"].get("parked") is True
+    assert common.read_registry()["7001"].get("parked") is True
     assert revived == []
 
 
@@ -609,7 +609,7 @@ def test_a_message_arriving_during_the_recheck_is_refused(registry, park_env, mo
     unread gate runs AFTER the sleep now, so the park refuses and the entry stays live —
     the message is delivered normally, not stranded behind a kill."""
     tmux_calls, replies = park_env
-    registry({"5935": {"pane": "%1", "name": "x", "session_id": "sid"}})
+    registry({"7001": {"pane": "%1", "name": "x", "session_id": "sid"}})
     inbox = {"n": 0}
     monkeypatch.setattr(daemon, "unread_count", lambda tid: inbox["n"])
     _one_sweep(monkeypatch, on_recheck=lambda: inbox.__setitem__("n", 1))
@@ -620,7 +620,7 @@ def test_a_message_arriving_during_the_recheck_is_refused(registry, park_env, mo
     assert not any("kill-pane" in c for c in tmux_calls), (
         "killed a session with a message waiting (#274 r2, finding 2)"
     )
-    entry = common.read_registry()["5935"]
+    entry = common.read_registry()["7001"]
     assert "ended" not in entry and "parked" not in entry
 
 
@@ -628,7 +628,7 @@ def test_transcript_activity_during_the_recheck_is_refused(registry, park_env, m
     """#274 r2, finding 2's delivered-message edge: the session's transcript moved during
     the sleep (a message was typed in and answered). The post-sleep ager sees it."""
     tmux_calls, _ = park_env
-    registry({"5935": {"pane": "%1", "name": "x", "session_id": "sid"}})
+    registry({"7001": {"pane": "%1", "name": "x", "session_id": "sid"}})
     age = {"last": time.time() - 7 * 3600}
     monkeypatch.setattr(daemon, "_session_last_activity", lambda info: age["last"])
     _one_sweep(monkeypatch, on_recheck=lambda: age.__setitem__("last", time.time()))
@@ -646,7 +646,7 @@ def test_a_carry_forward_acquired_during_the_recheck_is_refused(
     """#274 r2, finding 4: /cf installs its pending record while the sweep sleeps; the
     ownership check runs after the sleep and refuses."""
     tmux_calls, _ = park_env
-    registry({"5935": {"pane": "%1", "name": "x", "session_id": "sid"}})
+    registry({"7001": {"pane": "%1", "name": "x", "session_id": "sid"}})
     cf = {"active": False}
     monkeypatch.setattr(daemon, "carry_forward_active", lambda tid: cf["active"])
     _one_sweep(monkeypatch, on_recheck=lambda: cf.__setitem__("active", True))
@@ -663,7 +663,7 @@ def test_an_error_after_the_claim_still_undoes_it(registry, park_env, monkeypatc
     """#274 r2, finding 3: there is no post-claim statement outside the try — any error
     between claim and kill runs the token-guarded undo, leaving the entry live."""
     tmux_calls, replies = park_env
-    registry({"5935": {"pane": "%1", "name": "x", "session_id": "sid"}})
+    registry({"7001": {"pane": "%1", "name": "x", "session_id": "sid"}})
     real_gates = daemon._park_gates_hold
 
     def _gates(tid, pane, pid, cutoff, claim_token=None):
@@ -677,7 +677,7 @@ def test_an_error_after_the_claim_still_undoes_it(registry, park_env, monkeypatc
     with pytest.raises(KeyboardInterrupt):
         daemon.idle_park_loop({"bot_token": "t", "chat_id": 1})
 
-    entry = common.read_registry()["5935"]
+    entry = common.read_registry()["7001"]
     assert "ended" not in entry and "parked" not in entry and "park_claim" not in entry, (
         "an error after the claim left a live pane stamped ended (#274 r2, finding 3)"
     )
@@ -691,14 +691,14 @@ def test_a_same_second_same_pane_restamp_survives_the_undo(
     second. The undo compares the unique token, so pane+timestamp equality can no longer
     fool it — the restamp survives."""
     tmux_calls, _ = park_env
-    registry({"5935": {"pane": "%1", "name": "x", "session_id": "sid"}})
+    registry({"7001": {"pane": "%1", "name": "x", "session_id": "sid"}})
     restamp = {}
 
     def _tmux(argv, **kw):
         tmux_calls.append(argv)
         if argv[:2] == ["tmux", "kill-pane"]:
             def _swap(r):
-                e = r["5935"]
+                e = r["7001"]
                 restamp["stamp"] = e["ended"]  # identical timestamp, identical pane
                 e.pop("park_claim", None)      # our claim is gone — not ours any more
                 e.pop("parked", None)
@@ -712,7 +712,7 @@ def test_a_same_second_same_pane_restamp_survives_the_undo(
     with pytest.raises(KeyboardInterrupt):
         daemon.idle_park_loop({"bot_token": "t", "chat_id": 1})
 
-    assert common.read_registry()["5935"].get("ended") == restamp["stamp"], (
+    assert common.read_registry()["7001"].get("ended") == restamp["stamp"], (
         "the undo popped a same-pane, same-second stamp that was not ours "
         "(#274 r2, finding 3)"
     )
@@ -723,13 +723,13 @@ def test_the_parked_flag_is_visible_the_instant_the_claim_lands(
     """#274 r2, finding 5: `parked` is written IN the claim, not after the kill — a
     message racing the gap snapshots an entry that already says why it ended."""
     tmux_calls, _ = park_env
-    registry({"5935": {"pane": "%1", "name": "x", "session_id": "sid"}})
+    registry({"7001": {"pane": "%1", "name": "x", "session_id": "sid"}})
     seen = {}
 
     def _tmux(argv, **kw):
         tmux_calls.append(argv)
         if argv[:2] == ["tmux", "kill-pane"]:
-            e = common.read_registry()["5935"]
+            e = common.read_registry()["7001"]
             seen["parked"] = e.get("parked")
             seen["ended"] = bool(e.get("ended"))
         return types.SimpleNamespace(returncode=0, stdout="", stderr="")
@@ -749,7 +749,7 @@ def test_the_choice_path_reports_the_parked_cause(registry, monkeypatch):
     """#274 r2, finding 5: a parked LARGE claude session goes through the resume-choice
     question; the revive after the answer must still say the bridge parked it, not that
     the owner reopened the topic."""
-    registry({"5935": {"pane": "%1", "name": "x", "session_id": "sid",
+    registry({"7001": {"pane": "%1", "name": "x", "session_id": "sid",
                        "ended": "2026-09-01T00:00:00+0000", "parked": True}})
     seen = []
     monkeypatch.setattr(daemon, "revive_one",
@@ -758,10 +758,10 @@ def test_the_choice_path_reports_the_parked_cause(registry, monkeypatch):
     monkeypatch.setattr(daemon.threading, "Thread",
                         lambda target=None, daemon=True: type(
                             "T", (), {"start": lambda self: target()})())
-    daemon.pending_reopens.pop("5935", None)
+    daemon.pending_reopens.pop("7001", None)
 
-    assert daemon._revive_with_choice({"bot_token": "t", "chat_id": 1}, "5935",
-                                      common.read_registry()["5935"], "compact")
+    assert daemon._revive_with_choice({"bot_token": "t", "chat_id": 1}, "7001",
+                                      common.read_registry()["7001"], "compact")
     assert seen == ["parked"], (
         "the choice path reported 'reopen' for a bridge-parked session (#274 r2, f5)"
     )
@@ -770,7 +770,7 @@ def test_the_choice_path_reports_the_parked_cause(registry, monkeypatch):
 def test_the_choice_path_keeps_reopen_for_unparked_sessions(registry, monkeypatch):
     """The inverse pin: a session that died on its own and was reopened by the owner
     still reports 'reopen' — the parked cause never leaks onto real reopens."""
-    registry({"5935": {"pane": "%1", "name": "x", "session_id": "sid",
+    registry({"7001": {"pane": "%1", "name": "x", "session_id": "sid",
                        "ended": "2026-09-01T00:00:00+0000"}})
     seen = []
     monkeypatch.setattr(daemon, "revive_one",
@@ -779,10 +779,10 @@ def test_the_choice_path_keeps_reopen_for_unparked_sessions(registry, monkeypatc
     monkeypatch.setattr(daemon.threading, "Thread",
                         lambda target=None, daemon=True: type(
                             "T", (), {"start": lambda self: target()})())
-    daemon.pending_reopens.pop("5935", None)
+    daemon.pending_reopens.pop("7001", None)
 
-    assert daemon._revive_with_choice({"bot_token": "t", "chat_id": 1}, "5935",
-                                      common.read_registry()["5935"], "compact")
+    assert daemon._revive_with_choice({"bot_token": "t", "chat_id": 1}, "7001",
+                                      common.read_registry()["7001"], "compact")
     assert seen == ["reopen"]
 
 
@@ -800,13 +800,13 @@ def test_a_failed_kill_undoes_the_claim(registry, park_env, monkeypatch):
         return types.SimpleNamespace(returncode=0, stdout="", stderr="")
 
     monkeypatch.setattr(daemon, "_tmux", _tmux)
-    registry({"5935": {"pane": "%1", "name": "x", "session_id": "sid"}})
+    registry({"7001": {"pane": "%1", "name": "x", "session_id": "sid"}})
     _one_sweep(monkeypatch)
 
     with pytest.raises(KeyboardInterrupt):
         daemon.idle_park_loop({"bot_token": "t", "chat_id": 1})
 
-    entry = common.read_registry()["5935"]
+    entry = common.read_registry()["7001"]
     assert "ended" not in entry and "parked" not in entry and "park_claim" not in entry, (
         "claim not undone"
     )
@@ -817,15 +817,15 @@ def test_the_undo_never_pops_a_newer_stamp(registry, park_env, monkeypatch):
     """The r1 ABA: our claim is cleared by a revive, a NEWER legitimate stamp lands on a
     different pane, our undo runs — the newer stamp must survive."""
     tmux_calls, replies = park_env
-    registry({"5935": {"pane": "%1", "name": "x", "session_id": "sid"}})
+    registry({"7001": {"pane": "%1", "name": "x", "session_id": "sid"}})
     newer = "2026-09-01T23:59:59+0000"
 
     def _tmux(argv, **kw):
         tmux_calls.append(argv)
         if argv[:2] == ["tmux", "kill-pane"]:
             common.update_registry(lambda r: (
-                r["5935"].pop("park_claim", None),
-                r["5935"].update({"pane": "%2", "ended": newer})))
+                r["7001"].pop("park_claim", None),
+                r["7001"].update({"pane": "%2", "ended": newer})))
             return types.SimpleNamespace(returncode=1, stdout="", stderr="")
         return types.SimpleNamespace(returncode=0, stdout="", stderr="")
 
@@ -835,7 +835,7 @@ def test_the_undo_never_pops_a_newer_stamp(registry, park_env, monkeypatch):
     with pytest.raises(KeyboardInterrupt):
         daemon.idle_park_loop({"bot_token": "t", "chat_id": 1})
 
-    assert common.read_registry()["5935"].get("ended") == newer, (
+    assert common.read_registry()["7001"].get("ended") == newer, (
         "the guarded undo popped a stamp that was not ours (#274 r1, finding 3)"
     )
 
@@ -844,15 +844,15 @@ def test_a_revive_between_claim_and_gates_aborts_the_park(registry, park_env, mo
     """#274 r1, finding 2: a revive lands immediately after the claim — the under-claim
     battery sees the token gone and abandons; nothing is killed."""
     tmux_calls, replies = park_env
-    registry({"5935": {"pane": "%1", "name": "x", "session_id": "sid"}})
+    registry({"7001": {"pane": "%1", "name": "x", "session_id": "sid"}})
     real_claim = daemon._claim_park
 
     def _claim_then_revive(tid, pane):
         token = real_claim(tid, pane)
         if token:  # the revive lands immediately after the claim, as _bind would
             common.update_registry(lambda r: (
-                r["5935"].pop("ended", None), r["5935"].pop("parked", None),
-                r["5935"].pop("park_claim", None)))
+                r["7001"].pop("ended", None), r["7001"].pop("parked", None),
+                r["7001"].pop("park_claim", None)))
         return token
 
     monkeypatch.setattr(daemon, "_claim_park", _claim_then_revive)
@@ -871,15 +871,15 @@ def test_a_revive_during_the_under_claim_battery_still_aborts_before_the_kill(
     """The LAST window that is still checkable: a revive lands while the under-claim
     battery is mid-pass — the final token look immediately before the kill catches it."""
     tmux_calls, replies = park_env
-    registry({"5935": {"pane": "%1", "name": "x", "session_id": "sid"}})
+    registry({"7001": {"pane": "%1", "name": "x", "session_id": "sid"}})
 
     def _idle_and_revive(pane):
         # pane_is_idle is the battery's last gate; a revive landing here has passed
         # every registry check already
-        if common.read_registry().get("5935", {}).get("park_claim"):
+        if common.read_registry().get("7001", {}).get("park_claim"):
             common.update_registry(lambda r: (
-                r["5935"].pop("ended", None), r["5935"].pop("parked", None),
-                r["5935"].pop("park_claim", None)))
+                r["7001"].pop("ended", None), r["7001"].pop("parked", None),
+                r["7001"].pop("park_claim", None)))
         return True
 
     monkeypatch.setattr(daemon, "pane_is_idle", _idle_and_revive)
@@ -897,27 +897,27 @@ def test_a_rebound_topic_is_not_parked(registry, park_env, monkeypatch):
     """The #237 fence carries over: if a revive rebinds the topic between the sweep's
     read and the claim, the claim refuses and nothing is killed."""
     tmux_calls, replies = park_env
-    registry({"5935": {"pane": "%NEW", "name": "x", "session_id": "sid"}})
+    registry({"7001": {"pane": "%NEW", "name": "x", "session_id": "sid"}})
     monkeypatch.setattr(daemon, "read_registry",
-                        lambda: {"5935": {"pane": "%1", "name": "x", "session_id": "sid"}})
+                        lambda: {"7001": {"pane": "%1", "name": "x", "session_id": "sid"}})
     _one_sweep(monkeypatch)
 
     with pytest.raises(KeyboardInterrupt):
         daemon.idle_park_loop({"bot_token": "t", "chat_id": 1})
 
     assert not any("kill-pane" in c or "kill-session" in c for c in tmux_calls)
-    assert "ended" not in common.read_registry()["5935"]
+    assert "ended" not in common.read_registry()["7001"]
 
 
 def test_a_parked_entry_revives_with_the_parked_cause(registry, park_env, monkeypatch):
     """#274 r1, finding 5: the ordinary-message revive must say the bridge parked the
     session, not that the terminal died."""
-    registry({"5935": {"pane": "%1", "name": "x", "session_id": "sid"}})
+    registry({"7001": {"pane": "%1", "name": "x", "session_id": "sid"}})
     _one_sweep(monkeypatch)
     with pytest.raises(KeyboardInterrupt):
         daemon.idle_park_loop({"bot_token": "t", "chat_id": 1})
 
-    entry = common.read_registry()["5935"]
+    entry = common.read_registry()["7001"]
     assert entry.get("parked") is True
 
     seen = []
@@ -929,8 +929,8 @@ def test_a_parked_entry_revives_with_the_parked_cause(registry, park_env, monkey
     monkeypatch.setattr(daemon.threading, "Thread",
                         lambda target=None, daemon=True: type(
                             "T", (), {"start": lambda self: target()})())
-    daemon.pending_reopens.pop("5935", None)
-    daemon.maybe_auto_revive({"bot_token": "t", "chat_id": 1}, "5935")
+    daemon.pending_reopens.pop("7001", None)
+    daemon.maybe_auto_revive({"bot_token": "t", "chat_id": 1}, "7001")
 
     assert seen == ["parked"], (
         "a parked session's revive reported a death that was not one (#274 r1, f5)"

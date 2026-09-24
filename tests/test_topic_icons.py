@@ -237,9 +237,9 @@ def test_a_failed_fetch_is_cached_too_so_it_is_not_retried_per_topic(monkeypatch
 
 
 REG = {
-    "33": {"name": "Telegram bridge build"},
-    "11445": {"name": "security"},
-    "1061": {"name": "Gym training", "topic_icon": "🩺"},   # already correct
+    "7033": {"name": "Telegram bridge build"},
+    "7040": {"name": "security"},
+    "7011": {"name": "Gym training", "topic_icon": "🩺"},   # already correct
     "9999": {"name": "POS Choice"},                          # no rule
     "8888": {"name": "old build", "ended": True},
     "7777": {"name": "build feed", "feed": True},
@@ -249,7 +249,7 @@ REG = {
 def test_the_plan_covers_only_live_topics_that_would_change():
     plan = cli.retheme_plan(CFG, REG)
 
-    assert [(tid, want) for tid, _n, _c, want in plan] == [(33, "💻"), (11445, "👮‍♂️")]
+    assert [(tid, want) for tid, _n, _c, want in plan] == [(7033, "💻"), (7040, "👮‍♂️")]
 
 
 def test_retheme_writes_nothing_without_apply(monkeypatch, capsys):
@@ -277,9 +277,9 @@ def test_retheme_with_apply_edits_each_changed_topic_once(monkeypatch, capsys):
     cli.cmd_retheme(CFG, type("A", (), {"apply": True})())
 
     edits = fake.of("editForumTopic")
-    assert [e["message_thread_id"] for e in edits] == [33, 11445]
+    assert [e["message_thread_id"] for e in edits] == [7033, 7040]
     assert edits[0]["icon_custom_emoji_id"] == f"id-{FREE_SET.index('💻')}"
-    assert reg["33"]["topic_icon"] == "💻" and reg["11445"]["topic_icon"] == "👮‍♂️"
+    assert reg["7033"]["topic_icon"] == "💻" and reg["7040"]["topic_icon"] == "👮‍♂️"
     assert "applied to 2" in capsys.readouterr().out
     # rerunning is a no-op now that the registry records what was set
     assert cli.retheme_plan(CFG, reg) == []
@@ -290,7 +290,7 @@ def test_one_refused_topic_does_not_stop_the_batch(monkeypatch, capsys):
 
     class Refusing(FakeApi):
         def __call__(self, token, method, params, **kw):
-            if method == "editForumTopic" and params.get("message_thread_id") == 33:
+            if method == "editForumTopic" and params.get("message_thread_id") == 7033:
                 self.calls.append((method, params))
                 raise RuntimeError("topic was closed")
             return super().__call__(token, method, params, **kw)
@@ -302,8 +302,8 @@ def test_one_refused_topic_does_not_stop_the_batch(monkeypatch, capsys):
 
     cli.cmd_retheme(CFG, type("A", (), {"apply": True})())
 
-    assert "topic_icon" not in reg["33"]          # not recorded — it never landed
-    assert reg["11445"]["topic_icon"] == "👮‍♂️"   # the rest of the batch still ran
+    assert "topic_icon" not in reg["7033"]          # not recorded — it never landed
+    assert reg["7040"]["topic_icon"] == "👮‍♂️"   # the rest of the batch still ran
     assert "applied to 1" in capsys.readouterr().out
 
 
@@ -378,7 +378,7 @@ SIG_REG = {
     "201": {"name": "Telegram bridge build", "icon": "🦊"},        # generic -> subject
     "202": {"name": "Gym training", "icon": "💪"},                 # hand-set, must not move
     "204": {"name": "Willow Harbour", "icon": "🐙"},               # no rule -> keep
-    "205": {"name": "bridge daemon debug", "icon": "🦉"},          # collides with 33
+    "205": {"name": "bridge daemon debug", "icon": "🦉"},          # collides with 7033
     "206": {"name": "old build", "icon": "🐳", "ended": True},     # ended -> skipped
     "207": {"name": "build feed", "icon": "📡", "feed": True},     # feed -> skipped
     "208": {"name": "security", "icon": "⚡"},                      # generic -> subject

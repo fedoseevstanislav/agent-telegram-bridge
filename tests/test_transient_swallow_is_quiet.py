@@ -17,7 +17,7 @@ from bridge import daemon
 
 
 PANE = "%290"
-TOPIC = 5935
+TOPIC = 7001
 
 
 @pytest.fixture(autouse=True)

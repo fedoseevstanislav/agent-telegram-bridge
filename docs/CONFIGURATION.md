@@ -100,6 +100,23 @@ Each engine is independent; setting one does not set the other. A malformed valu
 string, a list, anything that is not a string per engine — grants no flags rather than
 guessing, because the only safe direction to guess here is fewer permissions.
 
+### `revive_model_map` — object
+
+Which model a sleeping Claude session wakes on. A revive normally resumes the session on the
+model its transcript last recorded; this maps that model to another one.
+
+```json
+"revive_model_map": {
+  "claude-opus-5": "claude-opus-5-5[1m]"
+}
+```
+
+Use it when the fleet moves to a newer model: every parked session that last ran the old one
+wakes on the new one, keeping its own effort, without being woken now to switch. It is also
+the only way a revived session gets the 1M window back, because the transcript records the
+model without the `[1m]` suffix. Sessions whose model is not a key wake as before, and a
+missing or malformed map changes nothing.
+
 ### `issue_queue` — object
 
 Adds a work-queue line to the pinned dashboard and the morning digest, counting open issues by
@@ -144,7 +161,8 @@ environment of the session running `tg-bridge`, and the daemon never sees it.
 | `TG_BRIDGE_SPAWN_MODEL` | `claude-opus-4-8[1m]` | Model for spawned claude sessions. Spawning with no explicit model rides the account default, which is how one model's disablement once broke every session at once. |
 | `TG_BRIDGE_CODEX_MODEL` | `0` | Set to `1` to let `/model <alias>` switch a running **codex** session. It gates typing the slash command into the pane; it adds no process argument. Off by default because the switch is not verified against every codex build. |
 | `TG_BRIDGE_TZ_OFFSET` | `3` | Hours from UTC for times shown to you. |
-| `TG_BRIDGE_AUTOCF_PCT` | `60` | Context percentage at which a session is asked to carry forward before compaction. |
+| `TG_BRIDGE_AUTOCF_PCT` | `50` (`60` when the carry-forward cycle is on) | Context percentage at which the daemon compacts the session. |
+| `TG_BRIDGE_CARRY_FORWARD` | `0` | `1` restores the pre-2026-09-21 carry-forward cycle (write → GitHub issue → `/compact` → resume-from-next-steps) **and** its 60 % threshold. Off, the daemon types `/compact` at the threshold and the session continues from the built-in summary. |
 | `TG_BRIDGE_TOPIC` | unset | Pin the CLI to one topic. Resolution order is `--topic`, then this, then a `.tg-bridge-topic` file in the working directory — there is no `TMUX_PANE` fallback here; that is a separate mechanism the daemon uses to find a pane. **Read by the `tg-bridge` CLI on every invocation, not by the daemon** — so it belongs in the environment of whatever runs `tg-bridge`, and restarting the daemon neither sets it nor is needed to change it. |
 | `TG_BRIDGE_DASH_POLL` | `60` | Seconds between fleet-dashboard rebuilds. |
 | `TG_BRIDGE_CTX_POLL` | `30` | Seconds between context readings. |

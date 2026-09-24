@@ -1,7 +1,7 @@
 """Unit tests for the outbound echo into the sender's own topic (#140).
 
 `notify` mirrored only into the recipient's topic, so each thread held just the half of the
-conversation it received. The first real peer exchange (topics 6258 ↔ 8713, 2026-08-10) put
+conversation it received. The first real peer exchange between two topics (2026-08-10) put
 four questions in one topic and their four answers in the other: reading either one, the owner
 saw replies with nothing they answered. Every hop had reached Telegram; neither thread read
 as a conversation.

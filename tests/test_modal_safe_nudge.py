@@ -65,7 +65,7 @@ CODEX_APPROVAL_MODAL = """\
   2. Yes, and don't ask again for this command in this session
   3. No, and tell Codex what to do differently"""
 
-NUDGE = "[tg-bridge] New Telegram message in your topic — run `tg-bridge recv --topic 33` and act on it."
+NUDGE = "[tg-bridge] New Telegram message in your topic — run `tg-bridge recv --topic 7033` and act on it."
 
 # Captured before any fixture patches it. `_no_sleep` patches daemon.time.sleep, which IS
 # the shared time module, so a fake that called time.sleep() would be silenced along with
@@ -629,11 +629,11 @@ def test_an_interrupt_writes_under_the_pane_lock(monkeypatch):
     long input. Written inside another injection's capture→type→capture window it raises that
     injection's chip count and authorises ITS Enter — onto whatever the interrupt brought up."""
     trace = _lock_trace(monkeypatch)
-    monkeypatch.setattr(daemon, "read_registry", lambda: {"33": {"pane": "%1"}})
+    monkeypatch.setattr(daemon, "read_registry", lambda: {"7033": {"pane": "%1"}})
     monkeypatch.setattr(daemon, "pane_alive", lambda _p: True)
     monkeypatch.setattr(daemon, "reply", lambda *_a, **_k: True)
 
-    daemon.interrupt_session({}, 33, "please stop and " + "explain yourself " * 40)
+    daemon.interrupt_session({}, 7033, "please stop and " + "explain yourself " * 40)
     assert _writes_are_locked(trace), trace
 
 
@@ -671,11 +671,11 @@ def _lock_trace_over(monkeypatch, pane):
 def test_the_command_relay_writes_under_the_pane_lock(monkeypatch):
     pane = FakePane(CLAUDE_IDLE)
     trace = _lock_trace_over(monkeypatch, pane)
-    monkeypatch.setattr(daemon, "read_registry", lambda: {"33": {"pane": "%1"}})
+    monkeypatch.setattr(daemon, "read_registry", lambda: {"7033": {"pane": "%1"}})
     monkeypatch.setattr(daemon, "pane_alive", lambda _p: True)
     monkeypatch.setattr(daemon, "reply", lambda *_a, **_k: True)
 
-    daemon.handle_command({}, 33, "/status")
+    daemon.handle_command({}, 7033, "/status")
     assert _writes_are_locked(trace), trace
     assert pane.submitted == ["/status"]        # and it really was delivered
 
@@ -683,14 +683,14 @@ def test_the_command_relay_writes_under_the_pane_lock(monkeypatch):
 def test_the_model_switch_writes_under_the_pane_lock(monkeypatch):
     pane = FakePane(CLAUDE_IDLE)
     trace = _lock_trace_over(monkeypatch, pane)
-    monkeypatch.setattr(daemon, "read_registry", lambda: {"33": {"pane": "%1"}})
+    monkeypatch.setattr(daemon, "read_registry", lambda: {"7033": {"pane": "%1"}})
     monkeypatch.setattr(daemon, "pane_alive", lambda _p: True)
     monkeypatch.setattr(daemon, "engine_of_pane", lambda _p: "claude")
     monkeypatch.setattr(daemon, "pane_is_idle", lambda _p: True)
     monkeypatch.setattr(daemon, "reply", lambda *_a, **_k: True)
-    daemon._pending_model["33"] = "opus"
+    daemon._pending_model["7033"] = "opus"
 
-    daemon._try_send_model({}, 33, "opus", "%1", "claude", 1)
+    daemon._try_send_model({}, 7033, "opus", "%1", "claude", 1)
     assert _writes_are_locked(trace), trace
     assert pane.submitted == ["/model opus"]
 
@@ -1030,9 +1030,9 @@ def test_cf_clear_modal_takes_the_pane_lock_and_rechecks(monkeypatch):
 
     monkeypatch.setattr(daemon, "_pane_lock", traced)
     monkeypatch.setattr(daemon, "_tmux", fake)
-    monkeypatch.setattr(daemon, "_pending_cf", {"33": {"token": "tok"}})
+    monkeypatch.setattr(daemon, "_pending_cf", {"7033": {"token": "tok"}})
 
-    assert daemon._cf_clear_modal("33", "tok", "%1") is True
+    assert daemon._cf_clear_modal("7033", "tok", "%1") is True
     steps = [s for s, _ in order]
     assert steps == ["lock", "capture", "Enter", "unlock"], order
     # and the capture must be the visible screen only: a ❯-block left in scrollback from
@@ -1058,7 +1058,7 @@ def test_maybe_nudge_reports_a_pane_that_keeps_swallowing(monkeypatch):
     monkeypatch.setattr(daemon, "report_blocked_pane",
                         lambda tid, p, what: reported.append((tid, p, what)))
 
-    assert daemon.maybe_nudge(33, "%1") is False
+    assert daemon.maybe_nudge(7033, "%1") is False
     assert pane.enters == 0
     assert reported == []            # one swallow is not yet news
 
@@ -1069,12 +1069,12 @@ def test_maybe_nudge_reports_a_pane_that_keeps_swallowing(monkeypatch):
     for _ in range(daemon.SWALLOW_MAX_ATTEMPTS + 2):
         if daemon.pane_is_persistently_swallowing("%1"):
             break
-        assert daemon.maybe_nudge(33, "%1") is False
+        assert daemon.maybe_nudge(7033, "%1") is False
     else:
         raise AssertionError(
             "the pane never reached the cap: type_line stopped counting swallows, "
             "so this test can no longer prove the report still fires")
-    assert reported and reported[0][0] == 33
+    assert reported and reported[0][0] == 7033
     assert pane.enters == 0          # and still no Enter on the picker
 
 
@@ -1086,7 +1086,7 @@ def test_maybe_nudge_is_silent_on_a_normal_pane(monkeypatch):
     reported = []
     monkeypatch.setattr(daemon, "report_blocked_pane",
                         lambda *a: reported.append(a))
-    assert daemon.maybe_nudge(33, "%1") is True
+    assert daemon.maybe_nudge(7033, "%1") is True
     assert pane.enters == 1
     assert reported == []
 
@@ -1097,8 +1097,8 @@ def test_blocked_report_is_rate_limited(monkeypatch):
     sent = []
     monkeypatch.setattr(daemon, "reply",
                         lambda cfg, tid, text: bool(sent.append(text)) or True)
-    assert daemon.report_blocked_pane(33, "%1", "a message") is True
-    assert daemon.report_blocked_pane(33, "%1", "a message") is False   # cooldown
+    assert daemon.report_blocked_pane(7033, "%1", "a message") is True
+    assert daemon.report_blocked_pane(7033, "%1", "a message") is False   # cooldown
     assert len(sent) == 1
 
 
@@ -1116,8 +1116,8 @@ def test_a_failed_report_does_not_buy_30_minutes_of_silence(monkeypatch):
         return True                      # reply() reports delivery since #161
 
     monkeypatch.setattr(daemon, "reply", flaky)
-    assert daemon.report_blocked_pane(33, "%1", "a message") is False
-    assert daemon.report_blocked_pane(33, "%1", "a message") is True   # not suppressed
+    assert daemon.report_blocked_pane(7033, "%1", "a message") is False
+    assert daemon.report_blocked_pane(7033, "%1", "a message") is True   # not suppressed
     assert len(attempts) == 2
 
 
@@ -1130,7 +1130,7 @@ def test_swallowed_briefing_is_retried(monkeypatch):
     monkeypatch.setattr(daemon, "type_line", lambda *a, **k: "swallowed")
     monkeypatch.setattr(daemon, "report_blocked_pane", lambda *a: True)
     # Bound to this pane: the #238 delivery guard now runs on every attempt.
-    monkeypatch.setattr(daemon, "read_registry", lambda: {"8265": {"pane": "%1"}})
+    monkeypatch.setattr(daemon, "read_registry", lambda: {"7004": {"pane": "%1"}})
     monkeypatch.setattr(daemon, "current_boot_id", lambda: "boot-1")
     marked = []
     monkeypatch.setattr(daemon, "update_registry", lambda fn: marked.append(fn))
@@ -1138,7 +1138,7 @@ def test_swallowed_briefing_is_retried(monkeypatch):
                         lambda delay, fn, args=(), kwargs=None: timers.append((delay, args)) or
                         types.SimpleNamespace(start=lambda: None))
 
-    daemon.deliver_briefing("%1", "8265", "codex", "brief {tid}")
+    daemon.deliver_briefing("%1", "7004", "codex", "brief {tid}")
     assert marked == []                                   # never marked briefed
     assert len(timers) == 1
     assert timers[0][0] == daemon.BRIEFING_RETRY_DELAY
@@ -1152,11 +1152,11 @@ def test_a_retry_abandons_a_rebound_pane(monkeypatch):
     typed = []
     monkeypatch.setattr(daemon, "pane_alive", lambda _p: True)
     monkeypatch.setattr(daemon, "type_line", lambda p, t, **k: typed.append((p, t)) or "sent")
-    monkeypatch.setattr(daemon, "read_registry", lambda: {"8265": {"pane": "%new"}})
+    monkeypatch.setattr(daemon, "read_registry", lambda: {"7004": {"pane": "%new"}})
     marked = []
     monkeypatch.setattr(daemon, "update_registry", lambda fn: marked.append(fn))
 
-    daemon.deliver_briefing("%old", "8265", "codex", "brief {tid}", attempt=2)
+    daemon.deliver_briefing("%old", "7004", "codex", "brief {tid}", attempt=2)
     assert typed == []          # nothing typed into the pane that now serves someone else
     assert marked == []         # and the topic is not falsely marked briefed
 
@@ -1169,10 +1169,10 @@ def test_a_retry_abandons_a_topic_already_briefed(monkeypatch):
     monkeypatch.setattr(daemon, "type_line", lambda p, t, **k: typed.append((p, t)) or "sent")
     monkeypatch.setattr(daemon, "current_boot_id", lambda: "boot-1")
     monkeypatch.setattr(daemon, "read_registry",
-                        lambda: {"8265": {"pane": "%1", "briefed_boot": "boot-1"}})
+                        lambda: {"7004": {"pane": "%1", "briefed_boot": "boot-1"}})
     monkeypatch.setattr(daemon, "update_registry", lambda fn: None)
 
-    daemon.deliver_briefing("%1", "8265", "codex", "brief {tid}", attempt=2)
+    daemon.deliver_briefing("%1", "7004", "codex", "brief {tid}", attempt=2)
     assert typed == []
 
 
@@ -1190,7 +1190,7 @@ def test_first_attempt_consults_the_registry_and_abandons_an_unbound_pane(monkey
     monkeypatch.setattr(daemon, "update_registry", lambda fn: None)
     monkeypatch.setattr(daemon, "current_boot_id", lambda: "boot-1")
 
-    daemon.deliver_briefing("%1", "8265", "codex", "brief {tid}")
+    daemon.deliver_briefing("%1", "7004", "codex", "brief {tid}")
     assert typed == [], "typed a briefing into a pane the registry does not bind (#238)"
 
 
@@ -1199,7 +1199,7 @@ def test_giving_up_on_a_briefing_forces_the_escalation(monkeypatch):
     empty inbox the sweep is not a fallback — so the last attempt must not go quiet."""
     monkeypatch.setattr(daemon, "pane_alive", lambda _p: True)
     monkeypatch.setattr(daemon, "type_line", lambda *a, **k: "swallowed")
-    monkeypatch.setattr(daemon, "read_registry", lambda: {"8265": {"pane": "%1"}})
+    monkeypatch.setattr(daemon, "read_registry", lambda: {"7004": {"pane": "%1"}})
     monkeypatch.setattr(daemon, "update_registry", lambda fn: None)
     monkeypatch.setattr(daemon, "current_boot_id", lambda: "boot-1")
     monkeypatch.setattr(daemon.threading, "Timer",
@@ -1208,11 +1208,11 @@ def test_giving_up_on_a_briefing_forces_the_escalation(monkeypatch):
     monkeypatch.setattr(daemon, "report_blocked_pane",
                         lambda tid, p, what: reports.append(what))
 
-    daemon._blocked_reported["8265"] = time.time()          # inside the normal cooldown
-    daemon.deliver_briefing("%1", "8265", "codex", "brief {tid}",
+    daemon._blocked_reported["7004"] = time.time()          # inside the normal cooldown
+    daemon.deliver_briefing("%1", "7004", "codex", "brief {tid}",
                             attempt=daemon.BRIEFING_MAX_ATTEMPTS)
     assert len(reports) == 1 and "final attempt" in reports[0]
-    assert "8265" not in daemon._blocked_reported            # cooldown cleared to force it
+    assert "7004" not in daemon._blocked_reported            # cooldown cleared to force it
 
 
 def test_briefing_retries_are_bounded(monkeypatch):
@@ -1225,7 +1225,7 @@ def test_briefing_retries_are_bounded(monkeypatch):
                         lambda delay, fn, args=(), kwargs=None: timers.append(args) or
                         types.SimpleNamespace(start=lambda: None))
 
-    daemon.deliver_briefing("%1", "8265", "codex", "brief {tid}",
+    daemon.deliver_briefing("%1", "7004", "codex", "brief {tid}",
                             attempt=daemon.BRIEFING_MAX_ATTEMPTS)
     assert timers == []                                   # gives up instead of looping
 
@@ -1238,14 +1238,14 @@ def test_carry_forward_inject_is_verified(monkeypatch):
     reported = []
     monkeypatch.setattr(daemon, "report_blocked_pane",
                         lambda tid, p, what: reported.append((tid, what)))
-    daemon._pending_cf["8265"] = {"token": "tok", "pane": "%1"}
+    daemon._pending_cf["7004"] = {"token": "tok", "pane": "%1"}
     try:
-        assert daemon._cf_inject_owned("8265", "tok", "%1", "carry-forward prompt") is False
+        assert daemon._cf_inject_owned("7004", "tok", "%1", "carry-forward prompt") is False
         assert pane.enters == 0
-        assert reported and reported[0][0] == "8265"
-        assert "8265" in daemon._pending_cf          # flow not released on a failed inject
+        assert reported and reported[0][0] == "7004"
+        assert "7004" in daemon._pending_cf          # flow not released on a failed inject
     finally:
-        daemon._pending_cf.pop("8265", None)
+        daemon._pending_cf.pop("7004", None)
 
 
 def test_blocked_report_shows_the_prompt_and_fences_it(monkeypatch):
@@ -1255,7 +1255,7 @@ def test_blocked_report_shows_the_prompt_and_fences_it(monkeypatch):
     sent = []
     monkeypatch.setattr(daemon, "reply",
                         lambda cfg, tid, text: bool(sent.append(text)) or True)
-    daemon.report_blocked_pane(33, "%1", "a new Telegram message")
+    daemon.report_blocked_pane(7033, "%1", "a new Telegram message")
     body = sent[0]
     assert "Switch to gpt-5.6-luna" in body          # The owner sees the actual prompt
     assert body.count("```") == 2                    # a backtick in the capture can't break out
@@ -1371,12 +1371,12 @@ def test_cf_clear_modal_refuses_enter_on_dont_ask_me_again(monkeypatch):
         return types.SimpleNamespace(returncode=0, stdout="", stderr="")
 
     monkeypatch.setattr(daemon, "_tmux", fake)
-    monkeypatch.setattr(daemon, "_pending_cf", {"33": {"token": "tok"}})
+    monkeypatch.setattr(daemon, "_pending_cf", {"7033": {"token": "tok"}})
     reported = []
     monkeypatch.setattr(daemon, "report_blocked_pane",
                         lambda tid, pane, what: reported.append(what))
 
-    assert daemon._cf_clear_modal("33", "tok", "%1") is False
+    assert daemon._cf_clear_modal("7033", "tok", "%1") is False
     assert keys == [], "pressed Enter on 'Don't ask me again' — that is permanent (A2)"
     assert reported and "permanently" in reported[0], "refused silently"
 
@@ -1398,7 +1398,7 @@ def test_cf_clear_modal_still_clears_an_ordinary_modal(monkeypatch):
         return types.SimpleNamespace(returncode=0, stdout="", stderr="")
 
     monkeypatch.setattr(daemon, "_tmux", fake)
-    monkeypatch.setattr(daemon, "_pending_cf", {"33": {"token": "tok"}})
+    monkeypatch.setattr(daemon, "_pending_cf", {"7033": {"token": "tok"}})
 
-    assert daemon._cf_clear_modal("33", "tok", "%1") is True
+    assert daemon._cf_clear_modal("7033", "tok", "%1") is True
     assert keys == ["Enter"]

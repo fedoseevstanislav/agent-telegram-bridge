@@ -410,6 +410,10 @@ def _worker_harness(session, monkeypatch, *, compacting, late_write=LATE_WRITE):
             daemon._pending_cf.pop(str(tid), None)
         return True
 
+    # This harness drives the CARRY-FORWARD CYCLE (it stubs the write phase and asserts its
+    # wording), and the cycle is off by default since 2026-09-21 — switch it on so these
+    # tests keep testing PHASE 2 rather than the new default (see tests/test_compact_only.py).
+    monkeypatch.setattr(daemon, "CARRY_FORWARD", True)
     monkeypatch.setattr(daemon, "_cf_compacting", lambda _p: compacting)
     monkeypatch.setattr(daemon, "_cf_inject_owned", fake_inject)
     monkeypatch.setattr(daemon, "_cf_cleanup_marker", lambda *_a, **_k: None)

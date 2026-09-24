@@ -16,7 +16,7 @@ import pytest
 from bridge import cli, common
 
 CFG = {"bot_token": "123:AA", "chat_id": -100}
-TOPIC = 33
+TOPIC = 7033
 
 
 @pytest.fixture

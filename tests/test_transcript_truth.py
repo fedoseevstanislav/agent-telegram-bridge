@@ -328,8 +328,8 @@ def test_a_submitted_payload_is_confirmed():
 
 
 def test_confirmation_survives_the_wrapping_the_pane_adds():
-    payload = "please drain topic 33 and act on it"
-    wrapped = _user("please drain topic 33\n  and act on it")
+    payload = "please drain topic 7033 and act on it"
+    wrapped = _user("please drain topic 7033\n  and act on it")
     assert transcript.payload_landed([wrapped], payload) is True
 
 
@@ -344,8 +344,8 @@ def test_an_unsubmitted_payload_is_not_confirmed():
 def test_only_user_records_confirm_a_submission():
     """An assistant echoing the text back is not evidence that the user record was written."""
     echoed = {"type": "assistant", "message": {"content": [
-        {"type": "text", "text": "You asked me to drain topic 33"}]}}
-    assert transcript.payload_landed([echoed], "drain topic 33") is False
+        {"type": "text", "text": "You asked me to drain topic 7033"}]}}
+    assert transcript.payload_landed([echoed], "drain topic 7033") is False
 
 
 # ---- path resolution ---------------------------------------------------------
@@ -389,8 +389,8 @@ def test_a_compaction_summary_is_never_a_receipt(payload):
 def test_every_synthetic_user_shape_is_rejected(flag):
     """All three counted in real data: 135, 135 and 943 occurrences. They are written BY the
     client, so none of them proves anything was submitted."""
-    synthetic = _user("please drain topic 33 and act on it", **{flag: True})
-    assert transcript.payload_landed([synthetic], "drain topic 33") is False
+    synthetic = _user("please drain topic 7033 and act on it", **{flag: True})
+    assert transcript.payload_landed([synthetic], "drain topic 7033") is False
 
 
 @pytest.mark.parametrize("flag", ["isMeta", "isVisibleInTranscriptOnly"])

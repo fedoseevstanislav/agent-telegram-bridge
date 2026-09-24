@@ -1,6 +1,6 @@
 """A halted carry-forward must be announced to the SESSION, not only the owner (#134).
 
-Topic 4367, 2026-08-06: the halt fired 43 seconds into the flow, but only the daemon knew.
+Topic 7002, 2026-08-06: the halt fired 43 seconds into the flow, but only the daemon knew.
 The session had already been handed the /carryforward instruction, so it executed the
 protocol for three more hours and then stopped to wait for a /compact that could never
 come — with its listener armed, its inbox drained, and every health signal green. The

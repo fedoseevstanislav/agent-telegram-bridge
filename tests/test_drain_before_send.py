@@ -17,7 +17,7 @@ from bridge import cli
 
 
 def _inbox(tmp_path, monkeypatch, records, cursor=0):
-    topic_dir = tmp_path / "topics" / "4367"
+    topic_dir = tmp_path / "topics" / "7002"
     topic_dir.mkdir(parents=True)
     (topic_dir / "inbox.jsonl").write_text(
         "".join(json.dumps(r, ensure_ascii=False) + "\n" for r in records), encoding="utf-8")
@@ -28,18 +28,18 @@ def _inbox(tmp_path, monkeypatch, records, cursor=0):
 
 
 def _record(text, ts="2026-08-07T16:09:54+0000", kind="voice"):
-    return {"ts": ts, "message_id": 1, "thread_id": 4367,
+    return {"ts": ts, "message_id": 1, "thread_id": 7002,
             "from": "Владелец", "kind": kind, "text": text}
 
 
 def _args(text="reply", force=False):
-    return types.SimpleNamespace(text=text, topic="4367", force=force, json=False)
+    return types.SimpleNamespace(text=text, topic="7002", force=force, json=False)
 
 
 def _no_send(monkeypatch):
     sent = []
     monkeypatch.setattr(cli, "send_text", lambda cfg, topic, text: sent.append((topic, text)))
-    monkeypatch.setattr(cli, "resolve_topic", lambda args: 4367)
+    monkeypatch.setattr(cli, "resolve_topic", lambda args: 7002)
     return sent
 
 
@@ -67,7 +67,7 @@ def test_refusal_does_not_advance_the_cursor(tmp_path, monkeypatch):
     # recv is the only cursor writer: a refusal that consumed the messages would make them
     # unreadable, which is the silent-loss class #105 fixed.
     assert (topic_dir / "cursor").read_text() == "0"
-    assert len(cli.unread_before_send(4367)) == 2
+    assert len(cli.unread_before_send(7002)) == 2
 
 
 def test_send_proceeds_when_everything_is_read(tmp_path, monkeypatch):
@@ -76,7 +76,7 @@ def test_send_proceeds_when_everything_is_read(tmp_path, monkeypatch):
 
     cli.cmd_send({}, _args(text="my reply"))
 
-    assert sent == [(4367, "my reply")]
+    assert sent == [(7002, "my reply")]
 
 
 def test_force_sends_despite_unread(tmp_path, monkeypatch):
@@ -85,7 +85,7 @@ def test_force_sends_despite_unread(tmp_path, monkeypatch):
 
     cli.cmd_send({}, _args(text="still working on it", force=True))
 
-    assert sent == [(4367, "still working on it")]
+    assert sent == [(7002, "still working on it")]
 
 
 def test_send_works_with_no_inbox_at_all(tmp_path, monkeypatch):
@@ -94,7 +94,7 @@ def test_send_works_with_no_inbox_at_all(tmp_path, monkeypatch):
 
     cli.cmd_send({}, _args(text="first contact"))
 
-    assert sent == [(4367, "first contact")]
+    assert sent == [(7002, "first contact")]
 
 
 def test_refusal_names_the_command_that_clears_it(tmp_path, monkeypatch, capsys):
@@ -108,7 +108,7 @@ def test_refusal_names_the_command_that_clears_it(tmp_path, monkeypatch, capsys)
     # Without this an agent retries send, hits exit 3 again, and livelocks: the printed
     # records are a preview, so only an explicit recv clears the block.
     assert "PREVIEW" in out
-    assert "tg-bridge recv --topic 4367" in out
+    assert "tg-bridge recv --topic 7002" in out
 
 
 def test_recv_then_send_recovers(tmp_path, monkeypatch, capsys):
@@ -121,10 +121,10 @@ def test_recv_then_send_recovers(tmp_path, monkeypatch, capsys):
     assert blocked.value.code == cli.UNREAD_EXIT
 
     # The documented recovery path must actually unblock the agent.
-    cli.cmd_recv({}, types.SimpleNamespace(topic="4367", wait=None, peek=False, json=False))
+    cli.cmd_recv({}, types.SimpleNamespace(topic="7002", wait=None, peek=False, json=False))
     cli.cmd_send({}, _args(text="one reply covering both"))
 
-    assert sent == [(4367, "one reply covering both")]
+    assert sent == [(7002, "one reply covering both")]
     capsys.readouterr()
 
 
@@ -133,17 +133,17 @@ def test_feed_topics_are_never_blocked(tmp_path, monkeypatch):
     sent = _no_send(monkeypatch)
     # An outbound-only feed has no reader, so its unread would never clear and every
     # later post would be blocked forever.
-    monkeypatch.setattr(cli, "read_registry", lambda: {"4367": {"feed": True}})
+    monkeypatch.setattr(cli, "read_registry", lambda: {"7002": {"feed": True}})
 
     cli.cmd_send({}, _args(text="feed event"))
 
-    assert sent == [(4367, "feed event")]
+    assert sent == [(7002, "feed event")]
 
 
 def test_dialog_topics_are_still_blocked_when_a_registry_entry_exists(tmp_path, monkeypatch):
     _inbox(tmp_path, monkeypatch, [_record("real message")])
     sent = _no_send(monkeypatch)
-    monkeypatch.setattr(cli, "read_registry", lambda: {"4367": {"name": "dialog"}})
+    monkeypatch.setattr(cli, "read_registry", lambda: {"7002": {"name": "dialog"}})
 
     with pytest.raises(SystemExit):
         cli.cmd_send({}, _args())
@@ -160,16 +160,16 @@ def test_unread_exit_code_is_distinct_from_the_recv_timeout(tmp_path, monkeypatc
         cli.cmd_send({}, _args())
 
     monkeypatch.setattr(cli, "send_typing", lambda cfg, topic: None)
-    cli.cmd_recv({}, types.SimpleNamespace(topic="4367", wait=None, peek=False, json=False))
+    cli.cmd_recv({}, types.SimpleNamespace(topic="7002", wait=None, peek=False, json=False))
     with pytest.raises(SystemExit) as timed_out:   # now nothing is unread: a real timeout
         # `wait=0` would be falsy and take the non-blocking branch — it must be a real wait.
-        cli.cmd_recv({}, types.SimpleNamespace(topic="4367", wait=1, peek=False, json=False))
+        cli.cmd_recv({}, types.SimpleNamespace(topic="7002", wait=1, peek=False, json=False))
 
     assert blocked.value.code != timed_out.value.code
 
 
 def test_send_parser_accepts_force():
     parser = cli.build_parser()
-    args = parser.parse_args(["send", "--topic", "4367", "--force", "hello"])
+    args = parser.parse_args(["send", "--topic", "7002", "--force", "hello"])
     assert args.force is True
-    assert parser.parse_args(["send", "--topic", "4367", "hello"]).force is False
+    assert parser.parse_args(["send", "--topic", "7002", "hello"]).force is False

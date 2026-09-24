@@ -45,11 +45,11 @@ def test_fallback_event_detected_once_and_watermark_suppresses_repeat(tmp_path, 
     monkeypatch.setattr(watchdog, "send_topic", lambda cfg, topic, text: alerts.append((topic, text)))
     monkeypatch.setattr(watchdog, "save_state", lambda current: None)
 
-    watchdog.check_transcript({}, 3089, "session-1", transcript, state)
-    watchdog.check_transcript({}, 3089, "session-1", transcript, state)
+    watchdog.check_transcript({}, 7013, "session-1", transcript, state)
+    watchdog.check_transcript({}, 7013, "session-1", transcript, state)
 
     assert len(alerts) == 1
-    assert alerts[0][0] == 3089
+    assert alerts[0][0] == 7013
     assert "Safeguards flagged this message" in alerts[0][1]
     assert "session now runs claude-opus-4-8" in alerts[0][1]
     assert "2026-07-15 13:44 UTC+3" in alerts[0][1]
@@ -71,8 +71,8 @@ def test_model_transition_detected_once(tmp_path, monkeypatch):
     monkeypatch.setattr(watchdog, "send_topic", lambda cfg, topic, text: alerts.append(text))
     monkeypatch.setattr(watchdog, "save_state", lambda current: None)
 
-    watchdog.check_transcript({}, 3089, "session-1", transcript, state)
-    watchdog.check_transcript({}, 3089, "session-1", transcript, state)
+    watchdog.check_transcript({}, 7013, "session-1", transcript, state)
+    watchdog.check_transcript({}, 7013, "session-1", transcript, state)
 
     assert len(alerts) == 1
     assert "claude-fable-5 → claude-opus-4-8" in alerts[0]
@@ -91,7 +91,7 @@ def test_synthetic_assistant_model_is_ignored(tmp_path, monkeypatch):
     monkeypatch.setattr(watchdog, "send_topic", lambda cfg, topic, text: alerts.append(text))
     monkeypatch.setattr(watchdog, "save_state", lambda current: None)
 
-    watchdog.check_transcript({}, 3089, "session-1", transcript, state)
+    watchdog.check_transcript({}, 7013, "session-1", transcript, state)
 
     assert alerts == []
     assert state["session-1"]["last_model"] == "claude-fable-5"
@@ -149,7 +149,7 @@ def test_first_run_baselines_without_alerting(tmp_path, monkeypatch):
     monkeypatch.setattr(watchdog, "send_topic", lambda cfg, topic, text: alerts.append(text))
     monkeypatch.setattr(watchdog, "save_state", lambda current: None)
 
-    watchdog.check_transcript({}, 3089, "session-1", transcript, state)
+    watchdog.check_transcript({}, 7013, "session-1", transcript, state)
 
     assert alerts == []
     assert state == {
@@ -182,8 +182,8 @@ def test_possibly_delivered_alert_is_watermarked_and_not_retried(tmp_path, monke
     monkeypatch.setattr(watchdog, "send_topic", ambiguous_send)
     monkeypatch.setattr(watchdog, "save_state", lambda current: None)
 
-    watchdog.check_transcript({}, 3089, "session-1", transcript, state)
-    watchdog.check_transcript({}, 3089, "session-1", transcript, state)
+    watchdog.check_transcript({}, 7013, "session-1", transcript, state)
+    watchdog.check_transcript({}, 7013, "session-1", transcript, state)
 
     assert len(attempts) == 1
     assert state["session-1"]["last_fallback_ts"] == "2026-07-15T10:44:30.346Z"
@@ -415,7 +415,7 @@ def test_codex_first_run_baselines_without_alerting(tmp_path, monkeypatch):
     monkeypatch.setattr(watchdog, "send_topic", lambda cfg, topic, text: alerts.append(text))
     monkeypatch.setattr(watchdog, "save_state", lambda current: None)
 
-    watchdog.check_codex_rollout({}, 8048, "thread-1", rollout, state)
+    watchdog.check_codex_rollout({}, 7016, "thread-1", rollout, state)
 
     assert alerts == []
     assert state["thread-1"]["last_model"] == "gpt-5.6-sol xhigh"
@@ -429,17 +429,17 @@ def test_codex_model_drift_alerts_once(tmp_path, monkeypatch):
     monkeypatch.setattr(watchdog, "send_topic", lambda cfg, topic, text: alerts.append((topic, text)))
     monkeypatch.setattr(watchdog, "save_state", lambda current: None)
     state = {}
-    watchdog.check_codex_rollout({}, 8048, "thread-1", rollout, state)
+    watchdog.check_codex_rollout({}, 7016, "thread-1", rollout, state)
 
     _appended(rollout, [
         _settings_event("gpt-5.6-luna", "xhigh", "2026-07-31T21:08:32.023Z"),
         _settings_event("gpt-5.6-luna", "low", "2026-07-31T21:08:32.059Z"),
     ])
-    watchdog.check_codex_rollout({}, 8048, "thread-1", rollout, state)
-    watchdog.check_codex_rollout({}, 8048, "thread-1", rollout, state)
+    watchdog.check_codex_rollout({}, 7016, "thread-1", rollout, state)
+    watchdog.check_codex_rollout({}, 7016, "thread-1", rollout, state)
 
     assert len(alerts) == 1
-    assert alerts[0][0] == 8048
+    assert alerts[0][0] == 7016
     assert "gpt-5.6-sol xhigh → gpt-5.6-luna low" in alerts[0][1]
     assert "2026-08-01 00:08 UTC+3" in alerts[0][1]
     assert state["thread-1"]["last_model"] == "gpt-5.6-luna low"
@@ -452,10 +452,10 @@ def test_codex_effort_only_drift_alerts(tmp_path, monkeypatch):
     monkeypatch.setattr(watchdog, "send_topic", lambda cfg, topic, text: alerts.append(text))
     monkeypatch.setattr(watchdog, "save_state", lambda current: None)
     state = {}
-    watchdog.check_codex_rollout({}, 8048, "thread-1", rollout, state)
+    watchdog.check_codex_rollout({}, 7016, "thread-1", rollout, state)
 
     _appended(rollout, [_settings_event("gpt-5.6-sol", "low", _old())])
-    watchdog.check_codex_rollout({}, 8048, "thread-1", rollout, state)
+    watchdog.check_codex_rollout({}, 7016, "thread-1", rollout, state)
 
     assert len(alerts) == 1
     assert "gpt-5.6-sol xhigh → gpt-5.6-sol low" in alerts[0]
@@ -468,14 +468,14 @@ def test_codex_flap_between_sweeps_is_reported(tmp_path, monkeypatch):
     monkeypatch.setattr(watchdog, "send_topic", lambda cfg, topic, text: alerts.append(text))
     monkeypatch.setattr(watchdog, "save_state", lambda current: None)
     state = {}
-    watchdog.check_codex_rollout({}, 8048, "thread-1", rollout, state)
+    watchdog.check_codex_rollout({}, 7016, "thread-1", rollout, state)
 
     _appended(rollout, [
         _settings_event("gpt-5.6-luna", "low", _old(120)),
         _settings_event("gpt-5.6-sol", "xhigh", _old(60)),
     ])
-    watchdog.check_codex_rollout({}, 8048, "thread-1", rollout, state)
-    watchdog.check_codex_rollout({}, 8048, "thread-1", rollout, state)
+    watchdog.check_codex_rollout({}, 7016, "thread-1", rollout, state)
+    watchdog.check_codex_rollout({}, 7016, "thread-1", rollout, state)
 
     assert len(alerts) == 1
     assert "gpt-5.6-luna low" in alerts[0]
@@ -490,11 +490,11 @@ def test_codex_unchanged_settings_never_alert(tmp_path, monkeypatch):
     monkeypatch.setattr(watchdog, "send_topic", lambda cfg, topic, text: alerts.append(text))
     monkeypatch.setattr(watchdog, "save_state", lambda current: None)
     state = {}
-    watchdog.check_codex_rollout({}, 8048, "thread-1", rollout, state)
+    watchdog.check_codex_rollout({}, 7016, "thread-1", rollout, state)
 
     # Codex re-applies identical settings at every turn start.
     _appended(rollout, [_settings_event("gpt-5.6-sol", "xhigh", _old(30)) for _ in range(3)])
-    watchdog.check_codex_rollout({}, 8048, "thread-1", rollout, state)
+    watchdog.check_codex_rollout({}, 7016, "thread-1", rollout, state)
 
     assert alerts == []
 
@@ -506,7 +506,7 @@ def test_codex_half_applied_switch_is_left_for_the_next_sweep(tmp_path, monkeypa
     monkeypatch.setattr(watchdog, "send_topic", lambda cfg, topic, text: alerts.append(text))
     monkeypatch.setattr(watchdog, "save_state", lambda current: None)
     state = {}
-    watchdog.check_codex_rollout({}, 8048, "thread-1", rollout, state)
+    watchdog.check_codex_rollout({}, 7016, "thread-1", rollout, state)
     offset_before = state["thread-1"]["offset"]
 
     # Model already written, effort not yet — the ages are driven explicitly so the test
@@ -514,7 +514,7 @@ def test_codex_half_applied_switch_is_left_for_the_next_sweep(tmp_path, monkeypa
     ages = {"FRESH": 0.0}
     monkeypatch.setattr(watchdog, "_event_age", lambda ts: ages.get(ts, 3600.0))
     _appended(rollout, [_settings_event("gpt-5.6-luna", "xhigh", "FRESH")])
-    watchdog.check_codex_rollout({}, 8048, "thread-1", rollout, state)
+    watchdog.check_codex_rollout({}, 7016, "thread-1", rollout, state)
 
     assert alerts == []
     assert state["thread-1"]["offset"] == offset_before  # the burst is not consumed
@@ -522,7 +522,7 @@ def test_codex_half_applied_switch_is_left_for_the_next_sweep(tmp_path, monkeypa
     # Next sweep: the effort event has landed and both are old enough to act on.
     ages["FRESH"] = 3600.0
     _appended(rollout, [_settings_event("gpt-5.6-luna", "low", _old(60))])
-    watchdog.check_codex_rollout({}, 8048, "thread-1", rollout, state)
+    watchdog.check_codex_rollout({}, 7016, "thread-1", rollout, state)
 
     assert len(alerts) == 1
     assert "gpt-5.6-sol xhigh → gpt-5.6-luna low" in alerts[0]
@@ -536,10 +536,10 @@ def test_codex_rollout_replacement_rebaselines_instead_of_alerting(tmp_path, mon
     monkeypatch.setattr(watchdog, "send_topic", lambda cfg, topic, text: alerts.append(text))
     monkeypatch.setattr(watchdog, "save_state", lambda current: None)
     state = {}
-    watchdog.check_codex_rollout({}, 8048, "thread-1", rollout, state)
+    watchdog.check_codex_rollout({}, 7016, "thread-1", rollout, state)
 
     _codex_rollout(rollout, [("gpt-5.6-luna", "low", _old())])  # shorter file, same name
-    watchdog.check_codex_rollout({}, 8048, "thread-1", rollout, state)
+    watchdog.check_codex_rollout({}, 7016, "thread-1", rollout, state)
 
     assert alerts == []
     assert state["thread-1"]["last_model"] == "gpt-5.6-luna low"
@@ -551,7 +551,7 @@ def test_codex_possibly_delivered_alert_is_watermarked(tmp_path, monkeypatch):
     rollout = _codex_rollout(tmp_path / "rollout.jsonl", [("gpt-5.6-sol", "xhigh", _old())])
     monkeypatch.setattr(watchdog, "save_state", lambda current: None)
     state = {}
-    watchdog.check_codex_rollout({}, 8048, "thread-1", rollout, state)
+    watchdog.check_codex_rollout({}, 7016, "thread-1", rollout, state)
     attempts = []
 
     def ambiguous_send(cfg, topic, text):
@@ -560,8 +560,8 @@ def test_codex_possibly_delivered_alert_is_watermarked(tmp_path, monkeypatch):
 
     monkeypatch.setattr(watchdog, "send_topic", ambiguous_send)
     _appended(rollout, [_settings_event("gpt-5.6-luna", "low", _old())])
-    watchdog.check_codex_rollout({}, 8048, "thread-1", rollout, state)
-    watchdog.check_codex_rollout({}, 8048, "thread-1", rollout, state)
+    watchdog.check_codex_rollout({}, 7016, "thread-1", rollout, state)
+    watchdog.check_codex_rollout({}, 7016, "thread-1", rollout, state)
 
     assert len(attempts) == 1
     assert state["thread-1"]["last_model"] == "gpt-5.6-luna low"
@@ -576,7 +576,7 @@ def test_check_codex_keys_state_by_rollout_thread_uuid(tmp_path, monkeypatch):
     monkeypatch.setattr(watchdog, "save_state", lambda current: None)
     state = {}
 
-    watchdog.check_codex({}, 8048, {"session_id": uuid}, "%15", state)
+    watchdog.check_codex({}, 7016, {"session_id": uuid}, "%15", state)
 
     assert state[uuid]["last_model"] == "gpt-5.6-sol xhigh"
 
@@ -586,7 +586,7 @@ def test_check_codex_without_a_resolvable_rollout_does_nothing(monkeypatch):
     monkeypatch.setattr(watchdog, "codex_rollout_path", lambda pane, sid: None)
     state = {}
 
-    watchdog.check_codex({}, 8048, {"session_id": None}, "%15", state)
+    watchdog.check_codex({}, 7016, {"session_id": None}, "%15", state)
 
     assert state == {}
 
@@ -611,13 +611,13 @@ def test_future_timestamp_does_not_pin_the_offset(tmp_path, monkeypatch):
     monkeypatch.setattr(watchdog, "send_topic", lambda cfg, topic, text: alerts.append(text))
     monkeypatch.setattr(watchdog, "save_state", lambda current: None)
     state = {}
-    watchdog.check_codex_rollout({}, 8048, "thread-1", rollout, state)
+    watchdog.check_codex_rollout({}, 7016, "thread-1", rollout, state)
 
     # A clock-skewed writer stamps the future; deferring it would silence this session
     # for good, so a negative age must count as settled.
     ahead = (datetime.now(timezone.utc) + timedelta(days=1)).strftime("%Y-%m-%dT%H:%M:%S.000Z")
     _appended(rollout, [_settings_event("gpt-5.6-luna", "low", ahead)])
-    watchdog.check_codex_rollout({}, 8048, "thread-1", rollout, state)
+    watchdog.check_codex_rollout({}, 7016, "thread-1", rollout, state)
 
     assert len(alerts) == 1
     assert state["thread-1"]["offset"] == rollout.stat().st_size
@@ -649,14 +649,14 @@ def test_rollout_swapped_under_the_same_name_rebaselines(tmp_path, monkeypatch):
     monkeypatch.setattr(watchdog, "send_topic", lambda cfg, topic, text: alerts.append(text))
     monkeypatch.setattr(watchdog, "save_state", lambda current: None)
     state = {}
-    watchdog.check_codex_rollout({}, 8048, "thread-1", rollout, state)
+    watchdog.check_codex_rollout({}, 7016, "thread-1", rollout, state)
 
     # A DIFFERENT inode at the same path, at least as long as the old offset: size alone
     # cannot see this, so the stored offset would point into unrelated bytes.
     replacement = tmp_path / "other.jsonl"
     _codex_rollout(replacement, [("gpt-5.6-luna", "low", _old()) for _ in range(6)])
     os.replace(replacement, rollout)
-    watchdog.check_codex_rollout({}, 8048, "thread-1", rollout, state)
+    watchdog.check_codex_rollout({}, 7016, "thread-1", rollout, state)
 
     assert alerts == []
     assert state["thread-1"]["last_model"] == "gpt-5.6-luna low"

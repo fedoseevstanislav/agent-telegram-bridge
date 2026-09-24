@@ -4,7 +4,7 @@ from bridge import daemon
 def test_missing_boot_id_with_dead_registered_panes_restores_before_saving(monkeypatch):
     events = []
     registry = {
-        "13": {
+        "7031": {
             "name": "queue-refactor",
             "pane": "%2",
             "engine": "claude",
@@ -32,7 +32,7 @@ def test_missing_boot_id_with_dead_registered_panes_restores_before_saving(monke
     # This branch is reached on "no stored boot_id AND every registered pane is dead", which
     # is a reboot OR a killed tmux server — _all_target_panes_dead's own docstring says so.
     # It must NOT tell the sessions a reboot happened (#167).
-    expected = ("revive", "13", "sid-13", False, "recovery")
+    expected = ("revive", "7031", "sid-13", False, "recovery")
     assert expected in events
     assert events.index(expected) < events.index(("save", "boot-new"))
 
@@ -48,7 +48,7 @@ def test_missing_boot_id_with_dead_registered_panes_restores_before_saving(monke
 def test_missing_boot_id_with_live_registered_panes_only_baselines(monkeypatch):
     events = []
     registry = {
-        "13": {
+        "7031": {
             "name": "queue-refactor",
             "pane": "%2",
             "engine": "claude",

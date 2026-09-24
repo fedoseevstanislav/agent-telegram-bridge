@@ -75,7 +75,7 @@ ENTRY = {"name": "big seat", "session_id": "SID", "cwd": "/", "engine": "claude"
 def test_a_large_old_session_is_resumed_from_summary_on_a_mass_restore(monkeypatch):
     r = Revive(monkeypatch)
 
-    status, task = daemon.revive_one({}, "33", dict(ENTRY), brief=False, auto_summary=True)
+    status, task = daemon.revive_one({}, "7033", dict(ENTRY), brief=False, auto_summary=True)
 
     assert r.choices == ["compact"]
     assert status == "resumed"
@@ -88,7 +88,7 @@ def test_without_auto_summary_nothing_is_chosen(monkeypatch):
     # the pre-#277 behaviour, still the default for every other caller
     r = Revive(monkeypatch)
 
-    daemon.revive_one({}, "33", dict(ENTRY), brief=False)
+    daemon.revive_one({}, "7033", dict(ENTRY), brief=False)
 
     assert r.answered == []
 
@@ -106,7 +106,7 @@ def test_without_auto_summary_nothing_is_chosen(monkeypatch):
 def test_below_either_threshold_or_unknown_no_choice_is_made(monkeypatch, sample):
     r = Revive(monkeypatch, sample=sample)
 
-    daemon.revive_one({}, "33", dict(ENTRY), brief=False, auto_summary=True)
+    daemon.revive_one({}, "7033", dict(ENTRY), brief=False, auto_summary=True)
 
     assert r.answered == []
     assert not any("picker" in t for _tid, t in r.replies), \
@@ -118,7 +118,7 @@ def test_a_fresh_spawn_is_never_given_a_choice(monkeypatch):
     # picker never appeared" warning on every reopened session.
     r = Revive(monkeypatch)
 
-    daemon.revive_one({}, "33", dict(ENTRY), fresh=True, brief=False, auto_summary=True)
+    daemon.revive_one({}, "7033", dict(ENTRY), fresh=True, brief=False, auto_summary=True)
 
     assert r.answered == []
     assert not any("picker" in t for _tid, t in r.replies)
@@ -129,7 +129,7 @@ def test_an_entry_with_no_session_id_is_never_given_a_choice(monkeypatch):
     entry = dict(ENTRY)
     entry.pop("session_id")
 
-    status, _task = daemon.revive_one({}, "33", entry, brief=False, auto_summary=True)
+    status, _task = daemon.revive_one({}, "7033", entry, brief=False, auto_summary=True)
 
     assert r.answered == [] and status == "fresh"
 
@@ -139,7 +139,7 @@ def test_a_codex_session_is_never_given_a_choice(monkeypatch):
     monkeypatch.setattr(daemon, "ensure_codex_trust", lambda cwd: None)
     entry = dict(ENTRY, engine="codex")
 
-    daemon.revive_one({}, "33", entry, brief=False, auto_summary=True)
+    daemon.revive_one({}, "7033", entry, brief=False, auto_summary=True)
 
     assert r.answered == []
 
@@ -150,7 +150,7 @@ def test_a_codex_session_is_never_given_a_choice(monkeypatch):
 def test_an_explicit_choice_from_the_caller_wins(monkeypatch):
     r = Revive(monkeypatch)
 
-    daemon.revive_one({}, "33", dict(ENTRY), brief=False, auto_summary=True,
+    daemon.revive_one({}, "7033", dict(ENTRY), brief=False, auto_summary=True,
                       resume_choice="full")
 
     assert r.choices == ["full"], "the owner's own answer must not be overridden"
@@ -160,7 +160,7 @@ def test_the_message_revive_path_is_unchanged_when_it_passes_no_choice(monkeypat
     # auto_summary defaults False, so #195's own flow keeps deciding for itself.
     r = Revive(monkeypatch)
 
-    daemon.revive_one({}, "33", dict(ENTRY), brief=False, cause="reopen")
+    daemon.revive_one({}, "7033", dict(ENTRY), brief=False, cause="reopen")
 
     assert r.answered == []
 
@@ -175,7 +175,7 @@ def test_the_callers_deadline_is_the_one_the_picker_gets(monkeypatch):
     before = time.time()
     given = before + daemon.MIN_PICKER_WINDOW + 30
 
-    daemon.revive_one({}, "33", dict(ENTRY), brief=False, auto_summary=True,
+    daemon.revive_one({}, "7033", dict(ENTRY), brief=False, auto_summary=True,
                       picker_deadline=given)
 
     _pane, _choice, deadline = r.answered[0]
@@ -230,7 +230,7 @@ def test_once_the_budget_is_spent_no_choice_is_claimed(monkeypatch):
     """
     r = Revive(monkeypatch)
 
-    status, task = daemon.revive_one({}, "33", dict(ENTRY), brief=False, auto_summary=True,
+    status, task = daemon.revive_one({}, "7033", dict(ENTRY), brief=False, auto_summary=True,
                                      picker_deadline=time.time() - 1)
 
     assert r.answered == [], "no answer attempt with no time to make one"
@@ -253,7 +253,7 @@ def test_a_daemon_choice_that_did_not_land_is_never_reported_as_the_owners(
     r = Revive(monkeypatch, picker=outcome)
     monkeypatch.setattr(daemon, "_resume_picker_present", lambda screen: False)
 
-    daemon.revive_one({}, "33", dict(ENTRY), brief=False, auto_summary=True)
+    daemon.revive_one({}, "7033", dict(ENTRY), brief=False, auto_summary=True)
 
     assert not any("You chose" in t for _tid, t in r.replies)
     # nothing on the pane -> it simply resumed in full, the ordinary pre-#277 outcome
@@ -268,7 +268,7 @@ def test_a_picker_left_up_by_a_failed_daemon_choice_is_reported_as_unanswered(
     r = Revive(monkeypatch, picker=outcome)
     monkeypatch.setattr(daemon, "_resume_picker_present", lambda screen: True)
 
-    daemon.revive_one({}, "33", dict(ENTRY), brief=False, auto_summary=True)
+    daemon.revive_one({}, "7033", dict(ENTRY), brief=False, auto_summary=True)
 
     assert not any("You chose" in t for _tid, t in r.replies)
     assert any(t == daemon.UNANSWERED_PICKER_NOTICE for _tid, t in r.replies)
@@ -280,7 +280,7 @@ def test_an_OWNERS_choice_that_did_not_land_is_still_reported_to_them(monkeypatc
     # something and did not get it. Only the daemon's own choice is exempt.
     r = Revive(monkeypatch, picker=outcome)
 
-    daemon.revive_one({}, "33", dict(ENTRY), brief=False, resume_choice="compact")
+    daemon.revive_one({}, "7033", dict(ENTRY), brief=False, resume_choice="compact")
 
     assert any("choice was not applied" in t for _tid, t in r.replies)
 
@@ -311,7 +311,7 @@ def test_no_choice_is_claimed_if_any_step_before_the_picker_eats_the_budget(
         monkeypatch.setattr(daemon, "launch_pane",
                             lambda name, cwd, launch, engine, reason: (_burn(), "%9")[1])
 
-    status, task = daemon.revive_one({}, "33", dict(ENTRY), brief=False, auto_summary=True,
+    status, task = daemon.revive_one({}, "7033", dict(ENTRY), brief=False, auto_summary=True,
                                      picker_deadline=deadline)
 
     assert r.answered == [], f"{slow_step} ate the budget but a choice was still claimed"
@@ -325,7 +325,7 @@ def test_no_choice_is_claimed_if_any_step_before_the_picker_eats_the_budget(
 def test_no_choice_for_any_non_positive_or_too_small_window(monkeypatch, remaining):
     r = Revive(monkeypatch)
 
-    daemon.revive_one({}, "33", dict(ENTRY), brief=False, auto_summary=True,
+    daemon.revive_one({}, "7033", dict(ENTRY), brief=False, auto_summary=True,
                       picker_deadline=time.time() + remaining)
 
     assert r.answered == []
@@ -336,7 +336,7 @@ def test_no_deadline_at_all_means_no_budget_applies(monkeypatch):
     # the single-session paths pass none; they must keep working exactly as before
     r = Revive(monkeypatch)
 
-    daemon.revive_one({}, "33", dict(ENTRY), brief=False, auto_summary=True,
+    daemon.revive_one({}, "7033", dict(ENTRY), brief=False, auto_summary=True,
                       picker_deadline=None)
 
     assert r.choices == ["compact"]
@@ -345,7 +345,7 @@ def test_no_deadline_at_all_means_no_budget_applies(monkeypatch):
 def test_a_deadline_with_room_left_still_takes_the_choice(monkeypatch):
     r = Revive(monkeypatch)
 
-    daemon.revive_one({}, "33", dict(ENTRY), brief=False, auto_summary=True,
+    daemon.revive_one({}, "7033", dict(ENTRY), brief=False, auto_summary=True,
                       picker_deadline=time.time() + daemon.RESUME_MODAL_WAIT)
 
     assert r.choices == ["compact"]
@@ -359,7 +359,7 @@ def test_the_restore_summary_counts_and_names_the_summarised_sessions(monkeypatc
         # `resume_choice` alone no longer separates it from the injected fallback,
         # which re-reads the full context first. The stub tracks the real producer's
         # shape — every assertion below is unchanged.
-        choice = "compact" if tid == "33" else None
+        choice = "compact" if tid == "7033" else None
         return "resumed", {"pane": "%1", "tid": tid, "engine": "claude", "tpl": "",
                            "needs_brief": False, "reopened": None, "resume_choice": choice,
                            "from_summary": choice == "compact"}
@@ -370,7 +370,7 @@ def test_the_restore_summary_counts_and_names_the_summarised_sessions(monkeypatc
                         lambda _t, _m, params: posted.append(params["text"]) or {})
 
     daemon._restore_targets_now({"bot_token": "T", "chat_id": 1}, "boot",
-                                [("33", {"name": "big seat"}), ("34", {"name": "small"})])
+                                [("7033", {"name": "big seat"}), ("34", {"name": "small"})])
 
     text = posted[0]
     assert "1 resumed from summary." in text
@@ -399,7 +399,7 @@ def test_a_revive_that_raises_does_not_stop_the_restore(monkeypatch):
 
     def _revive(cfg, tid, info, **kw):
         calls.append(tid)
-        if tid == "33":
+        if tid == "7033":
             raise RuntimeError("launch exploded")
         return "resumed", {"pane": "%1", "tid": tid, "engine": "claude", "tpl": "",
                            "needs_brief": False, "reopened": None, "resume_choice": None}
@@ -410,9 +410,9 @@ def test_a_revive_that_raises_does_not_stop_the_restore(monkeypatch):
                         lambda _t, _m, params: posted.append(params["text"]) or {})
 
     daemon._restore_targets_now({"bot_token": "T", "chat_id": 1}, "boot",
-                                [("33", {"name": "boom"}), ("34", {"name": "ok"})])
+                                [("7033", {"name": "boom"}), ("34", {"name": "ok"})])
 
-    assert calls == ["33", "34"]
+    assert calls == ["7033", "34"]
     assert "1 failed" in posted[0]
 
 
@@ -456,7 +456,7 @@ def test_a_sampling_failure_still_revives_the_session_in_full(monkeypatch):
 
     monkeypatch.setattr(daemon, "session_cost_sample", _boom)
 
-    status, task = daemon.revive_one({}, "33", dict(ENTRY), brief=False, auto_summary=True)
+    status, task = daemon.revive_one({}, "7033", dict(ENTRY), brief=False, auto_summary=True)
 
     assert status == "resumed", "the session must still come back"
     assert any("--resume" in line for line in r.launched)

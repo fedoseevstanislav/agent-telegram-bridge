@@ -18,8 +18,8 @@ def _point_state(monkeypatch, tmp_path, name="autocf_exempt.json"):
 
 def test_exempt_returns_topic_ids_as_strings(monkeypatch, tmp_path):
     p = _point_state(monkeypatch, tmp_path)
-    p.write_text(json.dumps(["5935", 5927]))  # mixed str/int -> all coerced to str
-    assert daemon.load_autocf_exempt() == {"5935", "5927"}
+    p.write_text(json.dumps(["7001", 7014]))  # mixed str/int -> all coerced to str
+    assert daemon.load_autocf_exempt() == {"7001", "7014"}
 
 
 def test_exempt_missing_file_is_empty(monkeypatch, tmp_path):
@@ -35,7 +35,7 @@ def test_exempt_malformed_json_is_empty(monkeypatch, tmp_path):
 
 def test_exempt_non_list_is_empty(monkeypatch, tmp_path):
     p = _point_state(monkeypatch, tmp_path)
-    p.write_text(json.dumps({"5935": True}))  # a dict, not a list -> ignored
+    p.write_text(json.dumps({"7001": True}))  # a dict, not a list -> ignored
     assert daemon.load_autocf_exempt() == set()
 
 
@@ -62,29 +62,29 @@ def _patch_autocf_side_effects(monkeypatch):
 def test_process_autocf_exempt_never_fires_and_clears_armed(monkeypatch):
     rec = _patch_autocf_side_effects(monkeypatch)
     monkeypatch.setattr(daemon, "carry_forward_active", lambda tid: False)
-    autocf_fired = {"5935": True}  # pre-existing armed flag
-    # 95% context on a claude session would normally fire — but 5935 is exempt.
-    fired = daemon._process_autocf({}, "5935", {}, "%1", 95, "claude", {"5935"}, autocf_fired)
+    autocf_fired = {"7001": True}  # pre-existing armed flag
+    # 95% context on a claude session would normally fire — but 7001 is exempt.
+    fired = daemon._process_autocf({}, "7001", {}, "%1", 95, "claude", {"7001"}, autocf_fired)
     assert fired is False
     assert rec["cf"] == [] and rec["reply"] == 0
-    assert "5935" not in autocf_fired  # stale armed flag cleared for clean un-exempt
+    assert "7001" not in autocf_fired  # stale armed flag cleared for clean un-exempt
 
 
 def test_process_autocf_non_exempt_fires_at_threshold(monkeypatch):
     rec = _patch_autocf_side_effects(monkeypatch)
     monkeypatch.setattr(daemon, "carry_forward_active", lambda tid: False)
     autocf_fired = {}
-    fired = daemon._process_autocf({}, "606", {}, "%2", 95, "claude", set(), autocf_fired)
+    fired = daemon._process_autocf({}, "604", {}, "%2", 95, "claude", set(), autocf_fired)
     assert fired is True
-    assert rec["cf"] == [606]  # handle_carry_forward called with int(tid)
-    assert autocf_fired["606"] is True  # now armed
+    assert rec["cf"] == [604]  # handle_carry_forward called with int(tid)
+    assert autocf_fired["604"] is True  # now armed
 
 
 def test_process_autocf_non_exempt_skips_while_cf_active(monkeypatch):
     rec = _patch_autocf_side_effects(monkeypatch)
     monkeypatch.setattr(daemon, "carry_forward_active", lambda tid: True)  # already running
     autocf_fired = {}
-    fired = daemon._process_autocf({}, "606", {}, "%2", 95, "claude", set(), autocf_fired)
+    fired = daemon._process_autocf({}, "604", {}, "%2", 95, "claude", set(), autocf_fired)
     assert fired is False
     assert rec["cf"] == []  # handle_carry_forward not called while a CF is already active
 
@@ -92,9 +92,9 @@ def test_process_autocf_non_exempt_skips_while_cf_active(monkeypatch):
 def test_process_autocf_non_exempt_does_not_fire_below_rearm(monkeypatch):
     rec = _patch_autocf_side_effects(monkeypatch)
     monkeypatch.setattr(daemon, "carry_forward_active", lambda tid: False)
-    autocf_fired = {"606": True}  # armed
+    autocf_fired = {"604": True}  # armed
     # context dropped below rearm -> re-arm (armed_next False), no fire
-    fired = daemon._process_autocf({}, "606", {}, "%2", 10, "claude", set(), autocf_fired)
+    fired = daemon._process_autocf({}, "604", {}, "%2", 10, "claude", set(), autocf_fired)
     assert fired is False
     assert rec["cf"] == []
-    assert autocf_fired["606"] is False  # re-armed for the next climb
+    assert autocf_fired["604"] is False  # re-armed for the next climb

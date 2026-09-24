@@ -59,7 +59,7 @@ def test_tuning_variables_from_the_host_are_cleared():
 #
 # These two run in file order and are a pair: the first writes through the real `state_path`,
 # the second proves the write is gone. Before the per-test STATE_DIR patch this leaked —
-# `topics/8265`, `topics/33` and `topics/11722` were each created by one test and still there
+# `topics/7004`, `topics/7033` and `topics/7005` were each created by one test and still there
 # for every later one (#203 review, C5).
 
 _LEAK_PROBE = ("topics", "999999", "leak-probe.json")

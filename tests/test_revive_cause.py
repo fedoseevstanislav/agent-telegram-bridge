@@ -1,6 +1,6 @@
 """A revive has three causes and only one of them is a reboot (#167).
 
-The session is not just shown this wording — it REASONS from it. Reviving topic 1902 by
+The session is not just shown this wording — it REASONS from it. Reviving topic 7008 by
 hand, with no reboot anywhere, the session was handed "restored after a server reboot",
 then explained a reaped background listener to itself as "the pre-reboot listener being
 terminated". Right conclusion, false premise. The next such inference — a missing tmux
@@ -105,9 +105,9 @@ def test_template_still_formats_with_tid_alone(engine, fresh, cause):
     briefing at all and (for codex, with an empty inbox) nothing else ever briefs it."""
     tpl, _notice = daemon._restore_wording(engine, cause, fresh=fresh)
     assert "{tid}" in tpl
-    text = tpl.format(tid=1902)
+    text = tpl.format(tid=7008)
     assert "{" not in text.replace("{tid}", "")
-    assert "1902" in text
+    assert "7008" in text
 
 
 @pytest.mark.parametrize("engine,fresh,cause",
@@ -173,11 +173,11 @@ def test_manual_revive_says_manual(monkeypatch):
     seen = []
     _stub_revive_one(monkeypatch, seen)
     monkeypatch.setattr(daemon, "read_registry",
-                        lambda: {"1902": {"engine": "claude", "session_id": "sid", "pane": "%3"}})
+                        lambda: {"7008": {"engine": "claude", "session_id": "sid", "pane": "%3"}})
 
-    daemon.revive_topics({"bot_token": "t", "chat_id": -1}, [{"tid": "1902"}])
+    daemon.revive_topics({"bot_token": "t", "chat_id": -1}, [{"tid": "7008"}])
 
-    assert seen == [("1902", "manual")]
+    assert seen == [("7008", "manual")]
 
 
 def test_boot_restore_says_boot(monkeypatch):
@@ -187,9 +187,9 @@ def test_boot_restore_says_boot(monkeypatch):
     monkeypatch.setattr(daemon, "save_boot_id", lambda boot: None)
 
     daemon._restore_targets_now({"bot_token": "t", "chat_id": -1}, "boot-2",
-                                [("1902", {"name": "S26", "engine": "claude"})])
+                                [("7008", {"name": "S26", "engine": "claude"})])
 
-    assert seen == [("1902", "boot")]
+    assert seen == [("7008", "boot")]
 
 
 def test_auto_revive_on_a_dead_pane_says_auto(monkeypatch):
@@ -198,7 +198,7 @@ def test_auto_revive_on_a_dead_pane_says_auto(monkeypatch):
     seen = []
     _stub_revive_one(monkeypatch, seen)
     monkeypatch.setattr(daemon, "read_registry",
-                        lambda: {"1902": {"engine": "claude", "session_id": "sid", "pane": "%3"}})
+                        lambda: {"7008": {"engine": "claude", "session_id": "sid", "pane": "%3"}})
     monkeypatch.setattr(daemon, "should_auto_revive", lambda entry: True)
     # maybe_auto_revive now applies the A3 cost gate before reviving, and this entry has no
     # cwd, so its size reads as unknown and it would be asked about instead. That gate has
@@ -217,10 +217,10 @@ def test_auto_revive_on_a_dead_pane_says_auto(monkeypatch):
 
     monkeypatch.setattr(daemon.threading, "Thread", _Thread)
 
-    daemon.maybe_auto_revive({"bot_token": "t", "chat_id": -1}, "1902")
+    daemon.maybe_auto_revive({"bot_token": "t", "chat_id": -1}, "7008")
 
     assert started
-    assert seen == [("1902", "auto")]
+    assert seen == [("7008", "auto")]
 
 
 # ---- the seam: what revive_one ACTUALLY hands to deliver_briefing ----
@@ -257,7 +257,7 @@ def test_inline_delivery_carries_the_resolved_cause(monkeypatch, cause):
     briefed, notices = _revive_harness(monkeypatch)
     entry = {"engine": "claude", "session_id": "sid", "cwd": "/home/user"}
 
-    daemon.revive_one({"bot_token": "t", "chat_id": -1}, "1902", entry,
+    daemon.revive_one({"bot_token": "t", "chat_id": -1}, "7008", entry,
                       brief=True, cause=cause)
 
     expected_tpl, expected_notice = daemon._restore_wording("claude", cause, fresh=False)
@@ -272,7 +272,7 @@ def test_deferred_task_carries_the_resolved_cause(monkeypatch, cause):
     briefed, _ = _revive_harness(monkeypatch)
     entry = {"engine": "claude", "session_id": "sid", "cwd": "/home/user"}
 
-    _status, task = daemon.revive_one({"bot_token": "t", "chat_id": -1}, "1902", entry,
+    _status, task = daemon.revive_one({"bot_token": "t", "chat_id": -1}, "7008", entry,
                                       brief=False, cause=cause)
 
     assert briefed == []          # nothing delivered inline
@@ -301,11 +301,11 @@ def test_retry_timer_carries_the_same_resolved_template(monkeypatch):
                         lambda pane, text, settle=None, still_ok=None: "swallowed")
     monkeypatch.setattr(daemon, "report_blocked_pane", lambda *a, **k: None)
     # Bound to this pane: the #238 delivery guard now runs on every attempt.
-    monkeypatch.setattr(daemon, "read_registry", lambda: {"1902": {"pane": "%77"}})
+    monkeypatch.setattr(daemon, "read_registry", lambda: {"7008": {"pane": "%77"}})
     monkeypatch.setattr(daemon, "current_boot_id", lambda: "boot-1")
 
     tpl, _ = daemon._restore_wording("claude", "auto", fresh=False)
-    daemon.deliver_briefing("%77", "1902", "claude", tpl)
+    daemon.deliver_briefing("%77", "7008", "claude", tpl)
 
     assert scheduled, "a swallowed briefing must schedule a retry"
     args = scheduled[0]
@@ -517,7 +517,7 @@ def test_revive_one_carries_a_failed_reopen_into_the_delivered_briefing(monkeypa
     monkeypatch.setattr(daemon, "reopen_topic", lambda cfg, tid: False)
     entry = {"engine": "claude", "session_id": "sid", "cwd": "/home/user"}
 
-    daemon.revive_one({"bot_token": "t", "chat_id": -1}, "1902", entry,
+    daemon.revive_one({"bot_token": "t", "chat_id": -1}, "7008", entry,
                       brief=True, cause="auto")
 
     assert briefed and "FAILED to reopen" in briefed[0]
@@ -531,14 +531,14 @@ def test_revive_one_distinguishes_requested_fresh_from_no_session_id(monkeypatch
     reasons; only `revive_one` knows which one applied."""
     briefed, _ = _revive_harness(monkeypatch)
     entry = {"engine": "claude", "session_id": "sid", "cwd": "/home/user"}
-    daemon.revive_one({"bot_token": "t", "chat_id": -1}, "1902", entry,
+    daemon.revive_one({"bot_token": "t", "chat_id": -1}, "7008", entry,
                       brief=True, fresh=True, cause="manual")
     assert briefed and "explicitly requested" in briefed[0]
     assert "no recoverable session id" not in briefed[0]
 
     briefed2, _ = _revive_harness(monkeypatch)
     no_sid = {"engine": "claude", "cwd": "/home/user"}          # -> do_fresh via `not sid`
-    daemon.revive_one({"bot_token": "t", "chat_id": -1}, "1902", no_sid,
+    daemon.revive_one({"bot_token": "t", "chat_id": -1}, "7008", no_sid,
                       brief=True, cause="manual")
     assert briefed2 and "no recoverable session id was stored" in briefed2[0]
     assert "explicitly requested" not in briefed2[0]
@@ -579,12 +579,12 @@ def test_the_mass_restore_fan_out_thread_delivers_the_resolved_template(monkeypa
     monkeypatch.setattr(daemon.threading, "Thread", _Thread)
 
     daemon._restore_targets_now({"bot_token": "t", "chat_id": -1}, "boot-9",
-                                [("1902", {"name": "S26", "engine": "claude"})],
+                                [("7008", {"name": "S26", "engine": "claude"})],
                                 cause="recovery")
 
     assert delivered, "the fan-out thread must actually brief"
     tid, tpl = delivered[0]
-    assert tid == "1902"
+    assert tid == "7008"
     assert tpl == daemon._restore_wording("claude", "recovery", fresh=False)[0]
     assert "reboot" not in tpl.replace("whether the host rebooted", "")
 
@@ -601,7 +601,7 @@ def test_the_briefing_retry_actually_re_delivers_the_same_template(monkeypatch):
     monkeypatch.setattr(daemon, "current_boot_id", lambda: "boot-x")
     # The retry re-checks that the topic is still bound to this pane before typing again —
     # a real guard, and without it staged here the retry abandons and the test proves nothing.
-    monkeypatch.setattr(daemon, "read_registry", lambda: {"1902": {"pane": "%77"}})
+    monkeypatch.setattr(daemon, "read_registry", lambda: {"7008": {"pane": "%77"}})
 
     attempts = {"n": 0}
 
@@ -625,12 +625,12 @@ def test_the_briefing_retry_actually_re_delivers_the_same_template(monkeypatch):
     monkeypatch.setattr(daemon.threading, "Timer", _Timer)
 
     tpl, _ = daemon._restore_wording("claude", "auto", fresh=False)
-    daemon.deliver_briefing("%77", "1902", "claude", tpl)
+    daemon.deliver_briefing("%77", "7008", "claude", tpl)
 
     assert scheduled, "a swallowed briefing must schedule a retry"
     assert scheduled[0].fn is daemon.deliver_briefing
     assert len(typed) == 2, "the retry must actually type again"
-    assert typed[0] == typed[1] == tpl.format(tid="1902")
+    assert typed[0] == typed[1] == tpl.format(tid="7008")
     assert "did NOT determine" in typed[1]
 
 
@@ -640,12 +640,12 @@ def test_revive_topics_does_not_report_derived_fresh_as_requested(monkeypatch):
     "a fresh session was explicitly requested". The callee-level test could not see it — the
     wrapper had already collapsed the distinction before revive_one was reached."""
     briefed, _ = _revive_harness(monkeypatch)
-    monkeypatch.setattr(daemon, "read_registry", lambda: {"1902": {"engine": "claude"}})
+    monkeypatch.setattr(daemon, "read_registry", lambda: {"7008": {"engine": "claude"}})
     monkeypatch.setattr(daemon, "context_session_id", lambda pane: None)
 
-    result = daemon.revive_topics({"bot_token": "t", "chat_id": -1}, [{"tid": "1902"}])
+    result = daemon.revive_topics({"bot_token": "t", "chat_id": -1}, [{"tid": "7008"}])
 
-    assert result == {"1902": "fresh"}
+    assert result == {"7008": "fresh"}
     assert briefed, "the wrapper must brief"
     assert "no recoverable session id was stored" in briefed[0]
     assert "explicitly requested" not in briefed[0]
@@ -655,9 +655,9 @@ def test_revive_topics_still_reports_an_explicit_fresh_as_requested(monkeypatch)
     """The other half — the distinction has to survive in both directions."""
     briefed, _ = _revive_harness(monkeypatch)
     monkeypatch.setattr(daemon, "read_registry",
-                        lambda: {"1902": {"engine": "claude", "session_id": "sid"}})
+                        lambda: {"7008": {"engine": "claude", "session_id": "sid"}})
 
-    daemon.revive_topics({"bot_token": "t", "chat_id": -1}, [{"tid": "1902", "fresh": True}])
+    daemon.revive_topics({"bot_token": "t", "chat_id": -1}, [{"tid": "7008", "fresh": True}])
 
     assert briefed and "explicitly requested" in briefed[0]
     assert "no recoverable session id" not in briefed[0]
@@ -716,7 +716,7 @@ def test_a_compact_resume_asks_the_briefing_to_wait_for_compaction(monkeypatch):
                         lambda argv, **kw: type("R", (), {"returncode": 1, "stdout": ""})())
     monkeypatch.setattr(daemon, "launch_pane", lambda *a, **k: ("%178", None))
     monkeypatch.setattr(daemon, "answer_resume_picker", lambda pane, choice, **k: "answered")
-    monkeypatch.setattr(daemon, "read_registry", lambda: {"12999": {"pane": "%178"}})
+    monkeypatch.setattr(daemon, "read_registry", lambda: {"7007": {"pane": "%178"}})
     monkeypatch.setattr(daemon, "reopen_topic", lambda cfg, tid: True)
     monkeypatch.setattr(daemon, "current_boot_id", lambda: "boot-x")
     monkeypatch.setattr(daemon, "update_registry", lambda fn: None)
@@ -726,7 +726,7 @@ def test_a_compact_resume_asks_the_briefing_to_wait_for_compaction(monkeypatch):
     monkeypatch.setattr(daemon, "deliver_briefing",
                         lambda pane, tid, eng, tpl, *a, **k: seen.update(k))
 
-    daemon.revive_one({}, "12999", {"engine": "claude", "session_id": "sid",
+    daemon.revive_one({}, "7007", {"engine": "claude", "session_id": "sid",
                                     "cwd": "/home/user", "pane": "%178"},
                       cause="auto", resume_choice="compact")
 

@@ -75,8 +75,12 @@ def test_full_lifecycle_sequence():
     assert fires == [60, 61]
 
 
-def test_module_defaults_are_60_50():
-    # sanity: default threshold/rearm come from the module constants
-    assert daemon.AUTOCF_PCT == 60
-    assert daemon.AUTOCF_REARM_PCT == 50
-    assert daemon._autocf_decide(60, "claude", False, False) == (True, True)
+def test_module_defaults_are_50_40():
+    # The owner dropped the carry-forward cycle on 2026-09-21 and moved the trigger to 50%
+    # ("we'll just do the automatic compaction at 50% instead of carry forward and
+    # compaction"). The cycle and its 60% threshold come back together, under one flag.
+    assert daemon.CARRY_FORWARD is False
+    assert daemon.AUTOCF_PCT == 50
+    assert daemon.AUTOCF_REARM_PCT == 40
+    assert daemon._autocf_decide(50, "claude", False, False) == (True, True)
+    assert daemon._autocf_decide(49, "claude", False, False) == (False, False)

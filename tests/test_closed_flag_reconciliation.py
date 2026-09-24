@@ -28,11 +28,11 @@ def registry():
 # ---------------------------------------------------------------------------
 
 def test_a_successful_send_clears_a_stale_closed_flag(registry, monkeypatch):
-    registry({"5935": {"pane": "%1", "closed": True}})
+    registry({"7001": {"pane": "%1", "closed": True}})
     monkeypatch.setattr(daemon, "send_message", lambda *a, **k: None)
 
-    assert daemon.reply({"bot_token": "t", "chat_id": 1}, 5935, "hi") is True
-    assert "closed" not in common.read_registry()["5935"], (
+    assert daemon.reply({"bot_token": "t", "chat_id": 1}, 7001, "hi") is True
+    assert "closed" not in common.read_registry()["7001"], (
         "Telegram accepted the send, so the topic is open — the stale flag must go (#212)"
     )
 
@@ -40,27 +40,27 @@ def test_a_successful_send_clears_a_stale_closed_flag(registry, monkeypatch):
 def test_a_successful_send_to_an_open_topic_writes_nothing(registry, monkeypatch):
     """No flag, no write: reply is the hot path and must not touch the registry lock on
     every ordinary delivery."""
-    registry({"5935": {"pane": "%1"}})
+    registry({"7001": {"pane": "%1"}})
     monkeypatch.setattr(daemon, "send_message", lambda *a, **k: None)
     writes = []
     monkeypatch.setattr(daemon, "set_topic_closed",
                         lambda tid, closed: writes.append((tid, closed)))
 
-    assert daemon.reply({"bot_token": "t", "chat_id": 1}, 5935, "hi") is True
+    assert daemon.reply({"bot_token": "t", "chat_id": 1}, 7001, "hi") is True
     assert writes == []
 
 
 def test_a_rejected_send_still_marks_closed(registry, monkeypatch):
     """The existing negative observation is unchanged."""
-    registry({"5935": {"pane": "%1"}})
+    registry({"7001": {"pane": "%1"}})
 
     def _boom(*a, **k):
         raise RuntimeError("Bad Request: TOPIC_CLOSED")
 
     monkeypatch.setattr(daemon, "send_message", _boom)
 
-    assert daemon.reply({"bot_token": "t", "chat_id": 1}, 5935, "hi") is False
-    assert common.read_registry()["5935"].get("closed") is True
+    assert daemon.reply({"bot_token": "t", "chat_id": 1}, 7001, "hi") is False
+    assert common.read_registry()["7001"].get("closed") is True
 
 
 def test_general_never_reconciles(registry, monkeypatch):
@@ -77,14 +77,14 @@ def test_general_never_reconciles(registry, monkeypatch):
 
 def test_reconciliation_invokes_no_lifecycle_effects(registry, monkeypatch):
     """The #206 boundary: clearing the flag may not start a revive or a pending question."""
-    registry({"5935": {"pane": "%1", "closed": True, "ended": "2026-01-01T00:00:00+0000"}})
+    registry({"7001": {"pane": "%1", "closed": True, "ended": "2026-01-01T00:00:00+0000"}})
     monkeypatch.setattr(daemon, "send_message", lambda *a, **k: None)
     revives = []
     monkeypatch.setattr(daemon, "revive_one",
                         lambda *a, **k: revives.append(1) or ("failed", {}))
 
-    daemon.reply({"bot_token": "t", "chat_id": 1}, 5935, "hi")
-    entry = common.read_registry()["5935"]
+    daemon.reply({"bot_token": "t", "chat_id": 1}, 7001, "hi")
+    entry = common.read_registry()["7001"]
     assert "closed" not in entry
     assert entry.get("ended"), "the flag clear must not resurrect an ended entry"
     assert revives == []
@@ -108,11 +108,11 @@ def test_identical_rejections_inside_the_window_emit_one_line(reject_log, monkey
     monkeypatch.setattr(daemon.time, "monotonic", lambda: now[0])
 
     for _ in range(50):
-        daemon._log_rejected_service_event("close", 5935, 42, None)
+        daemon._log_rejected_service_event("close", 7001, 42, None)
         now[0] += 0.1
 
     assert len(reject_log) == 1, "an event flood must not become a journal flood (#212)"
-    assert "ignored forum close of topic 5935" in reject_log[0]
+    assert "ignored forum close of topic 7001" in reject_log[0]
 
 
 def test_the_suppressed_count_is_carried_on_the_next_line(reject_log, monkeypatch):
@@ -120,9 +120,9 @@ def test_the_suppressed_count_is_carried_on_the_next_line(reject_log, monkeypatc
     monkeypatch.setattr(daemon.time, "monotonic", lambda: now[0])
 
     for _ in range(10):
-        daemon._log_rejected_service_event("close", 5935, 42, None)
+        daemon._log_rejected_service_event("close", 7001, 42, None)
     now[0] += daemon._SVC_REJECT_WINDOW + 1
-    daemon._log_rejected_service_event("close", 5935, 42, None)
+    daemon._log_rejected_service_event("close", 7001, 42, None)
 
     assert len(reject_log) == 2
     assert "9 identical rejections suppressed" in reject_log[1]
@@ -131,9 +131,9 @@ def test_the_suppressed_count_is_carried_on_the_next_line(reject_log, monkeypatc
 def test_distinct_rejections_are_not_coalesced(reject_log, monkeypatch):
     monkeypatch.setattr(daemon.time, "monotonic", lambda: 1000.0)
 
-    daemon._log_rejected_service_event("close", 5935, 42, None)
-    daemon._log_rejected_service_event("reopen", 5935, 42, None)
-    daemon._log_rejected_service_event("close", 5935, 43, None)
+    daemon._log_rejected_service_event("close", 7001, 42, None)
+    daemon._log_rejected_service_event("reopen", 7001, 42, None)
+    daemon._log_rejected_service_event("close", 7001, 43, None)
 
     assert len(reject_log) == 3, "different event/sender must each land immediately"
 
@@ -141,7 +141,7 @@ def test_distinct_rejections_are_not_coalesced(reject_log, monkeypatch):
 def test_the_first_line_of_a_burst_lands_immediately(reject_log, monkeypatch):
     monkeypatch.setattr(daemon.time, "monotonic", lambda: 1000.0)
 
-    daemon._log_rejected_service_event("close", 5935, 42, None)
+    daemon._log_rejected_service_event("close", 7001, 42, None)
 
     assert len(reject_log) == 1, "coalescing must delay repeats, never the first sighting"
 
@@ -154,9 +154,9 @@ def test_the_window_survives_a_wall_clock_rollback(reject_log, monkeypatch):
     monkeypatch.setattr(daemon.time, "monotonic", lambda: mono[0])
     monkeypatch.setattr(daemon.time, "time", lambda: 5.0)  # wall clock 'rolled back'
 
-    daemon._log_rejected_service_event("close", 5935, 42, None)
+    daemon._log_rejected_service_event("close", 7001, 42, None)
     mono[0] += daemon._SVC_REJECT_WINDOW + 1
-    daemon._log_rejected_service_event("close", 5935, 42, None)
+    daemon._log_rejected_service_event("close", 7001, 42, None)
 
     assert len(reject_log) == 2, (
         "a wall-clock correction silently extended suppression past the real window"
@@ -169,7 +169,7 @@ def test_the_key_table_is_bounded_at_the_cap(reject_log, monkeypatch):
     monkeypatch.setattr(daemon.time, "monotonic", lambda: 1000.0)
 
     for sender in range(daemon._SVC_REJECT_MAX_KEYS + 10):
-        daemon._log_rejected_service_event("close", 5935, sender, None)
+        daemon._log_rejected_service_event("close", 7001, sender, None)
 
     assert len(daemon._svc_rejects) <= daemon._SVC_REJECT_MAX_KEYS
 
@@ -184,19 +184,19 @@ def test_the_cap_does_not_lose_a_live_burst_count(reject_log, monkeypatch):
     # Fill the table one short of the cap with keys whose windows will have TURNED by the
     # time the cap eviction runs.
     for sender in range(2, daemon._SVC_REJECT_MAX_KEYS + 1):
-        daemon._log_rejected_service_event("reopen", 5935, sender, None)
+        daemon._log_rejected_service_event("reopen", 7001, sender, None)
 
     now[0] = daemon._SVC_REJECT_WINDOW + 1
-    daemon._log_rejected_service_event("close", 5935, 1, None)   # key A, live window
+    daemon._log_rejected_service_event("close", 7001, 1, None)   # key A, live window
     for _ in range(5):
-        daemon._log_rejected_service_event("close", 5935, 1, None)
+        daemon._log_rejected_service_event("close", 7001, 1, None)
 
     # A new key at the cap: eviction must take the expired fillers, never live A.
     now[0] += 10
-    daemon._log_rejected_service_event("reopen", 5935, 9999, None)
+    daemon._log_rejected_service_event("reopen", 7001, 9999, None)
 
     now[0] += daemon._SVC_REJECT_WINDOW                           # A's window turns
-    daemon._log_rejected_service_event("close", 5935, 1, None)
+    daemon._log_rejected_service_event("close", 7001, 1, None)
 
     assert any("5 identical rejections suppressed" in line for line in reject_log), (
         "the cap eviction discarded the window state of a burst still running"
@@ -210,22 +210,22 @@ def test_an_all_live_eviction_flushes_the_count_instead_of_dropping_it(
     now = [0.0]
     monkeypatch.setattr(daemon.time, "monotonic", lambda: now[0])
 
-    daemon._log_rejected_service_event("close", 5935, 1, None)   # key A, the oldest
+    daemon._log_rejected_service_event("close", 7001, 1, None)   # key A, the oldest
     for _ in range(5):
-        daemon._log_rejected_service_event("close", 5935, 1, None)
+        daemon._log_rejected_service_event("close", 7001, 1, None)
     now[0] = 1.0
     for sender in range(2, daemon._SVC_REJECT_MAX_KEYS + 1):     # fill to cap, all live
-        daemon._log_rejected_service_event("reopen", 5935, sender, None)
+        daemon._log_rejected_service_event("reopen", 7001, sender, None)
 
     now[0] = 2.0
-    daemon._log_rejected_service_event("reopen", 5935, 9999, None)  # forces the eviction
+    daemon._log_rejected_service_event("reopen", 7001, 9999, None)  # forces the eviction
 
     flushed = [line for line in reject_log
                if "5 identical rejections suppressed" in line and "evicted" in line]
     assert flushed, (
         "evicting a live window silently dropped its suppressed count (#272 r2)"
     )
-    assert "close" in flushed[0] and "5935" in flushed[0]
+    assert "close" in flushed[0] and "7001" in flushed[0]
 
 
 def test_a_stale_cleanup_at_capacity_flushes_counts_too(reject_log, monkeypatch):
@@ -234,14 +234,14 @@ def test_a_stale_cleanup_at_capacity_flushes_counts_too(reject_log, monkeypatch)
     now = [0.0]
     monkeypatch.setattr(daemon.time, "monotonic", lambda: now[0])
 
-    daemon._log_rejected_service_event("close", 5935, 1, None)   # key A
+    daemon._log_rejected_service_event("close", 7001, 1, None)   # key A
     for _ in range(5):
-        daemon._log_rejected_service_event("close", 5935, 1, None)
+        daemon._log_rejected_service_event("close", 7001, 1, None)
     for sender in range(2, daemon._SVC_REJECT_MAX_KEYS + 1):     # fill to cap
-        daemon._log_rejected_service_event("reopen", 5935, sender, None)
+        daemon._log_rejected_service_event("reopen", 7001, sender, None)
 
     now[0] = daemon._SVC_REJECT_WINDOW + 1                       # everything expires
-    daemon._log_rejected_service_event("reopen", 5935, 9999, None)  # triggers cleanup
+    daemon._log_rejected_service_event("reopen", 7001, 9999, None)  # triggers cleanup
 
     flushed = [line for line in reject_log
                if "5 identical rejections suppressed" in line and "expired" in line]

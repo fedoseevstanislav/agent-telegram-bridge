@@ -48,7 +48,7 @@ def _revive(entry_cwd, choice, picker_result, monkeypatch, posted):
     monkeypatch.setattr(daemon, "answer_resume_picker",
                         lambda pane, c, deadline=None: picker_result)
     entry = {"engine": "claude", "session_id": "SID", "cwd": entry_cwd, "pane": "%OLD"}
-    daemon.revive_one({}, "5935", entry, brief=False, cause="reopen",
+    daemon.revive_one({}, "7001", entry, brief=False, cause="reopen",
                       resume_choice=choice, respect_close=True)
     return "\n".join(posted)
 
@@ -98,7 +98,7 @@ def test_maybe_auto_revive_forwards_its_cause(monkeypatch, cause, expected):
     arrived: the same false trigger, through a different door (#236 review r1, Q2)."""
     seen = {}
     monkeypatch.setattr(daemon, "read_registry",
-                        lambda: {"5935": {"engine": "codex", "session_id": "SID", "ended": "x"}})
+                        lambda: {"7001": {"engine": "codex", "session_id": "SID", "ended": "x"}})
     monkeypatch.setattr(daemon, "should_auto_revive", lambda entry: True)
     monkeypatch.setattr(daemon, "_reopen_needs_asking", lambda entry: False)
     monkeypatch.setattr(daemon, "log", lambda *a, **k: None)
@@ -106,8 +106,8 @@ def test_maybe_auto_revive_forwards_its_cause(monkeypatch, cause, expected):
                         lambda cfg, tid, entry, **kw: (seen.update(kw) or ("resumed", None)))
 
     if cause is None:
-        daemon.maybe_auto_revive({}, "5935")
+        daemon.maybe_auto_revive({}, "7001")
     else:
-        daemon.maybe_auto_revive({}, "5935", cause=cause)
+        daemon.maybe_auto_revive({}, "7001", cause=cause)
 
     assert seen.get("cause") == expected

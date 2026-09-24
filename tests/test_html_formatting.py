@@ -123,18 +123,18 @@ class _Api:
 def test_send_message_happy_path_html(monkeypatch):
     rec = _Api()
     monkeypatch.setattr(common, "api", rec)
-    common.send_message("t", 5, "hi **bold**", thread_id=33)
+    common.send_message("t", 5, "hi **bold**", thread_id=7033)
     assert len(rec.calls) == 1
     assert rec.calls[0]["parse_mode"] == "HTML"
     assert rec.calls[0]["text"] == "hi <b>bold</b>"
-    assert rec.calls[0]["message_thread_id"] == 33
+    assert rec.calls[0]["message_thread_id"] == 7033
     assert rec.calls[0]["chat_id"] == 5
 
 
 def test_send_message_falls_back_to_plain_on_parse_error(monkeypatch):
     rec = _Api(fail_parse=True)
     monkeypatch.setattr(common, "api", rec)
-    common.send_message("t", 5, "bad <x", thread_id=33)
+    common.send_message("t", 5, "bad <x", thread_id=7033)
     assert len(rec.calls) == 2
     assert "parse_mode" in rec.calls[0]          # first HTML attempt
     assert "parse_mode" not in rec.calls[1]      # plain-text fallback
@@ -145,7 +145,7 @@ def test_send_message_reraises_non_parse_error(monkeypatch):
     rec = _Api(fail_conn=True)
     monkeypatch.setattr(common, "api", rec)
     with pytest.raises(RuntimeError):
-        common.send_message("t", 5, "hi", thread_id=33)
+        common.send_message("t", 5, "hi", thread_id=7033)
     assert len(rec.calls) == 1                   # no plain-text retry on connection failure
 
 
@@ -173,7 +173,7 @@ def test_send_message_verbatim_preserves_disclosure_characters(monkeypatch):
     )
     disclosure = (line * (10528 // len(line) + 1))[:10528]
 
-    deliveries = common.send_message("t", 5, disclosure, thread_id=33, verbatim=True)
+    deliveries = common.send_message("t", 5, disclosure, thread_id=7033, verbatim=True)
 
     assert len(rec.calls) == 3
     assert "".join(call["text"] for call in rec.calls) == disclosure
@@ -187,13 +187,13 @@ def test_send_message_adds_force_reply_only_to_a_single_prompt(monkeypatch):
     monkeypatch.setattr(common, "api", rec)
 
     common.send_message(
-        "t", 5, "Reply OK or go", thread_id=33,
+        "t", 5, "Reply OK or go", thread_id=7033,
         reply_markup={"force_reply": True, "input_field_placeholder": "OK to publish"},
     )
 
     assert rec.calls == [{
         "chat_id": 5,
-        "message_thread_id": 33,
+        "message_thread_id": 7033,
         "text": "Reply OK or go",
         "parse_mode": "HTML",
         "reply_markup": '{"force_reply":true,"input_field_placeholder":"OK to publish"}',

@@ -3,7 +3,7 @@
 It appeared in the suite only as a monkeypatched stub, so its own logic never ran. Three
 behaviours carry consequences, and each fails in a different direction:
 
-  * the boundary match — `pgrep -af "tg-bridge recv --topic 6"` matches `--topic 606` as a
+  * the boundary match — `pgrep -af "tg-bridge recv --topic 6"` matches `--topic 604` as a
     plain substring, so a prefix collision would report a listener that belongs to another
     topic, and the sweep would never heal the session that actually went dark;
   * errors return None so callers err toward "not dark" — returning False instead turns one
@@ -44,33 +44,33 @@ BARE = "830538 /home/user/bin/tg-bridge recv --topic {tid} --wait 86400"
 
 
 def test_a_live_listener_is_found_through_the_shell_wrapper(monkeypatch):
-    _pgrep(monkeypatch, WRAPPED.format(tid=4367) + "\n")
-    assert daemon.has_live_recv(4367) is True
+    _pgrep(monkeypatch, WRAPPED.format(tid=7002) + "\n")
+    assert daemon.has_live_recv(7002) is True
 
 
 def test_a_live_listener_is_found_when_invoked_by_absolute_path(monkeypatch):
-    _pgrep(monkeypatch, BARE.format(tid=6258) + "\n")
-    assert daemon.has_live_recv(6258) is True
+    _pgrep(monkeypatch, BARE.format(tid=7015) + "\n")
+    assert daemon.has_live_recv(7015) is True
 
 
 def test_no_listener_returns_false_not_none(monkeypatch):
     # `idle_sweep_loop` gates on `recv is False`. None here would silently disable the
     # dead-listener branch for every topic — the sweep would stop healing anything.
     _pgrep(monkeypatch, "")
-    assert daemon.has_live_recv(4367) is False
+    assert daemon.has_live_recv(7002) is False
 
 
 # ---- the boundary match ------------------------------------------------------
 
 @pytest.mark.parametrize("running,asked", [
-    (606, 6),        # the case named in the docstring
+    (604, 6),        # the case named in the docstring
     (60, 6),
-    (12999, 129),
-    (13130, 1313),
-    (1902, 190),
+    (70199, 701),
+    (71313, 7131),
+    (7190, 719),
 ])
 def test_a_longer_topic_id_is_not_mistaken_for_a_shorter_one(monkeypatch, running, asked):
-    # pgrep's own pattern is a substring match, so it hands back the 606 line when asked
+    # pgrep's own pattern is a substring match, so it hands back the 604 line when asked
     # about 6. If the filter stops tightening that, topic 6 reads as "has a listener" and
     # the sweep never heals it — silently, and only for topics whose id is a prefix of a
     # live one.
@@ -78,7 +78,7 @@ def test_a_longer_topic_id_is_not_mistaken_for_a_shorter_one(monkeypatch, runnin
     assert daemon.has_live_recv(asked) is False
 
 
-@pytest.mark.parametrize("tid", [6, 60, 606])
+@pytest.mark.parametrize("tid", [6, 60, 604])
 def test_each_id_still_finds_its_own_listener(monkeypatch, tid):
     # The mirror of the above: tightening the match must not overshoot into never matching.
     _pgrep(monkeypatch, WRAPPED.format(tid=tid) + "\n")
@@ -87,7 +87,7 @@ def test_each_id_still_finds_its_own_listener(monkeypatch, tid):
 
 def test_the_right_listener_is_found_among_several(monkeypatch):
     _pgrep(monkeypatch, "\n".join([
-        WRAPPED.format(tid=606),
+        WRAPPED.format(tid=604),
         WRAPPED.format(tid=60),
         BARE.format(tid=6),
     ]) + "\n")
@@ -96,16 +96,16 @@ def test_the_right_listener_is_found_among_several(monkeypatch):
 
 def test_a_prefix_sibling_alone_does_not_answer_for_the_topic(monkeypatch):
     _pgrep(monkeypatch, "\n".join([
-        WRAPPED.format(tid=606),
+        WRAPPED.format(tid=604),
         WRAPPED.format(tid=60),
     ]) + "\n")
     assert daemon.has_live_recv(6) is False
 
 
 def test_the_id_is_matched_at_its_start_too(monkeypatch):
-    # 606's listener must not answer for 06 or for a trailing-substring lookalike.
-    _pgrep(monkeypatch, WRAPPED.format(tid=606) + "\n")
-    assert daemon.has_live_recv(606) is True
+    # 604's listener must not answer for 06 or for a trailing-substring lookalike.
+    _pgrep(monkeypatch, WRAPPED.format(tid=604) + "\n")
+    assert daemon.has_live_recv(604) is True
     assert daemon.has_live_recv(60) is False
 
 
@@ -116,16 +116,16 @@ def test_an_error_returns_none_so_callers_err_toward_not_dark(monkeypatch):
     # dead-listener verdict for the whole fleet at once — one pgrep failure, every pane
     # nudged. None is what keeps a broken probe from becoming a broadcast.
     _pgrep(monkeypatch, "", boom=OSError("pgrep: cannot fork"))
-    assert daemon.has_live_recv(4367) is None
+    assert daemon.has_live_recv(7002) is None
 
 
 def test_the_probe_asks_pgrep_for_the_full_command_line(monkeypatch):
     # Without -f, pgrep matches only the process NAME ("bash", "python3"), so every lookup
     # returns nothing and every topic reads as dark.
     calls = _pgrep(monkeypatch, "")
-    daemon.has_live_recv(4367)
+    daemon.has_live_recv(7002)
     assert calls, "has_live_recv never invoked pgrep"
     cmd = calls[0]
     assert cmd[0] == "pgrep"
     assert "-af" in cmd or ("-a" in cmd and "-f" in cmd)
-    assert any("4367" in part for part in cmd), "the topic id never reached the probe"
+    assert any("7002" in part for part in cmd), "the topic id never reached the probe"

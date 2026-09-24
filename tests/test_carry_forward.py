@@ -564,7 +564,7 @@ def test_leading_whitespace_command_is_not_passive():
     assert not daemon.is_passive_status_command("\t/help")
 
 
-def _cf_msg(text, thread_id=33):
+def _cf_msg(text, thread_id=7033):
     return {"chat": {"id": 1}, "from": {"id": 5},
             "message_thread_id": thread_id, "text": text}
 
@@ -631,6 +631,9 @@ def test_worker_disarms_kill_switch_after_successful_resume(monkeypatch):
     # carry-forward is complete — the flow is released so NO later message (not even a
     # real one) can trip a spurious "halted". Mock the pane-driving so the happy path
     # runs deterministically; use the REAL _cf_release / carry_forward_active.
+    # Pins the carry-forward CYCLE, off by default since 2026-09-21 — switch it on so this
+    # test keeps testing what it is about (new default: tests/test_compact_only.py).
+    monkeypatch.setattr(daemon, "CARRY_FORWARD", True)
     monkeypatch.setattr(daemon.time, "sleep", lambda *a, **k: None)
     monkeypatch.setattr(daemon, "_cf_cleanup_marker", lambda *a, **k: None)
     monkeypatch.setattr(daemon, "_cf_wait_idle", lambda *a, **k: "idle")
@@ -649,11 +652,11 @@ def test_worker_disarms_kill_switch_after_successful_resume(monkeypatch):
     replies = []
     monkeypatch.setattr(daemon, "reply", lambda cfg, tid, text: replies.append(text))
     monkeypatch.setattr(daemon, "_pending_cf",
-                        {"33": {"token": "t", "pane": "%0", "phase": "write"}})
+                        {"7033": {"token": "t", "pane": "%0", "phase": "write"}})
 
-    daemon._carry_forward_worker({}, 33, "%0", "/x/cf.md", "/x/cf.md.done", "t", "sess")
+    daemon._carry_forward_worker({}, 7033, "%0", "/x/cf.md", "/x/cf.md.done", "t", "sess")
 
-    assert not daemon.carry_forward_active(33)                 # kill-switch disarmed
+    assert not daemon.carry_forward_active(7033)                 # kill-switch disarmed
     assert any("Carry-forward complete" in r for r in replies) # resume confirmation sent
     assert not any("halted" in r.lower() for r in replies)     # no spurious halt
 
@@ -688,11 +691,11 @@ def test_worker_aborts_when_busy_but_not_compacting(monkeypatch):
     replies = []
     monkeypatch.setattr(daemon, "reply", lambda cfg, tid, text: replies.append(text))
     monkeypatch.setattr(daemon, "_pending_cf",
-                        {"33": {"token": "t", "pane": "%0", "phase": "write"}})
+                        {"7033": {"token": "t", "pane": "%0", "phase": "write"}})
 
-    daemon._carry_forward_worker({}, 33, "%0", "/x/cf.md", "/x/cf.md.done", "t", "sess")
+    daemon._carry_forward_worker({}, 7033, "%0", "/x/cf.md", "/x/cf.md.done", "t", "sess")
 
-    assert not daemon.carry_forward_active(33)                        # flow released on abort
+    assert not daemon.carry_forward_active(7033)                        # flow released on abort
     assert injected.count("/compact") == daemon.CF_COMPACT_TRIES      # retried, didn't give up early
     assert any("didn't start compacting" in r for r in replies)      # honest abort message
     assert not any("Carry-forward complete" in r for r in replies)   # NO false success
@@ -877,12 +880,12 @@ def test_worker_stops_at_once_when_a_precompact_hook_refuses(monkeypatch):
     replies = []
     monkeypatch.setattr(daemon, "reply", lambda cfg, tid, text: replies.append(text))
     monkeypatch.setattr(daemon, "_pending_cf",
-                        {"33": {"token": "t", "pane": "%0", "phase": "write"}})
+                        {"7033": {"token": "t", "pane": "%0", "phase": "write"}})
 
-    daemon._carry_forward_worker({}, 33, "%0", "/x/cf.md", "/x/cf.md.done", "t", "sess")
+    daemon._carry_forward_worker({}, 7033, "%0", "/x/cf.md", "/x/cf.md.done", "t", "sess")
 
     assert injected.count("/compact") == 1                            # no pointless retries
-    assert not daemon.carry_forward_active(33)                        # flow released
+    assert not daemon.carry_forward_active(7033)                        # flow released
     assert any("refused by a PreCompact hook" in r for r in replies)
     assert any("no new carry-forward comment on #42" in r for r in replies)  # the real reason
     assert not any("didn't start compacting" in r for r in replies)   # not the generic message
@@ -896,6 +899,9 @@ def test_worker_still_retries_when_a_displayed_refusal_is_not_ours(monkeypatch):
     # attempts that can succeed. Drive the real _cf_hook_block_reason with a pane that
     # displays a past refusal throughout, and let attempt 2 compact: the carry-forward must
     # complete normally.
+    # Pins the carry-forward CYCLE, off by default since 2026-09-21 — switch it on so this
+    # test keeps testing what it is about (new default: tests/test_compact_only.py).
+    monkeypatch.setattr(daemon, "CARRY_FORWARD", True)
     monkeypatch.setattr(daemon.time, "sleep", lambda *a, **k: None)
     monkeypatch.setattr(daemon, "_cf_cleanup_marker", lambda *a, **k: None)
     monkeypatch.setattr(daemon, "_cf_wait_idle", lambda *a, **k: "idle")
@@ -926,9 +932,9 @@ def test_worker_still_retries_when_a_displayed_refusal_is_not_ours(monkeypatch):
     replies = []
     monkeypatch.setattr(daemon, "reply", lambda cfg, tid, text: replies.append(text))
     monkeypatch.setattr(daemon, "_pending_cf",
-                        {"33": {"token": "t", "pane": "%0", "phase": "write"}})
+                        {"7033": {"token": "t", "pane": "%0", "phase": "write"}})
 
-    daemon._carry_forward_worker({}, 33, "%0", "/x/cf.md", "/x/cf.md.done", "t", "sess")
+    daemon._carry_forward_worker({}, 7033, "%0", "/x/cf.md", "/x/cf.md.done", "t", "sess")
 
     assert injected.count("/compact") == 2                             # the retry was not stolen
     assert any("Carry-forward complete" in r for r in replies)         # it recovered
@@ -969,9 +975,9 @@ def test_worker_snapshots_the_pane_before_injecting_compact(monkeypatch):
     replies = []
     monkeypatch.setattr(daemon, "reply", lambda cfg, tid, text: replies.append(text))
     monkeypatch.setattr(daemon, "_pending_cf",
-                        {"33": {"token": "t", "pane": "%0", "phase": "write"}})
+                        {"7033": {"token": "t", "pane": "%0", "phase": "write"}})
 
-    daemon._carry_forward_worker({}, 33, "%0", "/x/cf.md", "/x/cf.md.done", "t", "sess")
+    daemon._carry_forward_worker({}, 7033, "%0", "/x/cf.md", "/x/cf.md.done", "t", "sess")
 
     assert events[:2] == ["capture", "inject"]                  # snapshot precedes the inject
     assert any("refused by a PreCompact hook" in r for r in replies)

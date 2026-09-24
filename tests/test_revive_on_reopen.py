@@ -4,7 +4,7 @@
 on-message trigger and closed the issue, so reopening was inert. That is worse than a plain
 gap: the working path was one keystroke away from the dead one, so reopening a topic and
 waiting looked like a broken revive rather than a missing feature. Observed 2026-08-24 on
-topic 14886 — reopened at 21:26:23, nothing happened, session stayed dead.
+topic 7009 — reopened at 21:26:23, nothing happened, session stayed dead.
 
 The tests drive the real `handle_message` so the CALL SITE is covered, not a re-implementation
 of the decision — the same distinction that left three in-loop mutations alive earlier in this
@@ -25,7 +25,7 @@ import pytest
 from bridge import daemon
 
 
-TID = 14886
+TID = 7009
 # `owner_id` matches the sender `_msg` builds: since #206 a forum service message only drives
 # state and revival when the owner (or this bot) sent it.
 CFG = {"chat_id": -100123, "bot_token": "t", "owner_id": 1}

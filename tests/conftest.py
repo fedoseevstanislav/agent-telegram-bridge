@@ -14,7 +14,7 @@ import pytest
 # claude readers look under `~/.codex` and `~/.claude`. Left pointing at the real home, the
 # suite reads and writes the LIVE bridge's state while the daemon is running (#203). Measured
 # with a `sys.addaudithook` plugin: collection ALONE opens the live `pending-reopens.json`,
-# and a full run touched the state root 20 times and created `topics/{33,8265,11722}`.
+# and a full run touched the state root 20 times and created `topics/{7033,7004,7005}`.
 #
 # Three reasons this belongs at module scope rather than in a fixture:
 #
@@ -80,8 +80,8 @@ def _isolated_state_dir(monkeypatch, tmp_path):
 
     Session-scoped HOME isolation stops the suite reaching the LIVE bridge, but it leaves one
     mutable state tree shared by 1000+ tests, so whatever a test writes is visible to every
-    test after it. Review of #203 measured three real leaks: `topics/8265` from
-    test_local_notification, `topics/33` from test_modal_safe_nudge, `topics/11722` from
+    test after it. Review of #203 measured three real leaks: `topics/7004` from
+    test_local_notification, `topics/7033` from test_modal_safe_nudge, `topics/7005` from
     test_reopen_choice — all created by `state_path`, which mkdirs the parent of whatever it
     returns. No assertion depends on them today; the point is that none can start to.
 

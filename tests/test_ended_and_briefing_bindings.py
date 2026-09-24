@@ -178,15 +178,15 @@ def test_a_first_attempt_does_not_type_into_a_pane_the_topic_has_left(
         registry, briefing_env, engine):
     """C1 — the reviewer's reproduction, both engines: registry bound to %NEW, the chain
     holds %OLD, attempt=1. Nothing may be typed."""
-    registry({"5935": {"pane": "%NEW", "engine": engine}})
+    registry({"7001": {"pane": "%NEW", "engine": engine}})
 
-    daemon.deliver_briefing("%OLD", "5935", engine, "briefing {tid}", attempt=1)
+    daemon.deliver_briefing("%OLD", "7001", engine, "briefing {tid}", attempt=1)
 
     assert briefing_env == [], (
         "a first-attempt briefing was typed into a pane the topic has left — one topic's "
         "operating instructions land in another topic's session (#238)"
     )
-    assert common.read_registry()["5935"].get("briefed_boot") is None, (
+    assert common.read_registry()["7001"].get("briefed_boot") is None, (
         "briefed at a pane that received nothing"
     )
 
@@ -196,12 +196,12 @@ def test_a_first_attempt_into_the_bound_pane_still_types(registry, briefing_env,
     """C2/C3 — the guard must not eat the legitimate inline path: this chain's own bind is
     committed before deliver_briefing runs, so the re-read sees it and the briefing goes
     through, stamping the pane that was actually typed into."""
-    registry({"5935": {"pane": "%P", "engine": engine}})
+    registry({"7001": {"pane": "%P", "engine": engine}})
 
-    daemon.deliver_briefing("%P", "5935", engine, "briefing {tid}", attempt=1)
+    daemon.deliver_briefing("%P", "7001", engine, "briefing {tid}", attempt=1)
 
     assert briefing_env == ["%P"]
-    assert common.read_registry()["5935"]["briefed_boot"] == BOOT
+    assert common.read_registry()["7001"]["briefed_boot"] == BOOT
 
 
 def test_a_close_that_raced_a_revive_is_undone(registry, monkeypatch):
@@ -295,7 +295,7 @@ def test_type_line_withholds_enter_when_authority_lapses_mid_call(monkeypatch):
 def test_deliver_briefing_hands_its_ownership_check_into_type_line(registry, monkeypatch):
     """The rebind lands while type_line runs. The fake rebinds the topic and then consults
     the handed-in predicate — the delivery is refused, nothing retried, nothing stamped."""
-    registry({"12999": {"pane": "%178", "engine": "claude"}})
+    registry({"7007": {"pane": "%178", "engine": "claude"}})
     monkeypatch.setattr(daemon, "pane_alive", lambda p: True)
     monkeypatch.setattr(daemon, "pane_is_idle", lambda p: True)
     monkeypatch.setattr(daemon, "has_live_recv", lambda tid: False)
@@ -311,20 +311,20 @@ def test_deliver_briefing_hands_its_ownership_check_into_type_line(registry, mon
         seen["still_ok"] = still_ok
         if still_ok is None:
             return "sent"
-        common.update_registry(lambda reg: reg["12999"].__setitem__("pane", "%999"))
+        common.update_registry(lambda reg: reg["7007"].__setitem__("pane", "%999"))
         seen["verdict"] = still_ok()
         return "abandoned"
 
     monkeypatch.setattr(daemon, "type_line", _type_line)
 
-    daemon.deliver_briefing("%178", "12999", "claude", "brief {tid}")
+    daemon.deliver_briefing("%178", "7007", "claude", "brief {tid}")
 
     assert seen["still_ok"] is not None, (
         "deliver_briefing no longer hands its ownership check into type_line"
     )
     assert seen["verdict"] is False, "the handed-in check missed the mid-type rebind"
     assert timers == [], "an abandoned briefing belongs to the new owner, not a retry"
-    assert common.read_registry()["12999"].get("briefed_boot") is None
+    assert common.read_registry()["7007"].get("briefed_boot") is None
 
 
 def test_a_new_codex_pane_on_the_same_boot_is_briefed(registry, monkeypatch):
@@ -333,7 +333,7 @@ def test_a_new_codex_pane_on_the_same_boot_is_briefed(registry, monkeypatch):
     reviewer's reproduction, through revive_one."""
     entry = {"pane": "%OLD", "engine": "codex", "session_id": "sid",
              "briefed_boot": BOOT, "name": "x"}
-    registry({"5935": dict(entry)})
+    registry({"7001": dict(entry)})
     monkeypatch.setattr(daemon, "current_boot_id", lambda: BOOT)
     monkeypatch.setattr(daemon, "_tmux",
                         lambda *a, **k: types.SimpleNamespace(returncode=1, stdout=""))
@@ -349,11 +349,11 @@ def test_a_new_codex_pane_on_the_same_boot_is_briefed(registry, monkeypatch):
                         lambda pane, text, settle=0.4, still_ok=None:
                         (typed.append(pane), "sent")[1])
 
-    status, task = daemon.revive_one({"bot_token": "t", "chat_id": 1}, "5935",
+    status, task = daemon.revive_one({"bot_token": "t", "chat_id": 1}, "7001",
                                      entry, cause="manual")
 
     assert status == "resumed"
     assert typed == ["%NEW"], (
         "the same-boot replacement pane was refused its first briefing (#270 r1, finding 3)"
     )
-    assert common.read_registry()["5935"]["briefed_boot"] == BOOT
+    assert common.read_registry()["7001"]["briefed_boot"] == BOOT

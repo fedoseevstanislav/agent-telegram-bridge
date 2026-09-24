@@ -1,8 +1,8 @@
 """#190 — a revived claude session must come back at the effort it was running at.
 
 The model was already carried deliberately (`last_model_for_session`), the effort was not, so
-every revive silently reset it to the machine default. Observed twice in two days: topic 1902
-had run 352 consecutive Fable turns at `medium` and came back `xhigh`; topic 14886 did the
+every revive silently reset it to the machine default. Observed twice in two days: topic 7008
+had run 352 consecutive Fable turns at `medium` and came back `xhigh`; topic 7009 did the
 same. That is not cosmetic on a rate-limited model, and correcting it afterwards costs a full
 context re-read (the `/effort` confirm dialog says so outright).
 
@@ -168,7 +168,7 @@ def test_revive_passes_the_recorded_effort_through(tmp_path, monkeypatch, captur
     monkeypatch.setattr(daemon, "last_model_for_session", lambda sid: "claude-fable-5")
     entry = {"engine": "claude", "session_id": "SID", "cwd": str(tmp_path), "pane": "%1"}
 
-    daemon.revive_one({}, "11722", entry)
+    daemon.revive_one({}, "7005", entry)
 
     assert "--effort medium" in capture_launch["launch"], (
         "revive_one still drops the effort — the fix is not wired to the call site (#190)"
@@ -181,7 +181,7 @@ def test_revive_of_a_no_effort_model_launches_without_the_flag(tmp_path, monkeyp
     monkeypatch.setattr(daemon, "last_model_for_session", lambda sid: "claude-opus-4-8")
     entry = {"engine": "claude", "session_id": "SID", "cwd": str(tmp_path), "pane": "%1"}
 
-    daemon.revive_one({}, "11722", entry)
+    daemon.revive_one({}, "7005", entry)
 
     assert "--effort" not in capture_launch["launch"]
 
@@ -196,7 +196,7 @@ def test_a_codex_revive_does_not_consult_the_claude_transcript(tmp_path, monkeyp
     monkeypatch.setattr(daemon, "ensure_codex_trust", lambda cwd: None)
     entry = {"engine": "codex", "session_id": "SID", "cwd": str(tmp_path), "pane": "%1"}
 
-    daemon.revive_one({}, "8713", entry)
+    daemon.revive_one({}, "7017", entry)
 
     assert "--effort" not in capture_launch["launch"]
 
@@ -237,7 +237,7 @@ def test_a_stale_watchdog_model_never_beats_the_transcript(tmp_path, monkeypatch
     monkeypatch.setattr(daemon, "last_model_for_session", lambda sid: "claude-fable-5")
     entry = {"engine": "claude", "session_id": "SID", "cwd": str(tmp_path), "pane": "%1"}
 
-    daemon.revive_one({}, "11722", entry)
+    daemon.revive_one({}, "7005", entry)
 
     assert "claude-opus-4-8" in capture_launch["launch"], (
         "resumed the stale watchdog model instead of the one the transcript last recorded"
@@ -256,7 +256,7 @@ def test_the_watchdog_is_still_the_fallback_when_the_transcript_is_silent(tmp_pa
     monkeypatch.setattr(daemon, "last_model_for_session", lambda sid: "claude-fable-5")
     entry = {"engine": "claude", "session_id": "SID", "cwd": str(tmp_path), "pane": "%1"}
 
-    daemon.revive_one({}, "11722", entry)
+    daemon.revive_one({}, "7005", entry)
 
     assert "claude-fable-5" in capture_launch["launch"]
     assert "--effort" not in capture_launch["launch"]
