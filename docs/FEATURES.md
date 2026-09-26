@@ -57,7 +57,7 @@ Anything starting with `/` in a topic is a command, never inbox content.
 |---|---|
 | `/help` | The command list. Works in General too. |
 | `/sessions` | Every tmux pane running an agent — not just registered ones — with name, bound topic, context %, cost, unread flag. Codex panes tagged `[codex]`; unconnected ones flagged. |
-| `/ctx` | This session's context-window usage. |
+| `/ctx` | This session's context-window usage; for a parked session, the usage measured when it was parked. |
 | `/usage` | Both account meters in one message — Claude (5h, week, Fable week) and Codex — every window as **% left** with its reset time, from any topic. `/usage claude` / `/usage codex` show just that one line; `/usage codex` from a Codex topic scopes to that session's rollout. |
 | `/stop` | Interrupt the current turn (Escape into the pane). |
 | `/kill` | End the session. Asks first; reply `yes` within 60 seconds. Anything else cancels and is passed through to the session. |

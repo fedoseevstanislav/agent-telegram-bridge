@@ -1343,6 +1343,13 @@ def _park_one(cfg, tid, pane, occupant, cutoff):
         # prevented here (r3, finding 2).
         if not _park_gates_hold(tid, pane, occupant, cutoff, claim_token=token):
             return
+        # The context size, read while the pane is still alive and bound: a parked topic has
+        # no pane, so this is the last moment the number can be measured, and it stays true
+        # until a revive (#346). Before the final token look, so it adds nothing to the gap
+        # between that look and the kill. A failed read only costs the number.
+        parked_pct = None
+        with contextlib.suppress(Exception):
+            parked_pct = _ctx_pct(context_for(pane))
         # One last token look IMMEDIATELY before the kill: the battery's token check is
         # its first read, so a revive landing mid-battery would otherwise slip past it.
         final = read_registry().get(str(tid)) or {}
@@ -1371,6 +1378,8 @@ def _park_one(cfg, tid, pane, occupant, cutoff):
             entry = reg.get(_t)
             if entry and entry.get("park_claim") == _tok:
                 entry.pop("park_claim", None)  # claim served; ended+parked stay
+                if parked_pct is not None:
+                    entry["parked_ctx"] = {"pct": parked_pct, "ts": int(time.time())}
         try:
             update_registry(_done)
         except Exception as e:
@@ -1388,8 +1397,9 @@ def _park_one(cfg, tid, pane, occupant, cutoff):
                 f"record (or mtime fallback) {'?' if idle_h is None else f'{idle_h:.1f}'}h ago")
         try:
             hours = "many" if idle_h is None else f"{idle_h:.0f}"
+            ctx_note = "" if parked_pct is None else f" Context: {parked_pct}% used."
             reply(cfg, int(tid), (
-                f"\U0001f4a4 Parked after {hours}h idle to free memory. Write anything "
+                f"\U0001f4a4 Parked after {hours}h idle to free memory.{ctx_note} Write anything "
                 f"here to bring it back — the same conversation resumes (a large session "
                 f"will first ask whether to resume in full or from a summary)."))
         except Exception as e:
@@ -1696,6 +1706,18 @@ def _pane_start_time(pane):
         return btime + ticks / os.sysconf("SC_CLK_TCK")
     except (OSError, ValueError, IndexError, StopIteration):
         return None
+
+
+def _ctx_pct(ctx):
+    """A context reading's percentage as an int in 0..100, or None. Total: a missing,
+    malformed or out-of-range value is no reading."""
+    if not isinstance(ctx, dict):
+        return None
+    try:
+        pct = float(ctx.get("pct"))
+    except (TypeError, ValueError, OverflowError):  # an int too large for a float
+        return None
+    return int(pct) if math.isfinite(pct) and 0 <= pct <= 100 else None
 
 
 def context_for(pane, engine=None):
@@ -2936,6 +2958,22 @@ def handle_command(cfg, thread_id, text):
             reply(cfg, thread_id, "No live terminal bound to this topic.")
         return
     if cmd.split()[0] == "/ctx":
+        if info.get("ended") and info.get("parked"):
+            # A parked topic's `pane` names a killed pane whose id tmux may already have given
+            # to another session, so it is not read. The number is the one measured at park
+            # time (#346); the conversation resumes at that size.
+            snap = info.get("parked_ctx")
+            pct = _ctx_pct(snap)
+            ts = None
+            with contextlib.suppress(OverflowError):  # _finite_number on a huge int
+                ts = _usable_epoch(snap.get("ts")) if isinstance(snap, dict) else None
+            if pct is not None and ts is not None:
+                reply(cfg, thread_id, f"Parked. Context window: {pct}% used when it was parked "
+                                      f"at {local_datetime(ts)} ({info.get('name', '?')}).")
+            else:
+                reply(cfg, thread_id, "Parked, and no context reading was taken when it was "
+                                      "parked. Write anything here to bring it back.")
+            return
         ctx = context_for(pane) if pane else None
         if ctx:
             cost = f", cost ${ctx['cost']:.2f}" if "cost" in ctx else ""
@@ -5897,6 +5935,7 @@ def revive_one(cfg, tid, entry, fresh=False, brief=True, taken=None, cause="boot
             e["session_id"] = sid  # persist now, don't wait for the next snapshot
         e.pop("ended", None)
         e.pop("parked", None)
+        e.pop("parked_ctx", None)  # a live session reads its own number again (#346)
         e.pop("park_claim", None)  # a claim the parker never released dies with the revive
     update_registry(_bind)
 
