@@ -170,6 +170,10 @@ def _mark_if_short(text, duration):
     Kept after the piecewise path too: chunking removes the failure this was written for, and
     the marker is what would say so if it ever came back.
     """
+    if not (text or "").strip():
+        # Nothing heard is not a truncated transcript: a marker here would turn silence into a
+        # non-empty message, and the daemon's no-speech notice keys on the empty string.
+        return ""
     if _looks_truncated(text, duration):
         return (text or "") + (
             "\n\n[transcript may be incomplete — audio %.0fs, %d words]"

@@ -1625,3 +1625,78 @@ def test_briefed_boot_is_never_stamped_on_a_pane_that_did_not_receive_it(monkeyp
     assert "briefed_boot" not in registry["7007"], (
         "stamped briefed_boot on %999, which never received the briefing"
     )
+
+
+# ---- reopen=compact preset: a relay seat reopens compacted without a question ---------
+
+def _preset_harness(monkeypatch, entry):
+    calls = []
+    monkeypatch.setattr(daemon, "revive_one",
+                        lambda cfg, tid, e, **kw: calls.append((str(tid), kw)) or ("resumed", None))
+    monkeypatch.setattr(daemon, "read_registry", lambda: {"7005": dict(entry)})
+    monkeypatch.setattr(daemon.threading, "Thread",
+                        lambda target=None, daemon=None, **kw: type(
+                            "T", (), {"start": lambda self: target()})())
+    return calls
+
+
+def test_a_compact_preset_reopens_a_large_session_compacted_without_asking(
+        tmp_path, monkeypatch, sent):
+    """A relay seat woken by machine messages sat parked at 168k behind a question nobody
+    was there to answer. The owner pre-answers `compact` for such a topic."""
+    _age(_transcript(tmp_path, monkeypatch, [{"cache_read_input_tokens": 352_556}]), 1440)
+    calls = _preset_harness(monkeypatch, dict(ENTRY, reopen="compact"))
+
+    daemon.maybe_auto_revive({}, 7005)
+
+    assert [(tid, kw.get("resume_choice")) for tid, kw in calls] == [("7005", "compact")]
+    assert sent == [], "asked a question the preset already answered"
+
+
+@pytest.mark.parametrize("preset", ["full", "Compact", "", None, True])
+def test_only_the_compact_preset_skips_the_question(tmp_path, monkeypatch, sent, preset):
+    """Never an unasked full resume: any value but the exact string `compact` asks as before."""
+    _age(_transcript(tmp_path, monkeypatch, [{"cache_read_input_tokens": 352_556}]), 1440)
+    calls = _preset_harness(monkeypatch, dict(ENTRY, reopen=preset))
+
+    daemon.maybe_auto_revive({}, 7005)
+
+    assert calls == []
+    assert "`compact`" in sent[0]
+
+
+def test_an_open_question_still_blocks_a_preset_topic(tmp_path, monkeypatch, sent):
+    _age(_transcript(tmp_path, monkeypatch, [{"cache_read_input_tokens": 352_556}]), 1440)
+    calls = _preset_harness(monkeypatch, dict(ENTRY, reopen="compact"))
+    daemon.pending_reopens["7005"] = {"entry": dict(ENTRY), "tokens": 1, "state": "delivered"}
+
+    daemon.maybe_auto_revive({}, 7005)
+
+    assert calls == []
+
+
+def test_a_preset_revive_that_cannot_start_falls_back_to_the_question(
+        tmp_path, monkeypatch, sent):
+    """Review r1, A3: a thread-start failure returned False with no revive in flight and no
+    question armed — the session silently down, the exact state the preset exists to end."""
+    _age(_transcript(tmp_path, monkeypatch, [{"cache_read_input_tokens": 352_556}]), 1440)
+    _preset_harness(monkeypatch, dict(ENTRY, reopen="compact"))
+
+    def _no_thread(*a, **k):
+        raise RuntimeError("can't start new thread")
+    monkeypatch.setattr(daemon.threading, "Thread", _no_thread)
+
+    daemon.maybe_auto_revive({}, 7005)
+
+    assert "`compact`" in sent[0]
+    assert daemon.pending_reopens["7005"]["state"] == "delivered"
+
+
+def test_a_preset_topic_already_reviving_is_left_alone(tmp_path, monkeypatch, sent):
+    _age(_transcript(tmp_path, monkeypatch, [{"cache_read_input_tokens": 352_556}]), 1440)
+    calls = _preset_harness(monkeypatch, dict(ENTRY, reopen="compact"))
+    daemon._auto_reviving.add("7005")
+
+    daemon.maybe_auto_revive({}, 7005)
+
+    assert calls == [] and sent == []

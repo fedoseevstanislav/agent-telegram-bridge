@@ -919,6 +919,21 @@ def maybe_auto_revive(cfg, thread_id, cause="auto"):
     # built to stop. Asking here costs them nothing, because handle_message has already put
     # their message in the inbox: it is delivered the moment they choose (C4).
     if (entry.get("engine") or "claude") == "claude" and _reopen_needs_asking(entry):
+        if entry.get("reopen") == "compact":
+            # The owner answered this question ahead of time for this topic: a relay seat
+            # woken by machine messages cannot wait for someone to type `compact`. Only the
+            # cheap answer can be pre-set — never `full`. A failed revive re-arms the
+            # question, so the fallback is the ordinary ask, not a silent dead end.
+            log(f"auto-revive topic {tid}: large session, reopen=compact preset — compacting")
+            if _revive_with_choice(cfg, thread_id, entry, "compact"):
+                return
+            with _auto_revive_lock:
+                in_flight = tid in _auto_reviving
+            if in_flight:
+                return                   # another path is already bringing it back
+            # The worker never started: nothing is running and nothing is armed. Ask, as a
+            # topic without the preset would, rather than leave the session silently down.
+            log(f"auto-revive topic {tid}: preset revive did not start — asking instead")
         if not offer_reopen_choice(cfg, thread_id, entry):
             # A3 has no exception for "the question could not be delivered". Round 2 chose to
             # revive anyway, to avoid stranding the session; round 3 was right to reject that
@@ -3802,6 +3817,18 @@ def handle_message(cfg, msg):
             download_file(cfg["bot_token"], file_id, tmp)
             transcript = transcribe(tmp, openai_api_key())
             log(f"transcribed {audio_kind} message {msg['message_id']} ({len(transcript)} chars)")
+            if not transcript.strip():
+                transcript = ""   # whitespace is not a message; don't queue a blank one
+                # A note with no audible speech (a muted or hijacked mic) used to vanish:
+                # empty text is dropped below, so the owner kept talking to nobody
+                # (2026-09-27: four notes in ten minutes, each at about -55 dB).
+                try:
+                    reply(cfg, thread_id, f"🔇 I heard no speech in that {audio_kind} message "
+                          "— check the microphone and resend, or type it.")
+                except Exception as e:
+                    # Inside the transcription try: an escaping send error would be filed as
+                    # "transcription failed" and queued for the session as if it were news.
+                    log(f"no-speech notice failed for message {msg['message_id']}: {e}")
             if is_voice_interrupt(transcript):
                 try:
                     interrupt_session(cfg, thread_id, transcript)
