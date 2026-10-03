@@ -116,6 +116,13 @@ session to re-read the file and continue.
 
 Any message in the topic during that flow aborts it. Claude Code only.
 
+Every compaction the bridge drives — this one, the automatic one, and the `/compact` it runs on a
+reopen when Claude's picker does not appear — runs on Sonnet 5.5 at `xhigh` effort. The bridge
+switches the session there first and, once the compaction is complete, back to the model and
+effort its transcript last recorded. If that pair is unknown it compacts on whatever the session
+is on. `~/.claude/settings.json` is put back byte-for-byte, because Claude Code saves every
+`/model` and `/effort` as the default for new sessions.
+
 ---
 
 ## Things that run on their own

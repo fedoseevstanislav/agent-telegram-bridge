@@ -230,7 +230,7 @@ def test_auto_chosen_absent_picker_uses_the_same_injection_route(monkeypatch):
                         lambda *a: (daemon.RESUME_MODAL_TOKENS + 1,
                                     daemon.RESUME_MODAL_AGE_MINUTES + 1))
     monkeypatch.setattr(daemon, "_compact_after_absent_picker",
-                        lambda pane: injected.append(pane) or ("injected", None))
+                        lambda pane, *a: injected.append(pane) or ("injected", None))
 
     daemon.revive_one({}, "302", dict(ENTRY), cause="boot", auto_summary=True)
 
@@ -279,7 +279,7 @@ def test_injection_failure_reports_the_actual_state_or_an_unanswered_picker(
         monkeypatch, picker_left_up):
     """C4: a failed fallback reports its own outcome, never a summary resume."""
     posted, _briefings = _revive_harness(monkeypatch)
-    monkeypatch.setattr(daemon, "_compact_after_absent_picker", lambda pane: ("failed", None))
+    monkeypatch.setattr(daemon, "_compact_after_absent_picker", lambda pane, *a: ("failed", None))
     monkeypatch.setattr(daemon, "_resume_picker_present", lambda screen: picker_left_up)
 
     daemon.revive_one({}, "302", dict(ENTRY), cause="reopen", resume_choice="compact")
@@ -294,7 +294,7 @@ def test_injection_failure_reports_the_actual_state_or_an_unanswered_picker(
 def test_injected_fallback_gets_its_own_final_notice(monkeypatch):
     """C6: `/compact` after resume is not reported as Claude's summary picker path."""
     posted, _briefings = _revive_harness(monkeypatch)
-    monkeypatch.setattr(daemon, "_compact_after_absent_picker", lambda pane: ("injected", None))
+    monkeypatch.setattr(daemon, "_compact_after_absent_picker", lambda pane, *a: ("injected", None))
 
     daemon.revive_one({}, "302", dict(ENTRY), cause="reopen", resume_choice="compact")
 

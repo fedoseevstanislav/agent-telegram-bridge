@@ -10,6 +10,7 @@ sleep and again under the claim; ownership is a unique token, not a timestamp; `
 lands inside the claim. The tests here include the reviewer's five r2 interleavings.
 """
 
+import json
 import os
 import time
 import types
@@ -1026,6 +1027,176 @@ def test_activity_uses_last_timestamped_codex_rollout_record(monkeypatch, tmp_pa
         pytest.approx(datetime.fromisoformat("2026-09-05T04:05:06+00:00").timestamp(), abs=1)
 
 
+def _listener_rearm_records(hour):
+    """The notification, tool result and metadata around a listener re-arm (#355)."""
+    stamp = f"2026-09-30T{hour:02d}:00:"
+    return [
+        {"type": "user", "timestamp": stamp + "00Z", "message": {
+            "content": "<task-notification>\n<status>killed</status>\n</task-notification>"}},
+        {"type": "attachment", "timestamp": stamp + "01Z"},
+        {"type": "queue-operation", "timestamp": stamp + "02Z"},
+        {"type": "assistant", "timestamp": stamp + "03Z", "message": {
+            "content": [{"type": "tool_use", "name": "Bash", "input": {
+                "command": "tg-bridge recv --topic 7001 --wait 86400"}}]}},
+        {"type": "user", "timestamp": stamp + "04Z", "message": {
+            "content": [{"type": "tool_result", "tool_use_id": "recv", "content":
+                         "Command running in background with ID: listener"}]}},
+        {"type": "assistant", "timestamp": stamp + "05Z", "message": {
+            "content": [{"type": "text", "text": ""}]}},
+        {"type": "system", "subtype": "turn_duration", "timestamp": stamp + "06Z"},
+        {"type": "last-prompt"},
+        {"type": "cost-state"},
+    ]
+
+
+def _activity_from_records(monkeypatch, tmp_path, records, engine="claude"):
+    path = tmp_path / "activity.jsonl"
+    path.write_text("".join(json.dumps(record) + "\n" for record in records))
+    monkeypatch.setattr(daemon.transcript, "transcript_path", lambda cwd, sid: str(path))
+    monkeypatch.setattr(daemon.codex_ctx, "rollout_for_session", lambda sid: str(path))
+    return daemon._session_last_activity({"session_id": "sid", "engine": engine})
+
+
+@pytest.mark.parametrize("turns", [1, 3])
+def test_activity_skips_trailing_listener_rearms(monkeypatch, tmp_path, turns):
+    """#355 C1: every trailing re-arm is skipped, including tool results and metadata."""
+    stamp = "2026-09-30T00:00:06Z"
+    records = [
+        {"type": "user", "timestamp": "2026-09-30T00:00:00Z", "message": {
+            "content": "Owner asks for work"}},
+        {"type": "assistant", "timestamp": "2026-09-30T00:00:05Z", "message": {
+            "content": [{"type": "text", "text": "Finished"}]}},
+        {"type": "system", "subtype": "turn_duration", "timestamp": stamp},
+    ]
+    for hour in range(1, turns + 1):
+        records.extend(_listener_rearm_records(hour))
+
+    assert _activity_from_records(monkeypatch, tmp_path, records) == \
+        datetime.fromisoformat(stamp.replace("Z", "+00:00")).timestamp()
+
+
+@pytest.mark.parametrize("kind", ["bridge-session", "history-suppression", "permission-mode"])
+@pytest.mark.parametrize("position", [3, 10, 19])
+def test_activity_metadata_does_not_make_listener_rearms_active(
+        monkeypatch, tmp_path, kind, position):
+    """#355 C1: extra metadata inside, between or after re-arms does not count as activity."""
+    stamp = "2026-09-30T00:00:06Z"
+    records = [{"timestamp": stamp}] + _listener_rearm_records(1) + _listener_rearm_records(2)
+    records.insert(position, {"type": kind})
+
+    assert _activity_from_records(monkeypatch, tmp_path, records) == \
+        datetime.fromisoformat(stamp.replace("Z", "+00:00")).timestamp()
+
+
+def test_activity_notification_with_bad_timestamp_still_starts_rearm(monkeypatch, tmp_path):
+    """#355 C1: an unparseable notification timestamp does not hide its turn boundary."""
+    stamp = "2026-09-30T00:00:06Z"
+    records = [{"timestamp": stamp}] + _listener_rearm_records(1)
+    records[1]["timestamp"] = "badZ"
+
+    assert _activity_from_records(monkeypatch, tmp_path, records) == \
+        datetime.fromisoformat(stamp.replace("Z", "+00:00")).timestamp()
+
+
+@pytest.mark.parametrize("tool", [
+    {"type": "tool_use", "name": "Read", "input": {"file_path": "notes.md"}},
+    {"type": "tool_use", "name": "Bash", "input": {"command": "tg-bridge send --topic 7001 -"}},
+    {"type": "tool_use", "name": "Bash", "input": {"command": "date"}},
+])
+def test_activity_counts_notification_turn_with_other_tools(monkeypatch, tmp_path, tool):
+    """#355 C2: one other tool keeps the whole turn's final timestamp as activity."""
+    records = _listener_rearm_records(1)
+    records[3]["message"]["content"].append(tool)
+    records.extend(_listener_rearm_records(2))
+
+    assert _activity_from_records(monkeypatch, tmp_path, records) == \
+        datetime.fromisoformat("2026-09-30T01:00:06+00:00").timestamp()
+
+
+def test_activity_tool_with_bad_timestamp_still_counts(monkeypatch, tmp_path):
+    """#355 C2: an unparseable tool timestamp does not make a working turn skippable."""
+    records = _listener_rearm_records(1)
+    records[3]["timestamp"] = "badZ"
+    records[3]["message"]["content"].append({"type": "tool_use", "name": "Read",
+                                          "input": {"file_path": "notes.md"}})
+    records.extend(_listener_rearm_records(2))
+
+    assert _activity_from_records(monkeypatch, tmp_path, records) == \
+        datetime.fromisoformat("2026-09-30T01:00:06+00:00").timestamp()
+
+
+@pytest.mark.parametrize("content", [
+    "Owner asks to listen",
+    [{"type": "text", "text": "Owner asks to listen"}],
+    [{"type": "text", "text": "<task-notification>Listener finished</task-notification>"}],
+])
+def test_activity_counts_listener_turn_with_non_notification_start(
+        monkeypatch, tmp_path, content):
+    """#355 C2: only a string notification can make a listener turn skippable."""
+    records = _listener_rearm_records(1)
+    records[0]["message"]["content"] = content
+    records.extend(_listener_rearm_records(2))
+
+    assert _activity_from_records(monkeypatch, tmp_path, records) == \
+        datetime.fromisoformat("2026-09-30T01:00:06+00:00").timestamp()
+
+
+def test_activity_keeps_real_turn_after_listener_rearm(monkeypatch, tmp_path):
+    """#355 C2: a real turn after a re-arm is still the latest activity."""
+    records = _listener_rearm_records(1) + [
+        {"type": "user", "timestamp": "2026-09-30T02:00:00Z", "message": {
+            "content": "New owner message"}},
+        {"type": "assistant", "timestamp": "2026-09-30T02:00:01Z", "message": {
+            "content": [{"type": "text", "text": "Reply"}]}},
+    ]
+
+    assert _activity_from_records(monkeypatch, tmp_path, records) == \
+        datetime.fromisoformat("2026-09-30T02:00:01+00:00").timestamp()
+
+
+def test_activity_only_rearms_falls_back_with_windowed_reads(monkeypatch, tmp_path):
+    """#355 C3: all re-arms fall back to the earliest seen timestamp, in bounded reads."""
+    records = []
+    for hour in range(1, 4):
+        turn = _listener_rearm_records(hour)
+        turn[5]["message"]["content"][0]["text"] = "x" * (256 * 1024)
+        records.extend(turn)
+    real_open = open
+    reads = []
+
+    class TrackingFile:
+        def __init__(self, *args, **kwargs):
+            self._file = real_open(*args, **kwargs)
+
+        def __enter__(self):
+            self._file.__enter__()
+            return self
+
+        def __exit__(self, *args):
+            return self._file.__exit__(*args)
+
+        def seek(self, *args):
+            return self._file.seek(*args)
+
+        def read(self, size=-1):
+            assert 0 < size <= 256 * 1024
+            reads.append(size)
+            return self._file.read(size)
+
+    monkeypatch.setattr(daemon, "open", TrackingFile, raising=False)
+
+    assert _activity_from_records(monkeypatch, tmp_path, records) == \
+        datetime.fromisoformat("2026-09-30T01:00:00+00:00").timestamp()
+    assert len(reads) >= 4
+
+
+def test_activity_codex_does_not_skip_listener_rearms(monkeypatch, tmp_path):
+    """#355 C4: even Claude-shaped re-arm records keep Codex's existing timestamp rule."""
+    assert _activity_from_records(monkeypatch, tmp_path, _listener_rearm_records(1),
+                                  engine="codex") == \
+        datetime.fromisoformat("2026-09-30T01:00:06+00:00").timestamp()
+
+
 def test_activity_walks_back_one_tail_window_without_reading_a_large_transcript(
         monkeypatch, tmp_path):
     """C5: a record just beyond the tail remains discoverable without a whole-file read."""
@@ -1034,7 +1205,7 @@ def test_activity_walks_back_one_tail_window_without_reading_a_large_transcript(
     stamp = "2026-09-05T01:02:03Z"
     suffix = b'{}\n' * ((window + 102) // 3)
     t.write_bytes(b'{}\n' * ((1024 * 1024) // 3) +
-                  ('{"timestamp": "' + stamp + '"}\n').encode() + suffix)
+                  ('{"type": "user", "message": {"content": "work"}, "timestamp": "' + stamp + '"}\n').encode() + suffix)
     assert t.stat().st_size > 1024 * 1024
     monkeypatch.setattr(daemon.transcript, "transcript_path", lambda cwd, sid: str(t))
     real_open = open
@@ -1076,8 +1247,8 @@ def test_activity_reassembles_a_timestamped_record_across_tail_windows(monkeypat
     old_stamp = "2026-09-05T01:02:03Z"
     stamp = "2026-09-05T04:05:06Z"
     t.write_text(
-        '{"timestamp": "' + old_stamp + '"}\n' +
-        '{"timestamp": "' + stamp + '", "payload": "' + "x" * window + '"}\n')
+        '{"type": "system", "timestamp": "' + old_stamp + '"}\n' +
+        '{"type": "system", "timestamp": "' + stamp + '", "payload": "' + "x" * window + '"}\n')
     monkeypatch.setattr(daemon.transcript, "transcript_path", lambda cwd, sid: str(t))
 
     assert daemon._session_last_activity(
@@ -1092,3 +1263,140 @@ def test_zero_hours_disables_the_loop():
     src = inspect.getsource(daemon.main)
     assert "IDLE_PARK_HOURS > 0" in src.split("idle_park_loop")[0].rsplit("\n", 2)[-1] or \
         "if IDLE_PARK_HOURS > 0:" in src, "the disable gate is gone"
+
+
+def test_activity_counts_turn_after_a_completed_listener(monkeypatch, tmp_path):
+    """#355 A1: a turn started by a completed recv counts as activity, whether or not the
+    recv returned a message (it may have timed out empty): that errs toward staying awake."""
+    records = _listener_rearm_records(1)
+    records[0]["message"]["content"] = (
+        "<task-notification>\n<status>completed</status>\n</task-notification>")
+    records.extend(_listener_rearm_records(2))
+
+    assert _activity_from_records(monkeypatch, tmp_path, records) == \
+        datetime.fromisoformat("2026-09-30T01:00:06+00:00").timestamp()
+
+
+def test_activity_untyped_record_inside_rearm_is_skipped(monkeypatch, tmp_path):
+    """#355 C1: a timestamped record with no type inside a re-arm turn does not count."""
+    records = [{"type": "system", "subtype": "turn_duration",
+                "timestamp": "2026-09-30T00:00:06Z"}]
+    rearm = _listener_rearm_records(1)
+    rearm.insert(5, {"timestamp": "2026-09-30T01:00:04Z"})
+    records.extend(rearm)
+
+    assert _activity_from_records(monkeypatch, tmp_path, records) == \
+        datetime.fromisoformat("2026-09-30T00:00:06+00:00").timestamp()
+
+
+def test_unreadable_exemption_file_is_logged_once_per_change(monkeypatch):
+    """#355 r4 C6: the skipped-sweep line is logged once until the file reads again."""
+    logged = []
+    monkeypatch.setattr(daemon, "log", logged.append)
+    monkeypatch.setattr(daemon, "_PARK_REFUSALS", {})
+    monkeypatch.setattr(daemon, "read_registry", lambda: {})
+    files = iter([None, None, set(), None])
+    monkeypatch.setattr(daemon, "load_park_exempt", lambda: next(files))
+    polls = iter(range(5))
+
+    def _sleep(_secs):
+        if next(polls) == 4:
+            raise KeyboardInterrupt  # four sweeps ran
+    monkeypatch.setattr(daemon.time, "sleep", _sleep)
+    with pytest.raises(KeyboardInterrupt):
+        daemon.idle_park_loop({"bot_token": "t", "chat_id": 1})
+
+    line = "idle-park: topic * stays awake — park_exempt.json unreadable, the sweep is skipped"
+    assert logged.count(line) == 2
+
+
+@pytest.mark.parametrize("error", [OSError("stderr gone"),
+                                   ValueError("I/O operation on closed file")])
+def test_park_refused_survives_a_failed_log_and_retries_it(monkeypatch, error):
+    """#355 r5/r6 C6: a log write that fails still refuses, and the line is retried."""
+    logged = []
+
+    def flaky(line):
+        if not logged and not flaky.failed:
+            flaky.failed = True
+            raise error
+        logged.append(line)
+    flaky.failed = False
+    monkeypatch.setattr(daemon, "log", flaky)
+    monkeypatch.setattr(daemon, "_PARK_REFUSALS", {})
+
+    assert daemon._park_refused("7001", "exempt") is False
+    assert daemon._park_refused("7001", "exempt") is False
+    assert logged == ["idle-park: topic 7001 stays awake — exempt"]
+
+
+def test_park_refused_logs_once_per_change(monkeypatch):
+    """#355 C6: the reason a session stays awake is logged once per change per topic."""
+    logged = []
+    monkeypatch.setattr(daemon, "log", logged.append)
+    monkeypatch.setattr(daemon, "_PARK_REFUSALS", {})
+
+    assert daemon._park_refused("7001", "exempt") is False
+    daemon._park_refused("7001", "exempt")
+    daemon._park_refused("7001", "pane not idle")
+
+    assert logged == ["idle-park: topic 7001 stays awake — exempt",
+                      "idle-park: topic 7001 stays awake — pane not idle"]
+
+
+def test_park_activity_counts_an_inbox_write_after_the_transcript(monkeypatch, tmp_path):
+    """#355 review r2 A1: a message drained inside a skipped re-arm turn still counts,
+    because its arrival wrote the inbox."""
+    inbox = tmp_path / "inbox.jsonl"
+    inbox.write_text("{}\n")
+    os.utime(inbox, (5000.0, 5000.0))
+    monkeypatch.setattr(daemon, "_session_last_activity", lambda info: 1000.0)
+    monkeypatch.setattr(daemon, "state_path", lambda *parts: str(inbox))
+
+    assert daemon._park_activity("7001", {}) == 5000.0
+
+
+def test_park_activity_unageable_session_stays_unparkable(monkeypatch, tmp_path):
+    """#355: an inbox write does not make an unageable session parkable."""
+    monkeypatch.setattr(daemon, "_session_last_activity", lambda info: None)
+
+    assert daemon._park_activity("7001", {}) is None
+
+
+def test_activity_skips_a_bridge_nudge_rearm_turn(monkeypatch, tmp_path):
+    """#355: a dead-listener nudge typed by the bridge, answered by a re-arm, is not activity."""
+    records = [{"type": "system", "subtype": "turn_duration",
+                "timestamp": "2026-09-30T00:00:06Z"}]
+    nudge = _listener_rearm_records(1)
+    nudge[0]["message"]["content"] = (
+        "[tg-bridge] Your background listener for topic 7001 isn't running.")
+    records.extend(nudge)
+
+    assert _activity_from_records(monkeypatch, tmp_path, records) == \
+        datetime.fromisoformat("2026-09-30T00:00:06+00:00").timestamp()
+
+
+def test_activity_queue_records_before_a_rearm_belong_to_it(monkeypatch, tmp_path):
+    """#355: queue and link records written just before a re-arm notification do not date
+    the turn before it."""
+    records = [{"type": "system", "subtype": "turn_duration",
+                "timestamp": "2026-09-30T00:00:06Z"},
+               {"type": "pr-link", "timestamp": "2026-09-30T00:59:59Z"}]
+    records.extend(_listener_rearm_records(1))
+
+    assert _activity_from_records(monkeypatch, tmp_path, records) == \
+        datetime.fromisoformat("2026-09-30T00:00:06+00:00").timestamp()
+
+
+def _inbox_newer_than_session(monkeypatch, tmp_path):
+    monkeypatch.setattr(daemon, "_session_last_activity", lambda info: 1000.0)
+    inbox = tmp_path / "inbox.jsonl"
+    inbox.write_text("{}\n")
+    os.utime(inbox, (5000.0, 5000.0))
+    monkeypatch.setattr(daemon, "state_path", lambda *parts: str(inbox))
+
+
+def test_park_clock_ignores_the_inbox_for_codex(monkeypatch, tmp_path):
+    """#355 r3 C4: a codex clock is its rollout alone, as before the fix."""
+    _inbox_newer_than_session(monkeypatch, tmp_path)
+    assert daemon._park_activity(7, {"engine": "codex"}) == 1000.0

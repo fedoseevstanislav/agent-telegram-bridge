@@ -1086,16 +1086,39 @@ def load_park_exempt():
     return None
 
 
+def _park_activity(tid, info):
+    """The park clock: the session's own last activity and, for claude, the later of that
+    and the last write to the topic's inbox. The inbox is written when a message arrives,
+    so a message a skipped re-arm turn drained still counts (#355 review r2, A1). Codex
+    turns are never skipped, so a codex clock is its rollout alone, as before (#355 r3, C4).
+    None when the session cannot be aged."""
+    last = _session_last_activity(info)
+    if last is None or (info.get("engine") or "claude") != "claude":
+        return last
+    try:
+        return max(last, os.path.getmtime(state_path("topics", str(tid), "inbox.jsonl")))
+    except OSError:
+        return last
+
+
 def _session_last_activity(info):
     """Epoch of the last timestamped record in the session's OWN artifact — the transcript
     for claude, the rollout for codex — falling back to its mtime when it has no timestamped
-    record, or None when it cannot be aged. The statusline ctx record is NOT used: measured
-    stale by WEEKS on live panes (#158 accepts any age), it would park working sessions and
-    spare dead ones (#273 A1). Unageable is unparkable."""
+    record, or None when it cannot be aged. For claude, trailing listener re-arm turns are
+    skipped (#355): a turn started by a task notification reporting a KILLED background task
+    (the harness's 2-hour cap) or by text the bridge typed into the pane (a dead-listener
+    nudge, a revive brief), whose only tool calls are `tg-bridge recv`. A turn started
+    by a COMPLETED task counts, whatever it returned: that errs toward keeping the session
+    awake. A message a skipped turn drained is not lost to the clock: `_park_activity` also
+    reads the inbox. When the bounded walk sees only re-arm turns, the earliest timestamp
+    it saw is returned. The statusline ctx record is NOT
+    used: measured stale by WEEKS on live panes (#158 accepts any age), it would park working
+    sessions and spare dead ones (#273 A1). Unageable is unparkable."""
     sid = info.get("session_id")
     if not sid:
         return None
-    if (info.get("engine") or "claude") == "claude":
+    claude = (info.get("engine") or "claude") == "claude"
+    if claude:
         path = transcript.transcript_path(info.get("cwd") or "~", sid)
     else:
         path = codex_ctx.rollout_for_session(sid)
@@ -1104,11 +1127,14 @@ def _session_last_activity(info):
     try:
         mtime = os.stat(path).st_mtime
         # Claude Code can touch a quiet transcript without adding a record. Start at its tail
-        # because live transcripts can be tens of MiB; only walk back when this window has no
-        # timestamped record at all, and stop at the first one seen in reverse record order.
+        # because live transcripts can be tens of MiB. Codex stops at the first timestamp;
+        # Claude keeps a turn's final timestamp until its tools or starting user record
+        # establish whether it counts. Tool-result user records do not start a new turn.
         with open(path, "rb") as f:
             end = f.seek(0, os.SEEK_END)
             partial = b""
+            last = earliest = None
+            active = False
             while end:
                 # Keep the byte before a window boundary in this bounded read. It tells us
                 # whether the first fragment continues a record from the previous window.
@@ -1125,14 +1151,57 @@ def _session_last_activity(info):
                     partial = lines.pop(0)
                 for line in reversed(lines):
                     try:
-                        timestamp = json.loads(line).get("timestamp")
+                        record = json.loads(line)
+                        timestamp = record.get("timestamp")
+                    except (AttributeError, ValueError):
+                        continue
+                    epoch = None
+                    try:
                         if isinstance(timestamp, str) and timestamp.endswith("Z"):
-                            return datetime.fromisoformat(
+                            epoch = datetime.fromisoformat(
                                 timestamp.replace("Z", "+00:00")).timestamp()
-                    except (AttributeError, ValueError, OverflowError, OSError):
+                    except (ValueError, OverflowError, OSError):
                         pass
+                    if epoch is not None:
+                        earliest = epoch
+                        if not claude:
+                            return epoch
+                    if not claude:
+                        continue
+                    kind = record.get("type")
+                    # Only conversation records date a turn: queue and link records written
+                    # just before a notification belong to it, not to the turn before.
+                    if epoch is not None and last is None and kind in (
+                            "user", "assistant", "system"):
+                        last = epoch
+                    message = record.get("message")
+                    content = message.get("content") if isinstance(message, dict) else None
+                    if kind == "assistant" and isinstance(content, list):
+                        for block in content:
+                            if not isinstance(block, dict) or block.get("type") != "tool_use":
+                                continue
+                            tool_input = block.get("input")
+                            command = (tool_input.get("command")
+                                       if isinstance(tool_input, dict) else None)
+                            if (block.get("name") != "Bash" or not isinstance(command, str)
+                                    or not command.startswith("tg-bridge recv")):
+                                active = True
+                    elif kind == "user":
+                        if isinstance(content, str) and (
+                                content.startswith("[tg-bridge]")
+                                or (content.startswith("<task-notification>")
+                                    and "<status>killed</status>" in content)):
+                            # Discard this turn's timestamps and continue into the preceding turn.
+                            if not active:
+                                last = None
+                        elif not (isinstance(content, list) and content and all(
+                                isinstance(block, dict) and block.get("type") == "tool_result"
+                                for block in content)):
+                            active = True
+                    if active and last is not None:
+                        return last
                 end = boundary
-        return mtime
+        return last if last is not None else earliest if earliest is not None else mtime
     except OSError:
         return None
 
@@ -1169,9 +1238,10 @@ def idle_park_loop(cfg):
         try:
             cutoff = time.time() - IDLE_PARK_HOURS * 3600
             exempt = load_park_exempt()
-            if exempt is None:
-                log("idle-park: park_exempt.json unreadable — skipping the sweep")
+            if exempt is None:  # logged once per change like a topic's reason (#355 r4, C6)
+                _park_refused("*", "park_exempt.json unreadable, the sweep is skipped")
                 continue  # fail closed: cannot know who is exempt, so nobody parks
+            _PARK_REFUSALS.pop("*", None)
             candidates = []
             for tid, info in read_registry().items():
                 # Candidate screen ONLY. Nothing decided here carries authority: r2
@@ -1179,18 +1249,22 @@ def idle_park_loop(cfg):
                 # statement about the past by kill time. The full battery runs fresh in
                 # _park_gates_hold after the sleep, and again under the claim.
                 pane = info.get("pane")
-                if (not pane or info.get("ended") or info.get("feed")
-                        or str(tid) in exempt):
+                if not pane or info.get("ended") or info.get("feed"):
                     continue
                 if not pane_alive(pane):
                     continue  # lifecycle_loop's case, not ours
-                last = _session_last_activity(info)
+                last = _park_activity(tid, info)
                 if last is None or last > cutoff:
                     continue
+                if str(tid) in exempt:
+                    _park_refused(tid, "exempt")
+                    continue
                 if not pane_is_idle(pane):
+                    _park_refused(tid, "pane not idle")
                     continue
                 occupant = _pane_occupant(pane)
                 if occupant is None:
+                    _park_refused(tid, "no foreground occupant")
                     continue
                 candidates.append((tid, pane, occupant))
             if not candidates:
@@ -1238,6 +1312,23 @@ def _pane_occupant(pane):
         return None
 
 
+_PARK_REFUSALS = {}  # tid -> the last refusal logged, so a sweep every 10 min logs a change once
+
+
+def _park_refused(tid, why):
+    """Log why a session past the idle threshold stays awake, once per change of reason
+    per topic (#355), and return False for the gate that refused. A reason is recorded only
+    once its line is written, so a failed write is retried at the next sweep; the failure
+    never turns a refusal into an exception (#355 r5, C6)."""
+    if _PARK_REFUSALS.get(str(tid)) != why:
+        try:
+            log(f"idle-park: topic {tid} stays awake — {why}")
+            _PARK_REFUSALS[str(tid)] = why
+        except Exception:  # OSError, or ValueError on a closed stderr (#355 r6)
+            pass
+    return False
+
+
 def _park_gates_hold(tid, pane, occupant, cutoff, claim_token=None):
     """The full park-authority battery, on FRESH reads only — run once after the recheck
     sleep and once more under the claim. r2's findings were one shape: a fence sampled
@@ -1249,48 +1340,48 @@ def _park_gates_hold(tid, pane, occupant, cutoff, claim_token=None):
     that class is closed by _park_one's post-kill repair, not by more reads here."""
     entry = read_registry().get(str(tid)) or {}
     if entry.get("pane") != pane or entry.get("feed"):
-        return False
+        return _park_refused(tid, "registry entry moved")
     if claim_token is None:
         if entry.get("ended") or entry.get("park_claim"):
-            return False
+            return _park_refused(tid, "ended or claimed")
     elif entry.get("park_claim") != claim_token:
-        return False
+        return _park_refused(tid, "claim lost")
     # The operator can exempt a topic at ANY moment, including inside the recheck sleep
     # (r3, finding 3) — so the exemption file is re-read in every battery, not carried
     # from the sweep's snapshot. None means the file exists but could not be read: fail
     # closed, an unreadable authority is not an empty one (r4, finding 4).
     exempt = load_park_exempt()
     if exempt is None or str(tid) in exempt:
-        return False
+        return _park_refused(tid, "exempt or exemption unreadable")
     if not pane_alive(pane):
-        return False
+        return _park_refused(tid, "pane gone")
     if _pane_occupant(pane) != occupant:
-        return False  # the foreground occupant changed under us — not our session
-    last = _session_last_activity(entry)
+        return _park_refused(tid, "foreground occupant changed")  # the foreground occupant changed under us — not our session
+    last = _park_activity(tid, entry)
     if last is None or last > cutoff:
-        return False  # activity moved during the wait — a message just landed (r2, f2)
+        return _park_refused(tid, "activity inside the window")  # activity moved during the wait — a message just landed (r2, f2)
     # A session idle for IDLE_PARK_HOURS cannot live behind a younger occupant: the
     # foreground group must predate the last activity it would answer for (r2/r3,
     # finding 1) — a shell's NEW foreground session started after our transcript went
     # quiet and correctly refuses here.
     if occupant[1] > last:
-        return False
+        return _park_refused(tid, "occupant younger than last activity")
     if engine_of_pane(pane) != (entry.get("engine") or "claude"):
-        return False
+        return _park_refused(tid, "engine mismatch")
     if not _pane_hosts_session(pane, entry):
-        return False
+        return _park_refused(tid, "pane does not host the session")
     # A carry-forward owns the topic even if it began during the sleep (r2, f4).
     if carry_forward_active(tid):
-        return False
+        return _park_refused(tid, "carry-forward active")
     if unread_count(tid) > 0:
-        return False  # a message is waiting — needed, not idle
-    # A recently-written inbox with a 6h-old transcript means a message arrived that the
-    # session never processed — possibly drained by its recv with the cursor advanced, so
-    # invisible to unread_count (r4, finding 3). Not idle either way.
+        return _park_refused(tid, "unread message")  # a message is waiting — needed, not idle
+    # A message arrived within the last few minutes. Its recv may already have drained it
+    # and advanced the cursor, so unread_count cannot see it (r4, finding 3). For claude the
+    # park clock already counts the inbox write (#355); this gate is what holds codex.
     if recent_inbox_drop(tid, time.time()) is not None:
-        return False
+        return _park_refused(tid, "recent inbox drop")
     if not pane_is_idle(pane):
-        return False
+        return _park_refused(tid, "pane not idle")
     return True
 
 
@@ -5310,6 +5401,10 @@ def last_model_and_effort_for_session(sid, cwd):
             # hand Opus `--effort medium`, a flag it rejects: the revive dies, and because
             # the answer has already been consumed that lands in the dead-session state this
             # whole feature exists to remove (Codex review, finding 7).
+            # Assistant records only, and never a synthetic one (#353 review r1, C2): a record
+            # the client wrote about the session is not the session running a model.
+            if record.get("type") != "assistant" or transcript._is_synthetic(record):
+                continue
             model = (record.get("message") or {}).get("model")
             if not model or model == "<synthetic>":
                 continue
@@ -5503,7 +5598,7 @@ def _clear_composer(pane):
         log(f"reopen: could not clear the withheld /compact from pane {pane}: {e}")
 
 
-def _compact_after_absent_picker(pane):
+def _compact_after_absent_picker(pane, tid=None, plan=None):
     """Inject `/compact` after a missing resume picker and observe its first outcome.
 
     The picker is not a safe place to type. Wait for a sustained-idle pane before using
@@ -5514,6 +5609,10 @@ def _compact_after_absent_picker(pane):
     Returns ``("injected" | "refused" | "failed", reason_or_None)``. ``injected`` means
     the bridge injected `/compact` and a capture then showed compaction in progress; it does
     not claim that compaction has finished.
+
+    With a `plan` (#353) the session is moved to COMPACT_MODEL first. On `injected` the
+    switch back is the briefing path's, after compaction settles; on any other outcome no
+    compaction is running, so it happens here, now.
     """
     idle_streak, deadline = 0, time.time() + CF_COMPACT_IDLE_WAIT
     while time.time() < deadline:
@@ -5529,6 +5628,23 @@ def _compact_after_absent_picker(pane):
     else:
         return "failed", None
 
+    if not plan:
+        return _inject_compact(pane)
+    if switch_for_compaction(pane, tid, plan, _unguarded) != "ok":
+        # Never compact on a model nobody confirmed: back to the session's own pair first,
+        # and no compaction at all if even that cannot be confirmed.
+        if restore_after_compaction(pane, tid, plan, _unguarded, compacted=False) != "ok":
+            return "failed", None
+        return _inject_compact(pane)
+    outcome = _inject_compact(pane)
+    if outcome[0] != "injected":
+        restore_after_compaction(pane, tid, plan, _unguarded)
+    return outcome
+
+
+def _inject_compact(pane):
+    """`_compact_after_absent_picker` from a sustained-idle pane on: type `/compact` and
+    observe its first outcome."""
     # This snapshot lets the existing refusal helper distinguish a new hook refusal from
     # stale pane scrollback. Without it, no refusal reason is established, so do not inject:
     # a later visible refusal could be stale and neither safe retry nor its wording is known.
@@ -5605,7 +5721,8 @@ def _briefing_exhausted(pane, tid, engine, briefing_tpl, attempt, reason, retry_
                         "session will stay unbriefed until you answer the prompt)")
 
 
-def deliver_briefing(pane, tid, engine, briefing_tpl, attempt=1, settle=None, await_busy=False):
+def deliver_briefing(pane, tid, engine, briefing_tpl, attempt=1, settle=None, await_busy=False,
+                     restore=None):
     """Type the briefing into a resumed pane once it is up and idle. Crash-retry safety:
     never create a second concurrent recv — if a claude recv already listens, skip. While
     the pane is mid-turn the briefing is NOT typed (a mid-turn inject could corrupt input);
@@ -5619,21 +5736,37 @@ def deliver_briefing(pane, tid, engine, briefing_tpl, attempt=1, settle=None, aw
     briefed at its new pane — which never received anything (#133 review r2). The same check
     collapses duplicate chains from repeated revives: whichever one lands first marks the
     topic, and the rest abandon."""
-    if attempt > 1 and not _briefing_still_ours(pane, tid, engine, "retry"):
-        return
-    if attempt == 1 and engine == "claude" and has_live_recv(str(tid)):
-        log(f"revive: topic {tid} already has a live recv — skip briefing")
-        return
     window = RESTORE_SETTLE if settle is None else settle
-    if await_busy and engine == "claude" and not _compaction_settled(pane, tid, window):
+    # #353: a switch back owed after a bridge-driven compaction comes before every reason below
+    # to skip the briefing — a live recv, or the topic having moved on (the session in this
+    # pane is still the one that was switched) — so its compaction wait moves up with it.
+    restore = restore if engine == "claude" else None
+    if (restore or await_busy) and engine == "claude" and not _compaction_settled(pane, tid,
+                                                                                  window):
         # Compaction was observed and did not finish. Do NOT fall through to the ordinary
         # idle wait: that returns without typing and schedules nothing (review finding 3),
         # which is precisely what left that topic dark — its retry waited RESTORE_SETTLE,
         # gave up, and ended the chain while compaction was still running.
         # The retry keeps waiting for compaction specifically, so it carries settle and
         # await_busy; the other give-up points do not (see the retry comment below).
+        # A pending switch back waits with it — typing /model into a compacting pane is the
+        # thing this wait prevents — and when the chain ends here, the owner is told where
+        # the session is left.
+        if restore and attempt >= BRIEFING_MAX_ATTEMPTS:
+            _reply_quietly(tid, f"⚠️ The bridge compacted this session on `{COMPACT_MODEL}` "
+                                f"and the compaction never settled, so I did not switch it "
+                                f"back to `{restore['model']}` at `{restore['effort']}`. "
+                                f"{_model_note(restore)}")
         _briefing_exhausted(pane, tid, engine, briefing_tpl, attempt, "still compacting",
-                            {"settle": settle, "await_busy": True})
+                            {"settle": settle, "await_busy": True,
+                             **({"restore": restore} if restore else {})})
+        return
+    if restore:
+        restore_after_compaction(pane, tid, restore, _unguarded)
+    if attempt > 1 and not _briefing_still_ours(pane, tid, engine, "retry"):
+        return
+    if attempt == 1 and engine == "claude" and has_live_recv(str(tid)):
+        log(f"revive: topic {tid} already has a live recv — skip briefing")
         return
     deadline, reached = time.time() + window, False
     while time.time() < deadline:
@@ -5732,6 +5865,7 @@ def revive_one(cfg, tid, entry, fresh=False, brief=True, taken=None, cause="boot
     if not os.path.isdir(cwd):
         cwd = os.path.expanduser("~")
     sid = entry.get("session_id")
+    launched_on = None  # (model, effort) this revive launched with, when its record gave both
     tmux_name = _revive_tmux_name(entry, tid, taken)
     do_fresh = fresh or not sid
 
@@ -5808,6 +5942,10 @@ def revive_one(cfg, tid, entry, fresh=False, brief=True, taken=None, cause="boot
             # rate-limited model, and correcting it afterwards costs a full context re-read.
             model, effort = (last_model_and_effort_for_session(sid, cwd)
                              if engine == "claude" else (None, None))
+            if model and effort:
+                # #353: what the session is launched on, from its own record — the pair a
+                # bridge-driven compaction on this reopen switches back to.
+                launched_on = (revive_model(model), effort)
             if engine == "claude" and not model:
                 # No transcript evidence. Fall back to the watchdog for the model and take NO
                 # effort with it: pairing an effort from one source with a model from another
@@ -5822,6 +5960,7 @@ def revive_one(cfg, tid, entry, fresh=False, brief=True, taken=None, cause="boot
         newly_spawned = True
 
     picker_outcome = None
+    compact_plan = None  # #353: set only when the bridge itself runs /compact on this reopen
     if newly_spawned and engine == "claude":
         # The gate for the automatic choice, as late as it can be taken (#277). Reviews r2,
         # r3 and r4 each found another step between this read and the call — the sizing read,
@@ -5870,7 +6009,9 @@ def revive_one(cfg, tid, entry, fresh=False, brief=True, taken=None, cause="boot
                 picker_outcome = "failed"
                 log(f"resume picker handling failed for topic {tid}: {e}")
         if resume_choice == "compact" and picker_outcome == "absent":
-            compact_outcome, refusal = _compact_after_absent_picker(pane)
+            compact_plan = (compaction_plan(sid, cwd, pane, *launched_on)
+                            if launched_on else None)
+            compact_outcome, refusal = _compact_after_absent_picker(pane, tid, compact_plan)
             if compact_outcome == "injected":
                 picker_outcome = "injected"
                 reply(cfg, tid,
@@ -6007,6 +6148,10 @@ def revive_one(cfg, tid, entry, fresh=False, brief=True, taken=None, cause="boot
             # (review r2, remaining finding).
             "from_summary": picker_outcome == "answered",
             "bridge_compacted": picker_outcome == "injected"}
+    if compact_plan and picker_outcome == "injected":
+        # The compaction is running on COMPACT_MODEL; the briefing path waits for it to settle
+        # and switches back before it types anything (#353).
+        task["restore"] = compact_plan
 
     if closed_again:
         log(f"revive: topic {tid} was closed again during the revive — session is up, "
@@ -6023,7 +6168,8 @@ def revive_one(cfg, tid, entry, fresh=False, brief=True, taken=None, cause="boot
         # answered 15:56:31, compaction finished 15:58:21 — 110s against a 20s window, and it
         # took a manual nudge to arm the listener.
         deliver_briefing(pane, tid, engine, tpl, await_busy=compacting,
-                         settle=COMPACT_SETTLE if compacting else None)
+                         settle=COMPACT_SETTLE if compacting else None,
+                         **({"restore": task["restore"]} if task.get("restore") else {}))
     status = "resumed" if not do_fresh else "fresh"
     # Only a reopen that was attempted AND failed is a reopen failure. On the reopen-choice
     # path the session came up fine and the bridge never touched the topic's state.
@@ -6086,7 +6232,8 @@ def _restore_targets_now(cfg, boot, targets, cause="boot"):
             threading.Thread(
                 target=deliver_briefing,
                 args=(task["pane"], task["tid"], task["engine"], task["tpl"]),
-                kwargs={"await_busy": True, "settle": COMPACT_SETTLE},
+                kwargs={"await_busy": True, "settle": COMPACT_SETTLE,
+                        **({"restore": task["restore"]} if task.get("restore") else {})},
                 daemon=True,
             ).start()
         else:
@@ -6324,6 +6471,293 @@ def _try_send_model(cfg, thread_id, alias, pane, engine, attempt):
                         args=(cfg, thread_id, alias, pane, engine, retry)).start()
 
 
+# ---- compaction on Sonnet (#353) ----
+#
+# A compaction summarises the whole context in one model call, so it is the most expensive
+# single call a long session makes. Before every compaction the bridge drives, it moves the
+# session to COMPACT_MODEL at COMPACT_EFFORT and, once the compaction is observed complete,
+# back to what the session was on. The "before" comes from the session's own transcript —
+# the same record revive launches from — never from the global settings, and when it cannot
+# be established the switch is skipped and the compaction runs exactly as it did before.
+#
+# Three facts measured on Claude Code 2.1.286 (probe pane, 2026-09-30):
+#   * `/model X` on a cached conversation opens "Switch model?" with "❯ 1. Yes, switch to …"
+#     selected; nothing happens until it is answered. After a compaction it does not appear.
+#   * `/model` and `/effort` each write their answer to the transcript as
+#     `<local-command-stdout>Set model to …` / `Set effort level to <level> …`. That record is
+#     the confirmation; the pane is only used to find and answer the dialog.
+#   * Both commands rewrite ~/.claude/settings.json ("saved as your default for new
+#     sessions"): the default model, the per-model effortLevel, even the trailing newline.
+#     Putting the old bytes back does not change the live session, so every model-command
+#     sequence here runs inside a snapshot that is restored byte-for-byte.
+COMPACT_MODEL = "claude-sonnet-5-5[1m]"
+COMPACT_EFFORT = "xhigh"
+MODEL_CMD_WAIT = 15          # s for a /model or /effort to confirm itself in the transcript
+_SWITCH_DIALOG_RE = re.compile(r"❯\s*1\.\s*Yes, switch")
+# One lock for every sequence that rewrites settings.json, so two topics compacting at once
+# cannot snapshot each other's half-switched file and "restore" it. Order: _settings_lock →
+# _cf_lock → the pane lock; nothing takes them the other way round.
+_settings_lock = threading.Lock()
+
+
+def _claude_settings_path():
+    base = os.environ.get("CLAUDE_CONFIG_DIR") or os.path.expanduser("~/.claude")
+    return os.path.realpath(os.path.join(base, "settings.json"))
+
+
+def _read_bytes(path):
+    try:
+        with open(path, "rb") as f:
+            return f.read()
+    except FileNotFoundError:
+        return None
+
+
+def _settings_put_back(path, before):
+    """Make `path` hold exactly `before` again (None: absent). True iff it now does."""
+    try:
+        if _read_bytes(path) == before:
+            return True
+        if before is None:
+            os.remove(path)
+        else:
+            # Replace, never truncate-and-write: a Claude process reading mid-write would see
+            # an empty settings file.
+            tmp = f"{path}.tg-bridge-{secrets.token_hex(4)}"
+            with open(tmp, "wb") as f:
+                f.write(before)
+            shutil.copymode(path, tmp)
+            os.replace(tmp, path)
+        log(f"compaction model switch: put {path} back byte-for-byte")
+        return _read_bytes(path) == before
+    except OSError as e:
+        log(f"compaction model switch: could not put {path} back: {e}")
+        return False
+
+
+def _base_model(model):
+    return model[:-len("[1m]")] if model.endswith("[1m]") else model
+
+
+def _argv_model(pane):
+    """The `--model` the pane's process was launched with, or None. The pane process IS the
+    claude binary (the launch execs it), so its own cmdline is the one to read."""
+    try:
+        with open(f"/proc/{pane_pid(pane)}/cmdline", "rb") as f:
+            argv = f.read().decode(errors="replace").split("\0")
+    except (OSError, TypeError):
+        return None
+    for i, arg in enumerate(argv):
+        if arg == "--model" and i + 1 < len(argv):
+            return argv[i + 1]
+        if arg.startswith("--model="):
+            return arg.split("=", 1)[1]
+    return None
+
+
+def compaction_plan(sid, cwd, pane, model=None, effort=None):
+    """What to switch back to after a compaction, or None to compact as before.
+
+    Without `model`, the pair is the session's own record: the newest non-synthetic assistant
+    record and its effort (`last_model_and_effort_for_session`, the source revive uses). The
+    reopen path passes the pair it just launched with, which came from that same record, and
+    is taken as-is — the launch argv is newer than anything typed before it.
+    Either unknown → None. Already on exactly the compaction model and effort → None.
+
+    The record names `claude-opus-5-5` for both context windows, and restoring the wrong one
+    would change the session's window. So the id to restore is the newest `/model` typed into
+    this session when it names the recorded model, else the pane's launch `--model` when that
+    does, else the bare recorded id."""
+    tpath = transcript.transcript_path(cwd, sid)
+    if model is not None:
+        restore = model               # a launch pair: argv is newer than anything typed
+    else:
+        model, effort = last_model_and_effort_for_session(sid, cwd)
+        restore = model
+        if model:
+            base = model
+            try:
+                typed = transcript.last_model_command(transcript.read_tail_records(tpath))
+            except OSError:
+                typed = None
+            if typed and _base_model(typed) == base:
+                restore = typed       # the newest explicit choice, window included
+            else:
+                launched = _argv_model(pane)
+                if launched and _base_model(launched) == base:
+                    restore = launched
+    if not restore or not effort:
+        return None
+    if restore == COMPACT_MODEL and effort == COMPACT_EFFORT:
+        return None
+    return {"model": restore, "effort": effort, "tpath": tpath,
+            "now": {"model": restore, "effort": effort}, "sent": None}
+
+
+def _switch_steps(plan):
+    """/model and /effort to the compaction pair, each with the stdout text that confirms it.
+    `/model` is left out only when the session is on exactly COMPACT_MODEL (window included):
+    typing a model the session is already on is not a switch. `/effort` is always sent."""
+    steps = []
+    if plan["now"]["model"] != COMPACT_MODEL:
+        steps.append((f"/model {COMPACT_MODEL}", "Set model to ", ("model", COMPACT_MODEL)))
+    steps.append((f"/effort {COMPACT_EFFORT}", f"Set effort level to {COMPACT_EFFORT}",
+                  ("effort", COMPACT_EFFORT)))
+    return steps
+
+
+def _restore_steps(plan):
+    """/model and /effort back to the recorded pair — both, always: after a switch that was
+    sent and not confirmed, "already there" cannot be known."""
+    return [(f"/model {plan['model']}", "Set model to ", ("model", plan["model"])),
+            (f"/effort {plan['effort']}", f"Set effort level to {plan['effort']}",
+             ("effort", plan["effort"]))]
+
+
+def _answer_switch_dialog(pane, guard):
+    """Answer "Switch model?" with its selected "Yes, switch" row, under the guard and the pane
+    lock, visible screen only (scrollback can hold an old answered dialog; see handle_model)."""
+    try:
+        with guard() as ok:
+            if not ok:
+                return False
+            with _pane_lock(pane):
+                cap = _tmux(["tmux", "capture-pane", "-p", "-t", pane],
+                            capture_output=True, text=True)
+                if cap.returncode != 0 or "Switch model?" not in cap.stdout \
+                        or not _SWITCH_DIALOG_RE.search(cap.stdout):
+                    return False
+                _tmux(["tmux", "send-keys", "-t", pane, "Enter"],
+                      check=True, capture_output=True)
+        log(f"compaction model switch: answered 'Switch model?' on pane {pane}")
+        return True
+    except Exception as e:
+        log(f"compaction model switch: dialog answer failed on pane {pane}: {e}")
+        return False
+
+
+def _model_cmd(pane, text, needle, tpath, guard, plan):
+    """Type one /model or /effort line and wait for the client's own stdout record for it.
+    "ok" | "failed" | "aborted" (the guard said this flow no longer owns the pane)."""
+    cur = transcript.cursor(tpath)
+    if cur is None:
+        return "failed"
+    with guard() as ok:
+        if not ok:
+            return "aborted"
+        # Marked inside the guard, before the keystrokes: a halt needs the same lock, so it
+        # sees either nothing typed or this command marked as sent — never the gap between
+        # a submitted command and its record (#353 review r2, C7).
+        before, plan["sent"] = plan.get("sent"), text
+        status = type_line(pane, text, settle=0.5)
+        if status != "sent":
+            plan["sent"] = before  # withheld: Enter was never pressed on it
+    if status != "sent":
+        log(f"compaction model switch: `{text}` {status} on pane {pane}")
+        _clear_composer(pane)  # a withheld line must not ride out with the next /compact
+        return "failed"
+    answered = False
+    deadline = time.time() + MODEL_CMD_WAIT
+    while time.time() < deadline:
+        with guard() as ok:
+            if not ok:
+                return "aborted"
+        if not pane_alive(pane):
+            return "aborted"
+        since = transcript.records_since(tpath, cur)
+        if since.status != transcript.UNKNOWN and transcript.local_stdout_has(since.records,
+                                                                               needle):
+            return "ok"
+        if not answered:
+            answered = _answer_switch_dialog(pane, guard)
+        time.sleep(0.5)
+    log(f"compaction model switch: `{text}` not confirmed within {MODEL_CMD_WAIT}s")
+    return "failed"
+
+
+def _run_model_steps(pane, plan, steps, guard):
+    """Run `steps` in order, keeping plan["now"]/plan["sent"] true at every point (the halt
+    notice reads them from another thread), inside one settings.json snapshot.
+    Returns (outcome, settings_ok)."""
+    outcome = "ok"
+    with _settings_lock:
+        path = _claude_settings_path()
+        before = _read_bytes(path)
+        try:
+            for text, needle, (field, value) in steps:
+                outcome = _model_cmd(pane, text, needle, plan["tpath"], guard, plan)
+                if outcome != "ok":
+                    break
+                plan["now"][field] = value
+                plan["sent"] = None
+        finally:
+            settings_ok = _settings_put_back(path, before)
+            if settings_ok:
+                # The client's own write can trail the stdout record it printed; a second look
+                # a moment later catches a write that lands after the first put-back.
+                time.sleep(1)
+                settings_ok = _settings_put_back(path, before)
+    return outcome, settings_ok
+
+
+def _model_note(plan):
+    """Which model the session is left on, as far as the transcript confirmed it."""
+    now = plan["now"]
+    note = f"The session is on `{now['model']}` at `{now['effort']}` effort"
+    if plan.get("sent"):
+        note += f" (last confirmed; `{plan['sent']}` was sent and may also have taken effect)"
+    return note + "."
+
+
+def _settings_notice(tid):
+    _reply_quietly(tid, f"⚠️ I could not put {_claude_settings_path()} back exactly as it was "
+                        "after switching models for a compaction, so the default model for "
+                        "new sessions may have changed. Check its `model` and `effortLevel`.")
+
+
+def _reply_quietly(tid, text):
+    try:
+        reply(load_config(), int(tid), text)
+    except Exception as e:
+        log(f"compaction model switch: notice to topic {tid} failed: {e}")
+
+
+def switch_for_compaction(pane, tid, plan, guard):
+    """Move the session to COMPACT_MODEL/COMPACT_EFFORT. A failure is logged and the
+    compaction proceeds on whatever the session is on; the restore runs afterwards either way."""
+    steps = _switch_steps(plan)
+    outcome, settings_ok = _run_model_steps(pane, plan, steps, guard)
+    log(f"compaction model switch (topic {tid}, pane {pane}): {outcome}; {_model_note(plan)}")
+    if not settings_ok:
+        _settings_notice(tid)
+    return outcome
+
+
+def restore_after_compaction(pane, tid, plan, guard, compacted=True):
+    """Move the session back to plan["model"]/plan["effort"]. When that cannot be confirmed,
+    the topic gets ONE notice naming what the session is left on (#353 C5). "aborted" sends
+    nothing: that is a halt, and the halt notice names the model itself."""
+    steps = _restore_steps(plan)
+    outcome, settings_ok = _run_model_steps(pane, plan, steps, guard)
+    log(f"compaction model restore (topic {tid}, pane {pane}): {outcome}; {_model_note(plan)}")
+    if outcome == "failed":
+        what = (f"This compaction ran on `{COMPACT_MODEL}` at `{COMPACT_EFFORT}`, and I"
+                if compacted else
+                f"I did not compact: the switch to `{COMPACT_MODEL}` at `{COMPACT_EFFORT}` "
+                f"could not be confirmed, and I")
+        _reply_quietly(tid, f"⚠️ {what} could not confirm the switch back to "
+                            f"`{plan['model']}` at `{plan['effort']}`. {_model_note(plan)} "
+                            f"Send `/model {plan['model']}` and `/effort {plan['effort']}` "
+                            f"to put it back.")
+    if not settings_ok:
+        _settings_notice(tid)
+    return outcome
+
+
+def _unguarded():
+    return contextlib.nullcontext(True)
+
+
 # ---- /carry forward command (#85) ----
 #
 # The model cannot trigger /compact on itself, so the daemon acts as its "hands":
@@ -6551,6 +6985,34 @@ def _cf_set_phase(tid, token, phase):
         st = _pending_cf.get(str(tid))
         if st and st.get("token") == token:
             st["phase"] = phase
+
+
+def _cf_guard(tid, token):
+    """A guard for the compaction model switch (#353): yields True while this flow still owns
+    the topic, holding _cf_lock for the body — the same atomic check-and-act as
+    _cf_inject_owned, so a halt can never be followed by one more keystroke."""
+    @contextlib.contextmanager
+    def guard():
+        with _cf_lock:
+            st = _pending_cf.get(str(tid))
+            yield bool(st) and st.get("token") == token
+    return guard
+
+
+def _cf_compaction_plan(tid, token, pane):
+    """compaction_plan for this topic's session, published on the flow record so a halt can
+    say which model the session is left on (#353 C7). None for anything but claude."""
+    entry = read_registry().get(str(tid)) or {}
+    sid = entry.get("session_id")
+    if not sid or (entry.get("engine") or "claude") != "claude":
+        return None
+    plan = compaction_plan(sid, entry.get("cwd") or "~", pane)
+    if plan:
+        with _cf_lock:
+            st = _pending_cf.get(str(tid))
+            if st and st.get("token") == token:
+                st["model_plan"] = plan
+    return plan
 
 
 def _cf_line_is_busy(line):
@@ -7205,6 +7667,7 @@ def handle_carry_forward(cfg, thread_id, text, info, pane):
 
 def _carry_forward_worker(cfg, thread_id, pane, cf_file, marker, token, name):
     tid = str(thread_id)
+    restore_model = None  # bound in PHASE 2 (#353); the error path below still owes it
     try:
         # The carry-forward cycle — write the file, record it to an issue, then compact —
         # runs ONLY when it is switched back on. Off, this whole phase is the thing the
@@ -7278,6 +7741,21 @@ def _carry_forward_worker(cfg, thread_id, pane, cf_file, marker, token, name):
         # specific signal via _cf_wait_compacting (not any busy turn), (3) retry the whole
         # inject a few times. Only a confirmed compaction proceeds to auto-resume.
         _cf_set_phase(tid, token, "compact")
+        # #353: the compaction runs on COMPACT_MODEL, and the session goes back to what it was
+        # on once the compaction is observed complete — or once this flow gives up, so no exit
+        # below leaves it on the cheaper model silently. `plan` is None when the previous model
+        # or effort is unknown, and then nothing here differs from before.
+        plan, guard = _cf_compaction_plan(tid, token, pane), _cf_guard(tid, token)
+        switched = tried = False  # a restore is owed / the switch was already attempted
+
+        def restore_model(compacted=True):
+            nonlocal switched
+            if not switched:
+                return "ok"
+            switched = False
+            _cf_set_phase(tid, token, "restore")
+            return restore_after_compaction(pane, tid, plan, guard, compacted)
+
         started, refusal = "timeout", None
         for _attempt in range(CF_COMPACT_TRIES):
             if not pane_alive(pane):
@@ -7288,6 +7766,22 @@ def _carry_forward_worker(cfg, thread_id, pane, cf_file, marker, token, name):
                 return
             if idle != "idle":
                 continue  # still busy after the wait — retry (or fall through to the abort)
+            if plan and not tried:
+                _cf_set_phase(tid, token, "switch")
+                tried = switched = True  # from the first keystroke on, a restore is owed
+                switch = switch_for_compaction(pane, tid, plan, guard)
+                if switch == "aborted":
+                    return
+                if switch != "ok":
+                    # Never compact on a model nobody confirmed: put the session back on its
+                    # own pair and compact there, exactly as before this feature. If even that
+                    # cannot be confirmed, do not compact at all — its notice says why.
+                    if restore_model(compacted=False) != "ok":
+                        _cf_release(tid, token)
+                        return
+                    if not _cf_owns(tid, token):
+                        return
+                _cf_set_phase(tid, token, "compact")
             # The transcript cursor is taken BEFORE the inject, so a refusal found afterwards
             # is NEW rather than displayed — the property that replaces #155's snapshot
             # reasoning. It does not prove the refusal answered THIS injection; nothing in
@@ -7313,12 +7807,14 @@ def _carry_forward_worker(cfg, thread_id, pane, cf_file, marker, token, name):
             if started == "refused":
                 log(f"carry-forward: /compact refused by a PreCompact hook "
                     f"(topic {thread_id}, pane {pane}): {refusal}")
+                restore_model()
                 if _cf_release(tid, token):
                     reply(cfg, thread_id, "⚠️ /compact was refused by a PreCompact hook — NOT "
                                           f"auto-resuming. The hook said: {refusal}")
                 return
             _cf_clear_modal(tid, token, pane)  # a beat-late modal may still block the start; clear before retry
         if started != "compacting":
+            restore_model()
             if _cf_release(tid, token):
                 reply(cfg, thread_id, f"⚠️ /compact didn't start compacting (retried {CF_COMPACT_TRIES}×) "
                                       "— NOT auto-resuming. Check the session terminal.")
@@ -7336,11 +7832,13 @@ def _carry_forward_worker(cfg, thread_id, pane, cf_file, marker, token, name):
             # a generic "didn't settle" here would hide the hook's own words (#155).
             log(f"carry-forward: /compact refused by a PreCompact hook "
                 f"(topic {thread_id}, pane {pane}): {late_refusal}")
+            restore_model()
             if _cf_release(tid, token):
                 reply(cfg, thread_id, "⚠️ /compact was refused by a PreCompact hook — NOT "
                                       f"auto-resuming. The hook said: {late_refusal}")
             return
         if res == "not-ready":
+            restore_model()  # its own typing gate decides; a failure there is the C5 notice
             # Says what happened. The compaction is done and the context IS smaller; what
             # failed is the pane settling enough to be typed into, so the owner is told that
             # rather than being sent to look for a compaction that already succeeded.
@@ -7350,6 +7848,7 @@ def _carry_forward_worker(cfg, thread_id, pane, cf_file, marker, token, name):
                                       "was compacted; nudge the session yourself.")
             return
         if res == "timeout":
+            restore_model()
             if _cf_release(tid, token):
                 reply(cfg, thread_id, "⚠️ Compaction didn't settle in time — NOT auto-resuming. "
                                       "Check the session terminal.")
@@ -7371,6 +7870,10 @@ def _carry_forward_worker(cfg, thread_id, pane, cf_file, marker, token, name):
         # finding 3). Writing the fact where the fact becomes true is the rule #241 is about,
         # and the `finally` was itself a violation of it.
         _cf_clear_unfinished(tid, token)
+
+        # Compaction observed complete and the pane settled: switch back before the session is
+        # handed its resume nudge, so the work after the compaction runs on its own model.
+        restore_model()
 
         # PHASE 3 — RESUME + DISARM: inject the auto-resume nudge (always, per #85
         # decision (a)); then the daemon's job is DONE, so disarm the kill-switch right
@@ -7402,6 +7905,11 @@ def _carry_forward_worker(cfg, thread_id, pane, cf_file, marker, token, name):
                               "▶️ Compaction done — the session is working on from the summary.")
     except Exception as e:
         log(f"carry-forward worker error (topic {thread_id}): {e}")
+        if restore_model:
+            try:
+                restore_model()
+            except Exception as e2:
+                log(f"carry-forward: model restore after an error failed (topic {thread_id}): {e2}")
     finally:
         _cf_release(tid, token)  # safety net: never leak an armed flow
         _cf_cleanup_marker(marker)  # don't leave the done-marker behind
@@ -7447,9 +7955,13 @@ def halt_carry_forward(cfg, thread_id, reason):
     except Exception as e:
         log(f"carry-forward halt: cancellation notice failed for pane {pane} "
             f"(topic {thread_id}): {e}")
+    # #353 C7: the flow may have moved the session to the compaction model. A halt stops all
+    # further typing, the switch back included, so say where the session was left.
+    plan = st.get("model_plan")
     reply(cfg, thread_id, (
         "🛑 Carry-forward halted — session interrupted. Your message was NOT delivered; "
         "resend it if you want the session to act on it."
+        + (f" {_model_note(plan)}" if plan else "")
     ))
     log(f"carry-forward halted (topic {thread_id}, phase {st.get('phase')}): {reason}")
     return True

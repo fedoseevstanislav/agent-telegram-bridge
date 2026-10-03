@@ -458,6 +458,42 @@ def compact_events(records):
     return {"submitted": submitted, "completed": completed, "refusal": refusal}
 
 
+def _local_command_text(record):
+    """The text of a genuine user/system record, '' for anything else. The same filter
+    `compact_events` applies: an assistant or synthetic record quoting a command is prose."""
+    if record.get("type") not in ("user", "system") or _is_synthetic(record):
+        return ""
+    return _text_of(record)
+
+
+_MODEL_ARGS_RE = re.compile(
+    r"<command-name>/model</command-name>.*?<command-args>([^<]*)</command-args>", re.S)
+
+
+def last_model_command(records):
+    """The argument of the newest `/model` typed into the session, or None.
+
+    This is where the context window lives. Assistant records name `claude-opus-5-5` whether
+    the session runs the 1M window or not; the `/model claude-opus-5-5[1m]` that put it there
+    keeps the suffix (#353)."""
+    for record in reversed(records):
+        match = _MODEL_ARGS_RE.search(_local_command_text(record))
+        if match and match.group(1).strip():
+            return match.group(1).strip()
+    return None
+
+
+def local_stdout_has(records, needle):
+    """True iff a record carries the client's own `<local-command-stdout>` containing
+    `needle` — how `/model` ("Set model to …") and `/effort` ("Set effort level to …")
+    confirm themselves (#353)."""
+    for record in records:
+        text = _local_command_text(record)
+        if "<local-command-stdout>" in text and needle in text:
+            return True
+    return False
+
+
 _TAG_RE = re.compile(r"</?[a-z][\w-]*>")  # <local-command-stderr> and friends
 _BLOCK_RE = re.compile(r"Compaction blocked by PreCompact hook:.*", re.S)
 
