@@ -1,9 +1,10 @@
 # Configuration
 
-Everything this project owns lives in one file: `~/.config/agent-telegram-bridge/config.json`.
+Connection settings live in `~/.config/agent-telegram-bridge/config.json`.
 
 (Two exceptions, both for one optional key: `openai_api_key` also has legacy fallback sources,
-described with that key below. Nothing else reads anything outside this file.)
+described with that key below. Optional host configuration in the state directory is described
+under [Codex context cues](#codex-context-cues).)
 
 It holds a bot token, so `chmod 600` it and never commit it. The installer refuses to run if
 the permissions are looser than that.
@@ -185,7 +186,44 @@ what this has been running on.
 | `topics/<id>/outbox.jsonl` | A journal of what was SENT: timestamp, message id, and a sha256 — never the text |
 | `topics/<id>/media/` | Downloaded images |
 | `registry.json` | Topic → session bindings |
+| `codex-context-cue.json` | Optional private host configuration for Codex context cues |
 
 **Nothing here is rotated or archived.** After two and a half months of continuous use the
 whole directory was 32 MB, so this has not been worth solving; it is stated so you are not
 surprised by it in a year. Everything is plaintext and readable by your user account.
+
+### Codex context cues
+
+To type a reminder after a listed Codex session compacts, create
+`~/.local/share/agent-telegram-bridge/codex-context-cue.json` on the host. Keep this file private
+and out of the repository. The daemon reads it fresh at each context poll; no restart is needed.
+An absent, unreadable or malformed file disables the cue. Each distinct configuration problem
+is logged at most once during the daemon's lifetime; absence is silent.
+
+This example uses synthetic paths and names:
+
+```json
+{
+  "cue": "[tg-bridge] Compaction is complete. Re-read your seat's context.",
+  "name_prefixes": ["Team"],
+  "seats": [
+    {"folder": "/srv/agents/seat-a"},
+    {
+      "folder": "/srv/agents/seat-b",
+      "rollout_cwds": ["/srv/agents/seat-b", "/srv/agents/runtime-b"],
+      "name": "Team Seat B"
+    }
+  ]
+}
+```
+
+`cue` is a nonempty string, typed verbatim. `name_prefixes` is a list of nonempty strings;
+the registry name must start with one of them. `seats` is a list of objects with an absolute
+`folder` matching the registry cwd. Optional `rollout_cwds` is a list of absolute paths and
+defaults to `[folder]`. Optional `name` is a string requiring an exact registry-name match.
+
+The seat must be active, its pane alive, and its folder's `.tg-bridge-topic` must contain the
+registered topic id. The live root rollout must match the registry session id and one of the
+allowed rollout cwds; native sub-agent rollouts are excluded. Identity is checked again before
+typing and Enter. Historical compactions are baselined on the first eligible poll, successful
+typing is deduplicated through the registry cursor, and unsuccessful typing is retried.

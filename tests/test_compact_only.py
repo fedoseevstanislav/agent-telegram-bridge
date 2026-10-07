@@ -76,7 +76,10 @@ def test_help_describes_what_actually_happens():
     # The reviewer of PR #336 caught this: both reply() sites were branched on CARRY_FORWARD
     # and /help was not, so the owner typing /help was told the session would write a
     # carry-forward and resume from its next-steps — neither of which happens any more.
-    cf_line = next(l for l in daemon.HELP_TEXT.splitlines() if l.startswith("/carryforward"))
+    cf_line = next(l for l in daemon.HELP_TEXT.splitlines() if l.startswith("/compact"))
+    assert "(or /cf)" in cf_line
+    assert "Sonnet" in cf_line and "back to its own model" in cf_line
+    assert "e.g. /compact" not in daemon.HELP_TEXT                 # no longer a relayed example
     assert "next-steps" not in cf_line
     assert "GitHub issue" not in cf_line
     assert "/compact" in cf_line

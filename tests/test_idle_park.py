@@ -67,7 +67,11 @@ def park_env(registry, monkeypatch):
     monkeypatch.setattr(daemon, "_session_last_activity",
                         lambda info: time.time() - 7 * 3600)  # 7h > 6h default
     monkeypatch.setattr(daemon, "unread_count", lambda tid: 0)
-    monkeypatch.setattr(daemon, "recent_inbox_drop", lambda tid, now, window=None: None)
+    monkeypatch.setattr(daemon, "recent_inbox_message", lambda tid, now, window=None: None)
+    # These park-race tests fake arrival/drain authorities. The provenance/cursor
+    # decision on real inbox files is covered separately below and in local_notification.
+    monkeypatch.setattr(daemon, "has_unread_owner_message", lambda tid:
+                        daemon.unread_count(tid) > 0 or daemon.recent_inbox_message(tid, time.time()) is not None)
     replies = []
     monkeypatch.setattr(daemon, "reply", lambda cfg, tid, t: replies.append((tid, t)) or True)
     return tmux_calls, replies
@@ -139,7 +143,7 @@ def test_a_parked_entry_is_revivable(registry, park_env, monkeypatch):
     ("stale claim token on the entry", lambda mp, reg: common.update_registry(
         lambda r: r["7001"].__setitem__("park_claim", "deadbeef"))),
     ("message drained by a dying listener (r4 f3)", lambda mp, reg: mp.setattr(
-        daemon, "recent_inbox_drop",
+        daemon, "recent_inbox_message",
         lambda tid, now, window=None: {"from": "S", "text": "hi"})),
     ("exemption file unreadable (r4 f4)", lambda mp, reg: mp.setattr(
         daemon, "load_park_exempt", lambda: None)),
@@ -320,7 +324,7 @@ def test_a_drained_message_is_reappended_before_the_revive(registry, park_env, m
     registry({"7001": {"pane": "%1", "name": "x", "session_id": "sid"}})
     state = {"killed": False}
     rec = {"from": "S", "text": "the message that was drained", "message_id": 7}
-    monkeypatch.setattr(daemon, "recent_inbox_drop",
+    monkeypatch.setattr(daemon, "recent_inbox_message",
                         lambda tid, now, window=None: rec if state["killed"] else None)
     appended = []
     monkeypatch.setattr(daemon, "append_jsonl",
@@ -449,7 +453,7 @@ def test_a_failed_replay_append_forces_the_resend_notice(registry, park_env, mon
     registry({"7001": {"pane": "%1", "name": "x", "session_id": "sid"}})
     state = {"killed": False}
     rec = {"from": "S", "text": "drained", "message_id": 7}
-    monkeypatch.setattr(daemon, "recent_inbox_drop",
+    monkeypatch.setattr(daemon, "recent_inbox_message",
                         lambda tid, now, window=None: rec if state["killed"] else None)
     monkeypatch.setattr(daemon, "append_jsonl",
                         lambda path, record: (_ for _ in ()).throw(OSError("disk full")))
@@ -931,11 +935,96 @@ def test_a_parked_entry_revives_with_the_parked_cause(registry, park_env, monkey
                         lambda target=None, daemon=True: type(
                             "T", (), {"start": lambda self: target()})())
     daemon.pending_reopens.pop("7001", None)
+    monkeypatch.setattr(daemon, "has_unread_owner_message", lambda tid: True)
     daemon.maybe_auto_revive({"bot_token": "t", "chat_id": 1}, "7001")
 
     assert seen == ["parked"], (
         "a parked session's revive reported a death that was not one (#274 r1, f5)"
     )
+
+
+@pytest.mark.parametrize("provenance", [None, "local-notify"])
+def test_park_repair_requeues_drained_records_but_only_owner_revives(
+        registry, monkeypatch, provenance):
+    registry({"7001": {"pane": "%1", "session_id": "sid", "parked": True,
+                       "ended": "2026-10-03T12:00:00+0000"}})
+    record = {"text": "drained during park", "kind": "peer" if provenance else "text"}
+    if provenance:
+        record["provenance"] = provenance
+    inbox = common.state_path("topics", "7001", "inbox.jsonl")
+    common.append_jsonl(inbox, record)
+    with open(common.state_path("topics", "7001", "cursor"), "w") as f:
+        f.write("1")
+    revives, logs = [], []
+
+    def revive(_cfg, tid):
+        # The replay must be unread before a revive is requested.
+        assert daemon.has_unread_owner_message(tid)
+        revives.append(tid)
+        common.update_registry(lambda reg: reg[tid].pop("ended"))
+
+    monkeypatch.setattr(daemon, "maybe_auto_revive", revive)
+    monkeypatch.setattr(daemon, "carry_forward_active", lambda tid: False)
+    monkeypatch.setattr(daemon, "load_park_exempt", lambda: set())
+    monkeypatch.setattr(daemon, "pending_reopens", {})
+    monkeypatch.setattr(daemon.time, "sleep", lambda seconds: None)
+    monkeypatch.setattr(daemon, "log", logs.append)
+    monkeypatch.setattr(daemon, "reply", lambda *a: pytest.fail("unexpected repair warning"))
+
+    daemon._park_repair({}, "7001")
+
+    with open(inbox) as f:
+        replayed = [json.loads(line) for line in f]
+    assert len(replayed) == 2
+    assert "re-delivery" in replayed[1]["text"]
+    assert replayed[1].get("provenance") == provenance
+    assert daemon.unread_count("7001") == 1
+    assert revives == ([] if provenance else ["7001"])
+    if provenance:
+        assert logs == []
+        assert common.read_registry()["7001"]["ended"]
+        assert daemon.pending_reopens == {}
+
+
+@pytest.mark.parametrize("lost_gate", ["exemption", "carry-forward"])
+def test_park_repair_revives_on_a_lost_exemption_or_carry_forward_without_owner_backlog(
+        registry, monkeypatch, lost_gate):
+    """#364 review: an exemption or carry-forward the kill raced past is the owner's or the
+    system's authority, not a peer's, so the repair still revives with no owner message."""
+    registry({"7001": {"pane": "%1", "session_id": "sid", "parked": True,
+                       "ended": "2026-10-03T12:00:00+0000"}})
+    common.append_jsonl(common.state_path("topics", "7001", "inbox.jsonl"),
+                        {"text": "peer", "kind": "peer", "provenance": "local-notify"})
+    revives = []
+
+    def revive(_cfg, tid):
+        revives.append(tid)
+        common.update_registry(lambda reg: reg[tid].pop("ended"))
+
+    monkeypatch.setattr(daemon, "maybe_auto_revive", revive)
+    monkeypatch.setattr(daemon, "recent_inbox_message", lambda tid, now, window=None: None)
+    monkeypatch.setattr(daemon, "carry_forward_active", lambda tid: lost_gate == "carry-forward")
+    monkeypatch.setattr(daemon, "load_park_exempt",
+                        lambda: {"7001"} if lost_gate == "exemption" else set())
+    monkeypatch.setattr(daemon, "pending_reopens", {})
+    monkeypatch.setattr(daemon.time, "sleep", lambda seconds: None)
+    monkeypatch.setattr(daemon, "log", lambda *a: None)
+    monkeypatch.setattr(daemon, "reply", lambda *a: pytest.fail("unexpected repair warning"))
+
+    daemon._park_repair({}, "7001")
+
+    assert revives == ["7001"]
+
+
+@pytest.mark.parametrize("line,owner", [
+    ('{"text": "hi", "from": "S"}', True),
+    ('{"text": "x", "provenance": "local-notify"}', False),
+    ('not json at all', True),
+    ('[1, 2]', True),
+])
+def test_owner_record_treats_unreadable_lines_as_the_owners(line, owner):
+    """#364 review: only a well-formed notify record is not the owner's."""
+    assert daemon._owner_record(line) is owner
 
 
 # ---- Primitive parsing ----
@@ -1099,12 +1188,13 @@ def test_activity_notification_with_bad_timestamp_still_starts_rearm(monkeypatch
 
 
 @pytest.mark.parametrize("tool", [
-    {"type": "tool_use", "name": "Read", "input": {"file_path": "notes.md"}},
-    {"type": "tool_use", "name": "Bash", "input": {"command": "tg-bridge send --topic 7001 -"}},
-    {"type": "tool_use", "name": "Bash", "input": {"command": "date"}},
+    {"type": "tool_use", "name": "Edit", "input": {"file_path": "notes.md"}},
+    {"type": "tool_use", "name": "Write", "input": {"file_path": "notes.md"}},
+    {"type": "tool_use", "name": "Agent", "input": {"prompt": "work"}},
 ])
 def test_activity_counts_notification_turn_with_other_tools(monkeypatch, tmp_path, tool):
-    """#355 C2: one other tool keeps the whole turn's final timestamp as activity."""
+    """#355 C2, #359: one tool other than Bash or Read keeps the whole turn's final
+    timestamp as activity."""
     records = _listener_rearm_records(1)
     records[3]["message"]["content"].append(tool)
     records.extend(_listener_rearm_records(2))
@@ -1117,7 +1207,7 @@ def test_activity_tool_with_bad_timestamp_still_counts(monkeypatch, tmp_path):
     """#355 C2: an unparseable tool timestamp does not make a working turn skippable."""
     records = _listener_rearm_records(1)
     records[3]["timestamp"] = "badZ"
-    records[3]["message"]["content"].append({"type": "tool_use", "name": "Read",
+    records[3]["message"]["content"].append({"type": "tool_use", "name": "Edit",
                                           "input": {"file_path": "notes.md"}})
     records.extend(_listener_rearm_records(2))
 
@@ -1400,3 +1490,122 @@ def test_park_clock_ignores_the_inbox_for_codex(monkeypatch, tmp_path):
     """#355 r3 C4: a codex clock is its rollout alone, as before the fix."""
     _inbox_newer_than_session(monkeypatch, tmp_path)
     assert daemon._park_activity(7, {"engine": "codex"}) == 1000.0
+
+
+@pytest.mark.parametrize("command", [
+    "cat /tmp/claude-1000/seat/tasks/b1.output; tg-bridge recv --topic 7001",
+    "exec 0</dev/null; tg-bridge recv --topic 7001 --wait 86400",
+    "cd ~ && tg-bridge recv --topic 7001 --wait 86400",
+    "date -u; cat /tmp/t/b1.output 2>/dev/null | head -c 4000; tg-bridge recv --topic 7001 2>&1",
+])
+def test_activity_skips_a_drain_in_any_shape(monkeypatch, tmp_path, command):
+    """#359 C1: a killed-listener turn whose Bash runs `tg-bridge recv` is a re-arm,
+    whatever else the command line does."""
+    records = [{"type": "system", "subtype": "turn_duration",
+                "timestamp": "2026-09-30T00:00:06Z"}]
+    for hour in (1, 2):
+        rearm = _listener_rearm_records(hour)
+        rearm[3]["message"]["content"] = [{"type": "tool_use", "name": "Bash",
+                                           "input": {"command": command}}]
+        records.extend(rearm)
+
+    assert _activity_from_records(monkeypatch, tmp_path, records) == \
+        datetime.fromisoformat("2026-09-30T00:00:06+00:00").timestamp()
+
+
+def test_activity_skips_a_rearm_turn_that_reads_the_task_output(monkeypatch, tmp_path):
+    """#359 C1: Read is a look, not work; with a drain the turn is still a re-arm."""
+    records = [{"type": "system", "subtype": "turn_duration",
+                "timestamp": "2026-09-30T00:00:06Z"}]
+    rearm = _listener_rearm_records(1)
+    rearm[3]["message"]["content"].insert(0, {"type": "tool_use", "name": "Read",
+                                              "input": {"file_path": "/tmp/t/b1.output"}})
+    records.extend(rearm)
+
+    assert _activity_from_records(monkeypatch, tmp_path, records) == \
+        datetime.fromisoformat("2026-09-30T00:00:06+00:00").timestamp()
+
+
+@pytest.mark.parametrize("command", ["make test", "tg-bridge send --topic 7001 -", ""])
+def test_activity_counts_a_killed_task_turn_with_bash_but_no_drain(
+        monkeypatch, tmp_path, command):
+    """#359 C3: Bash with no `tg-bridge recv` anywhere in the turn is work (e.g. answering a
+    killed build), so the turn counts."""
+    records = _listener_rearm_records(1)
+    records[3]["message"]["content"] = [{"type": "tool_use", "name": "Bash",
+                                         "input": {"command": command}}]
+    records.extend(_listener_rearm_records(2))
+
+    assert _activity_from_records(monkeypatch, tmp_path, records) == \
+        datetime.fromisoformat("2026-09-30T01:00:06+00:00").timestamp()
+
+
+def test_activity_flags_do_not_leak_from_a_skipped_turn(monkeypatch, tmp_path):
+    """#359 C3: a skipped re-arm's drain does not excuse Bash work in the turn before it."""
+    records = [{"type": "system", "subtype": "turn_duration",
+                "timestamp": "2026-09-30T00:00:06Z"}]
+    work = _listener_rearm_records(1)
+    work[3]["message"]["content"] = [{"type": "tool_use", "name": "Bash",
+                                      "input": {"command": "make test"}}]
+    records.extend(work + _listener_rearm_records(2))
+
+    assert _activity_from_records(monkeypatch, tmp_path, records) == \
+        datetime.fromisoformat("2026-09-30T01:00:06+00:00").timestamp()
+
+
+def test_activity_skips_a_nudge_stored_as_pasted_content(monkeypatch, tmp_path):
+    """C2 (#359): a bridge nudge wrapped as pasted content starts a skippable turn."""
+    records = [{"type": "system", "subtype": "turn_duration",
+                "timestamp": "2026-09-30T00:00:06Z"}]
+    nudge = _listener_rearm_records(1)
+    nudge[0]["message"]["content"] = (
+        '\n\n<pasted_content id="bb19">\n[tg-bridge] Your background listener for topic '
+        "7001 isn't running.\n</pasted_content id=\"bb19\">")
+    records.extend(nudge)
+
+    assert _activity_from_records(monkeypatch, tmp_path, records) == \
+        datetime.fromisoformat("2026-09-30T00:00:06+00:00").timestamp()
+
+
+@pytest.mark.parametrize("content", [
+    '\n\n<pasted_content id="a1">\nOwner text [tg-bridge] quoted later\n</pasted_content id="a1">',
+    'Look at this <pasted_content id="a1">\n[tg-bridge] old nudge\n</pasted_content id="a1">',
+])
+def test_activity_counts_other_pasted_content(monkeypatch, tmp_path, content):
+    """C4: pasted text that is not a bridge nudge at the very start is activity."""
+    records = _listener_rearm_records(1)
+    records[0]["message"]["content"] = content
+    records.extend(_listener_rearm_records(2))
+
+    assert _activity_from_records(monkeypatch, tmp_path, records) == \
+        datetime.fromisoformat("2026-09-30T01:00:06+00:00").timestamp()
+
+
+def test_park_repair_revives_when_the_owner_check_fails(registry, monkeypatch):
+    """#364 review r1, C4: a failed owner-backlog read must not skip the repair's revive."""
+    registry({"7001": {"pane": "%1", "session_id": "sid", "parked": True,
+                       "ended": "2026-10-03T12:00:00+0000"}})
+    common.append_jsonl(common.state_path("topics", "7001", "inbox.jsonl"),
+                        {"text": "peer", "kind": "peer", "provenance": "local-notify"})
+    revives = []
+
+    def revive(_cfg, tid):
+        revives.append(tid)
+        common.update_registry(lambda reg: reg[tid].pop("ended"))
+
+    def broken(tid):
+        raise OSError("inbox unreadable")
+
+    monkeypatch.setattr(daemon, "maybe_auto_revive", revive)
+    monkeypatch.setattr(daemon, "has_unread_owner_message", broken)
+    monkeypatch.setattr(daemon, "recent_inbox_message", lambda tid, now, window=None: None)
+    monkeypatch.setattr(daemon, "carry_forward_active", lambda tid: False)
+    monkeypatch.setattr(daemon, "load_park_exempt", lambda: set())
+    monkeypatch.setattr(daemon, "pending_reopens", {})
+    monkeypatch.setattr(daemon.time, "sleep", lambda seconds: None)
+    monkeypatch.setattr(daemon, "log", lambda *a: None)
+    monkeypatch.setattr(daemon, "reply", lambda *a: pytest.fail("unexpected repair warning"))
+
+    daemon._park_repair({}, "7001")
+
+    assert revives == ["7001"]

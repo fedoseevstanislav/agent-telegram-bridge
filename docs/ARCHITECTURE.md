@@ -33,8 +33,8 @@ Two design priorities shape every structural decision:
 3. **Asymmetric transport.** Inbound goes through the single daemon; outbound has no single consumer. **Session replies go directly from the per-session CLI to Telegram**; daemon- and aux-originated messages (control-command replies, the pinned dashboard, watchdog alerts, the daily digest) are sent by the daemon and aux modules directly via `api()`, not through the CLI. Only inbound needs the single-consumer guarantee.
 4. **Classify failures, never blind-retry writes.** The Telegram API wrapper distinguishes "provably never sent" (safe to retry) from "delivery unknown after connect" (must not retry) — the structural defense against duplicate messages.
 5. **Emoji signature per topic.** Because one bot account serves all sessions, each topic is assigned a distinct emoji that the CLI prepends to every message, giving the human a visual sender.
-6. **Liveness by symptom, not cause.** A background sweep detects "dark" sessions (alive, idle, not listening) and re-pokes them, rather than enumerating the many ways a session can stop listening.
-7. **Engine abstraction.** `claude` and `codex` are launched through one spawn path; their differences (model pin, trust pre-write, self-arming vs nudge-driven idle, context source) are isolated behind small per-engine branches.
+6. **Liveness by symptom, not cause.** A periodic sweep retries nudges for sustained unread backlogs on live supported panes, rather than guessing why a seat missed an arrival cue.
+7. **Engine abstraction.** `claude` and `codex` are launched through one spawn path; their differences (model pin, trust pre-write, context source) are isolated behind small per-engine branches.
 8. **Context from external sources.** Claude context/cost is read from an external statusline hook; Codex context/usage is derived from Codex's own rollout logs. The bridge owns neither source.
 9. **Out-of-band supervision.** A watchdog alerts the human when the daemon is down by talking to Telegram directly — never through the daemon it watches.
 10. **Owner-pinned, redaction-aware.** Inbound is restricted to one owner id; secrets live only in chmod-600 config and an external OpenClaw config, never in code or logs.
@@ -195,10 +195,10 @@ sequenceDiagram
 sequenceDiagram
     participant D as Daemon sweep (60s)
     participant S as Session pane
-    D->>S: alive? idle? listener running? unread backlog?
-    alt dark (idle, no listener / unread, sustained 150s)
-        D->>S: type "re-arm your recv" nudge (respecting 600s cooldown)
-        S->>S: drain inbox, re-arm listener
+    D->>S: alive? supported engine? unread backlog?
+    alt unread backlog sustained 150s
+        D->>S: type "run foreground recv" nudge (respecting 600s cooldown)
+        S->>S: drain inbox, end turn
     else healthy
         D->>D: nothing
     end
@@ -244,8 +244,8 @@ The same machine runs at boot for every topic whose pane died, with the cause se
 - **Single bot account.** All sessions share one Telegram identity; the per-topic emoji is the only signature. A multi-bot pool for true identities was considered and rejected as disproportionate.
 - **Single owner.** Owner-pinning supports one id. Multi-user access was out of scope.
 - **Two scoped per-inbox locks.** Telegram and trusted local writers serialize append and wake-claim creation with a writer lock; local writers also deduplicate there. A separate transition lock serializes cursor commit with validation and dispatch of the cursor-generation wake claim, without holding writers behind tmux. The single reader prints outside both locks and drains additions before retrying its commit. The design still assumes one reader per topic; concurrent readers can duplicate output and are unsupported.
-- **Codex is nudge-driven.** The Codex CLI cannot hold a background wait, so its liveness depends entirely on the daemon's nudge/sweep — a tighter coupling than Claude's self-arming model. A codex pane sitting on a modal therefore cannot be reached at all: the daemon refuses to answer the prompt on the session's behalf and escalates to the topic instead.
-- **Auth-outage blind spot.** The self-heal sweep detects a dark session but cannot fix an expired-credential outage (a nudge can't restore auth); it still surfaces the session for manual recovery.
+- **Both engines are nudge-driven.** Claude and Codex end their turn and depend on the daemon's arrival nudge and unread-backlog sweep. A pane sitting on a modal may swallow the cue: the daemon withholds Enter when echo verification fails, retries, and escalates sustained failures to the topic.
+- **Auth-outage blind spot.** An expired-credential outage is not detected. The self-heal sweep only re-types the unread nudge every cooldown, a nudge cannot restore auth, and a nudge that types successfully is only logged, so nothing reports the outage to the owner.
 - **Revival is best-effort and depends on the engine.** The bridge can relaunch an engine against a stored session id, but whether that id still resolves to a readable conversation is the engine's business, not the bridge's. A resume that the engine refuses degrades to a fresh session, which is a real loss of context presented honestly rather than hidden. The cost question above a size threshold trades a round-trip with the human for never spending a large resume unasked — the opposite bias would be cheaper to implement and worse to live with.
 - **Install-time path substitution.** The clone can live anywhere the installer can quote — spaces included, a newline in the path refused outright (`scripts/install.sh`) — but the absolute path has to be baked in somewhere: `bin/tg-bridge` resolves its own location, and the systemd units ship with a `@@BRIDGE_ROOT@@` placeholder that `scripts/install.sh` substitutes, because systemd cannot expand a variable in `ExecStart`. Moving an installed clone therefore means re-running the installer, not editing files by hand.
 

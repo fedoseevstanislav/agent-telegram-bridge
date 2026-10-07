@@ -3,7 +3,7 @@
 Commands:
   register --name NAME        create a forum topic for this session, print its id
   send TEXT                   send text into the session's topic
-  recv [--wait N] [--peek]    print new inbox messages (optionally block up to N seconds)
+  recv [--peek]             print new inbox messages (--wait is retired)
   ask TEXT [--timeout N]      send, then block until a reply arrives (or timeout)
   current-topic               print the live topic bound to TMUX_PANE as JSON
   notify --topic N ...        enqueue an event into another topic's inbox, wake its pane,
@@ -558,7 +558,8 @@ def journal_possibly_delivered(topic_id, kind, error, _fallback_text):
     append_outbox_record(topic_id, kind, delivery, possibly_delivered=True)
 
 
-UNREAD_EXIT = 3  # distinct from `recv --wait`'s timeout exit (2)
+UNREAD_EXIT = 3  # distinct from ask's timeout exit (2)
+WAIT_RETIRED_EXIT = 5
 
 
 def unread_before_send(topic_id):
@@ -820,10 +821,10 @@ def cmd_current_topic(_cfg, _args):
 
 
 def notify_topic(cfg, topic_id, sender, idempotency_key, text, owner_only=False):
-    """Enqueue one local event into a topic's inbox, wake its pane, then mirror to Telegram.
+    """Store one local event, cue a live pane when appropriate, then mirror to Telegram.
 
-    An ended parked topic has no live pane to nudge. Its appended inbox record instead asks
-    the lifecycle sweep to revive it; every other target keeps `require_live_dialog`'s contract.
+    An ended parked topic has no live pane to nudge. Its inbox record waits for the owner's
+    next message or topic-reopen; every other target keeps `require_live_dialog`'s contract.
 
     `owner_only`: the event is for the OWNER reading the topic, not for the agent — a usage
     alert, a daily pulse. It is posted to Telegram with the same attribution and the same
@@ -878,7 +879,9 @@ def notify_topic(cfg, topic_id, sender, idempotency_key, text, owner_only=False)
     if owner_only:
         wake = "not-requested"
     elif parked:
-        wake = "parked-revive-requested"
+        wake = "parked-stored"
+        print(f"topic {topic_id} is parked since {info['ended']}; stored, not delivered "
+              "— another seat's notify never wakes a parked seat", file=sys.stderr)
     elif wake_claim is not None:
         nudge_result = maybe_nudge(topic_id, info["pane"], wake_claim)
         if nudge_result is True:
@@ -1027,15 +1030,21 @@ def wait_for_messages(topic_id, timeout):
 
 def cmd_recv(cfg, args):
     topic_id = resolve_topic(args)
+    # Refuse even zero/negative waits before reading or touching the cursor: legacy
+    # background callers must not consume a reply before the seat sees its nudge.
+    if args.wait is not None:
+        print(
+            f"Background waits are retired; end your turn. This is the nudge-driven "
+            f"protocol: when a message arrives the bridge types a [tg-bridge] line "
+            f"into this terminal; then run tg-bridge recv --topic {topic_id}.",
+            file=sys.stderr,
+        )
+        sys.exit(WAIT_RETIRED_EXIT)
     if not args.peek:
         # Only the committing path is guarded: `--peek` moves no cursor, so it stays the
         # sanctioned read-only look at another topic (including ended ones, for forensics).
         require_own_topic(topic_id, "recv")
-    armed_at = waited = None
-    if args.wait:
-        records, new_cursor, armed_at, waited = wait_for_messages(topic_id, args.wait)
-    else:
-        records, new_cursor = read_new(topic_id, load_cursor(topic_id))
+    records, new_cursor = read_new(topic_id, load_cursor(topic_id))
     if records:
         if not args.peek:
             drain_and_commit(topic_id, records, new_cursor, args.json)
@@ -1043,9 +1052,6 @@ def cmd_recv(cfg, args):
         else:
             print_records(records, args.json)
             sys.stdout.flush()
-    elif args.wait:
-        print(timeout_notice(armed_at, waited))
-        sys.exit(2)
 
 
 def cmd_ask(cfg, args):
@@ -1108,7 +1114,7 @@ def build_parser():
 
     p = sub.add_parser("recv", help="print new inbox messages")
     p.add_argument("--topic", help="topic id")
-    p.add_argument("--wait", type=int, help="block up to N seconds for a message")
+    p.add_argument("--wait", type=int, help="retired: exits 5; end your turn and read on a [tg-bridge] nudge")
     p.add_argument("--peek", action="store_true", help="do not advance the read cursor")
     p.add_argument("--json", action="store_true", help="print raw JSONL records")
 

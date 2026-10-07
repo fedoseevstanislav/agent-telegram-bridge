@@ -67,7 +67,7 @@ ENTRY = {"name": "api-refactor", "engine": "claude", "session_id": "SID",
 @pytest.fixture
 def sent(monkeypatch):
     out = []
-    monkeypatch.setattr(daemon, "reply", lambda cfg, tid, text: bool(out.append(text)) or True)
+    monkeypatch.setattr(daemon, "reply", lambda cfg, tid, text, **kw: bool(out.append(text)) or True)
     return out
 
 
@@ -123,7 +123,7 @@ def test_an_unknown_size_is_admitted_not_invented(tmp_path, monkeypatch, sent):
 
 def test_the_choice_is_not_armed_when_the_question_cannot_be_delivered(tmp_path, monkeypatch):
     _transcript(tmp_path, monkeypatch, [{"input_tokens": 1}])
-    monkeypatch.setattr(daemon, "reply", lambda cfg, tid, text: False)   # closed/deleted topic
+    monkeypatch.setattr(daemon, "reply", lambda cfg, tid, text, **kw: False)   # closed/deleted topic
     assert daemon.offer_reopen_choice({}, 7005, ENTRY) is False
     assert daemon.pending_reopens == {}, (
         "a live choice behind an undelivered question — the #162 r2 failure"
@@ -160,7 +160,7 @@ def answer(monkeypatch, sent):
     return _arm, calls
 
 
-@pytest.mark.parametrize("word", ["full", "Full", "fully", " as-is ", "полностью", "full."])
+@pytest.mark.parametrize("word", ["full", "Full", "fully", " as-is ", "полностью", "full.", "f", "F", " f."])
 def test_full_resumes_as_is(answer, word):
     arm, calls = answer
     arm()
@@ -168,7 +168,7 @@ def test_full_resumes_as_is(answer, word):
     assert calls["full"] == ["7005"] and calls["compact"] == []
 
 
-@pytest.mark.parametrize("word", ["compact", "COMPACT", "cf", "сжать"])
+@pytest.mark.parametrize("word", ["compact", "COMPACT", "cf", "сжать", "c", "C", " c!"])
 def test_compact_relays_the_summary_choice(answer, word):
     arm, calls = answer
     arm()
@@ -184,7 +184,8 @@ def test_an_unrelated_message_re_asks_and_is_still_delivered(answer, sent):
     arm()
     assert daemon.check_pending_reopen({}, 7005, "actually, what did we decide on F2?") is False
     assert calls["full"] == [] and calls["compact"] == []
-    assert "Reply `compact`" in sent[-1], "the question was not asked again"
+    assert "`compact` resumes from a summary" in sent[-1], "the question was not asked again"
+    assert "`full` brings back the whole session" in sent[-1] and "type `c` / `f`" in sent[-1]
     assert "7005" in daemon.pending_reopens, "the question was dropped by a non-answer"
 
 
@@ -455,7 +456,7 @@ def test_an_unaskable_large_session_is_not_revived_unasked(tmp_path, monkeypatch
     A3 says "including on restart or ANY error path"."""
     _age(_transcript(tmp_path, monkeypatch, [{"cache_read_input_tokens": 352_556}]), 1440)
     revived = _auto_revive_harness(monkeypatch)
-    monkeypatch.setattr(daemon, "reply", lambda cfg, tid, text: False)
+    monkeypatch.setattr(daemon, "reply", lambda cfg, tid, text, **kw: False)
 
     daemon.maybe_auto_revive({}, 7005)
 
@@ -900,7 +901,7 @@ def test_a_send_that_raises_still_leaves_an_answerable_question(tmp_path, monkey
     by design and only re-asked at process start, so the topic was wedged until a restart."""
     _transcript(tmp_path, monkeypatch, [{"input_tokens": 1}])
 
-    def _boom(cfg, tid, text):
+    def _boom(cfg, tid, text, **kw):
         raise RuntimeError("possibly delivered")
 
     monkeypatch.setattr(daemon, "reply", _boom)

@@ -67,7 +67,7 @@ def harness(monkeypatch):
     # the reduced-durability notice arrives as a second "offer" that breaks the assertions.
     # Either way the test was reporting on the environment, not on the code.
     monkeypatch.setattr(daemon, "_save_pending_reopens", lambda: True)
-    monkeypatch.setattr(daemon, "reply", lambda cfg, tid, text: bool(state["offered"].append(str(tid))) or True)
+    monkeypatch.setattr(daemon, "reply", lambda cfg, tid, text, **kw: bool(state["offered"].append(str(tid))) or True)
     monkeypatch.setattr(daemon, "session_context_tokens", lambda sid, cwd: 352_556)
     # #195: the question is only asked for a large, old session. Default to "yes" here; the
     # branch has its own test below.
@@ -124,6 +124,13 @@ def test_a_session_claude_will_not_ask_about_is_revived_directly(harness, monkey
     monkeypatch.setattr(daemon, "session_cost_sample", lambda sid, cwd: (20_000, 4320.0))
     run, state = harness
     run("reopened", dict(ENDED))
+    assert state["offered"] == [] and state["revived"] == [str(TID)]
+
+
+def test_owner_reopen_revives_a_parked_topic_without_owner_backlog(harness, monkeypatch):
+    monkeypatch.setattr(daemon, "session_cost_sample", lambda sid, cwd: (20_000, 4320.0))
+    run, state = harness
+    run("reopened", dict(ENDED, parked=True))
     assert state["offered"] == [] and state["revived"] == [str(TID)]
 
 

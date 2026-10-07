@@ -31,8 +31,23 @@ def test_matches_carryforward_no_space():
     assert daemon.is_carry_forward_command("/carryforward now")
 
 
-def test_does_not_match_unrelated_commands():
+def test_bare_compact_is_the_bridge_flow_while_the_cycle_is_off(monkeypatch):
+    monkeypatch.setattr(daemon, "CARRY_FORWARD", False)
+    assert daemon.is_carry_forward_command("/compact")
+    assert daemon.is_carry_forward_command("  /compact ")
+    # With instructions it is Claude's own command, relayed verbatim.
+    assert not daemon.is_carry_forward_command("/compact keep the test names")
+    assert not daemon.is_carry_forward_command("/compacting")
+
+
+def test_compact_is_relayed_while_the_cycle_is_on(monkeypatch):
+    # With the cycle on, the flow writes an issue first; `/compact` must not mean that.
+    monkeypatch.setattr(daemon, "CARRY_FORWARD", True)
     assert not daemon.is_carry_forward_command("/compact")
+    assert daemon.is_carry_forward_command("/cf")
+
+
+def test_does_not_match_unrelated_commands():
     assert not daemon.is_carry_forward_command("/model opus")
     assert not daemon.is_carry_forward_command("/carrying on")  # /carrying != /carry
     assert not daemon.is_carry_forward_command("")

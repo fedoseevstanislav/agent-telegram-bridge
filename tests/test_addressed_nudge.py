@@ -63,8 +63,7 @@ def test_an_unregistered_topic_still_addresses_the_topic(registry):
 # ---- every line that tells a session to run recv carries it -------------------------------
 
 @pytest.mark.parametrize("build", [
-    pytest.param(lambda: daemon.sweep_nudge_text(4242, "unread", 0), id="sweep-unread"),
-    pytest.param(lambda: daemon.dead_listener_nudge(4242), id="dead-listener"),
+    pytest.param(lambda: daemon.sweep_nudge_text(4242), id="sweep-unread"),
 ])
 def test_each_injected_recv_instruction_is_addressed(registry, build):
     text = build()
@@ -96,21 +95,12 @@ def test_the_address_comes_before_the_instruction(registry, monkeypatch):
     monkeypatch.setattr(daemon, "type_line", lambda _pane, text: typed.append(text) or "sent")
     daemon.maybe_nudge(4242, "%1")
 
-    for text in (daemon.sweep_nudge_text(4242, "unread", 0),
-                 daemon.dead_listener_nudge(4242),
+    for text in (daemon.sweep_nudge_text(4242),
                  typed[0]):
         assert text.index("other agents in this terminal ignore this") < text.index("recv")
         assert text.startswith("[tg-bridge] For the session registered on topic 4242")
 
 
-def test_a_dead_listener_recap_still_follows_the_address(registry, monkeypatch):
-    """The recap re-delivers someone's actual message. It must not get in front of the
-    address — that is exactly the text a wrong reader would act on."""
-    monkeypatch.setattr(daemon, "recent_inbox_drop",
-                        lambda _t, _n: {"from": "owner", "text": "change direction"})
-    text = daemon.sweep_nudge_text(4242, "dead-listener", 0)
-    assert "change direction" in text
-    assert text.index("ignore this") < text.index("change direction")
 
 
 # ---- what this does NOT claim -------------------------------------------------------------
@@ -200,7 +190,7 @@ def test_every_place_that_builds_a_recv_instruction_is_known_and_classified():
 
     The classification is the point. One of these is not a typed line at all and one is a gap
     we are choosing to leave open; neither is hidden by this test passing."""
-    addressed = {"dead_listener_nudge", "sweep_nudge_text", "maybe_nudge"}
+    addressed = {"sweep_nudge_text", "maybe_nudge"}
     classified = {
         "has_live_recv": "builds a pgrep pattern to find the listener process, never typed",
         # KNOWN GAP, not an exemption on the merits: the RESTORE_BRIEFING_* and SPAWN_BOOTSTRAP
@@ -236,7 +226,7 @@ def test_every_place_that_builds_a_recv_instruction_is_known_and_classified():
 def test_the_sweep_and_message_nudges_route_through_the_constructor():
     import inspect
 
-    for name in ("dead_listener_nudge", "sweep_nudge_text", "maybe_nudge"):
+    for name in ("sweep_nudge_text", "maybe_nudge"):
         body = inspect.getsource(getattr(daemon, name))
         assert "nudge_text(" in body, f"{name} builds a recv line without nudge_text()"
 

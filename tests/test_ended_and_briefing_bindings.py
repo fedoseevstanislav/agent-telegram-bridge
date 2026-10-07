@@ -124,7 +124,7 @@ def test_the_sweep_still_announces_a_real_end(registry, monkeypatch):
 
 def test_lifecycle_sweep_requests_one_revive_for_each_parked_topic_with_unread_inbox(
         registry, monkeypatch):
-    """A parked topic's unread inbox is the durable revive request; live and empty topics wait."""
+    """A parked topic's unread owner backlog requests a revive; live and empty topics wait."""
     registry({
         "235": {"pane": "%A", "name": "unread", "session_id": "sid",
                 "ended": "2026-08-02T12:30:00+0000", "parked": True},
@@ -134,7 +134,8 @@ def test_lifecycle_sweep_requests_one_revive_for_each_parked_topic_with_unread_i
     })
     revives = []
     logs = []
-    monkeypatch.setattr(daemon, "unread_count", lambda tid: 1 if str(tid) == "235" else 0)
+    common.append_jsonl(common.state_path("topics", "235", "inbox.jsonl"),
+                        {"text": "owner message"})
     monkeypatch.setattr(daemon, "maybe_auto_revive", lambda cfg, tid: revives.append((cfg, tid)))
     monkeypatch.setattr(daemon, "pane_alive", lambda _pane: True)
     monkeypatch.setattr(daemon, "log", logs.append)
@@ -152,7 +153,7 @@ def test_lifecycle_sweep_requests_one_revive_for_each_parked_topic_with_unread_i
         daemon.lifecycle_loop(cfg)
 
     assert revives == [(cfg, "235")]
-    assert logs == ["lifecycle: parked topic 235: record appended, revive requested via unread inbox"]
+    assert logs == ["lifecycle: parked topic 235: owner message unread, revive requested via unread inbox"]
 
 
 # ---------------------------------------------------------------------------

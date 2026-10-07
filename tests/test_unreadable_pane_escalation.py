@@ -48,7 +48,7 @@ def sweep(monkeypatch):
     monkeypatch.setattr(daemon, "fleet_panes", lambda: [(PANE, "sess", "node", "claude")])
     monkeypatch.setattr(daemon, "pane_alive", lambda p: True)
     monkeypatch.setattr(daemon, "unread_count", lambda t: 2)
-    monkeypatch.setattr(daemon, "sweep_nudge_text", lambda t, f, now: "nudge")
+    monkeypatch.setattr(daemon, "sweep_nudge_text", lambda t: "nudge")
     monkeypatch.setattr(daemon, "log", lambda *a, **k: None)
     monkeypatch.setattr(daemon, "_prune_pane_tables", lambda: None)
     monkeypatch.setattr(daemon, "type_line", lambda pane, text, **kw: state["status"])

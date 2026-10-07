@@ -364,7 +364,7 @@ def test_notify_duplicate_has_no_second_inbox_nudge_or_telegram_side_effect(
     assert len(telegram) == 1
 
 
-def test_notify_to_a_parked_topic_enqueues_without_a_pane_nudge(monkeypatch, tmp_path):
+def test_notify_to_a_parked_topic_enqueues_without_a_pane_nudge(monkeypatch, tmp_path, capsys):
     nudges = []
     telegram = []
     monkeypatch.setattr(common, "STATE_DIR", str(tmp_path))
@@ -381,11 +381,133 @@ def test_notify_to_a_parked_topic_enqueues_without_a_pane_nudge(monkeypatch, tmp
     duplicate = cli.notify_topic(_CFG, 7004, "scheduler", "parked-key", "Finished")
 
     assert first["status"] == "enqueued"
-    assert first["wake"] == "parked-revive-requested"
+    assert first["wake"] == "parked-stored"
     assert duplicate == {"status": "duplicate", "topic_id": 7004}
     assert len((tmp_path / "topics/7004/inbox.jsonl").read_text().splitlines()) == 1
     assert nudges == []
     assert telegram == [("token", -100, "scheduler: Finished", 7004)]
+    assert capsys.readouterr().err == (
+        "topic 7004 is parked since 2026-08-02T12:30:00+0000; stored, not delivered "
+        "— another seat's notify never wakes a parked seat\n"
+    )
+
+
+def test_cmd_notify_parked_store_result_stays_json(monkeypatch, capsys):
+    monkeypatch.setattr(cli, "read_registry", lambda: {
+        "7004": _dialog(ended="2026-10-03T12:00:00+0000", parked=True),
+    })
+    monkeypatch.setattr(cli.sys, "stdin", io.StringIO("Waiting for the owner"))
+    monkeypatch.setattr(cli, "send_message", lambda *args: [])
+    monkeypatch.setattr(cli, "maybe_nudge", lambda *args: pytest.fail("parked pane nudged"))
+    monkeypatch.setattr(daemon, "maybe_auto_revive", lambda *args: pytest.fail("revive requested"))
+
+    cli.cmd_notify(_CFG, SimpleNamespace(topic=7004, sender="scheduler",
+                                       idempotency_key="parked-cli"))
+
+    output = capsys.readouterr()
+    assert json.loads(output.out)["wake"] == "parked-stored"
+    assert "parked since 2026-10-03T12:00:00+0000; stored, not delivered" in output.err
+    records, _cursor = cli.read_new(7004, 0)
+    assert records[0]["provenance"] == "local-notify"
+    assert records[0]["text"] == "Waiting for the owner"
+
+
+@pytest.mark.parametrize("provenances,cursor,expected", [
+    (["local-notify"], 0, False),
+    (["local-notify", "local-notify"], 0, False),
+    ([None], 0, True),
+    (["local-notify", None], 0, True),
+    ([None, "local-notify"], 0, True),
+    ([None, "local-notify"], 1, False),
+    ([None], 1, False),
+    ([], 0, False),
+])
+def test_unread_owner_predicate_uses_provenance_and_cursor(provenances, cursor, expected):
+    inbox = common.state_path("topics", "7004", "inbox.jsonl")
+    for provenance in provenances:
+        record = {"kind": "peer" if provenance else "text", "text": "message"}
+        if provenance is not None:
+            record["provenance"] = provenance
+        common.append_jsonl(inbox, record)
+    with open(common.state_path("topics", "7004", "cursor"), "w") as f:
+        f.write(str(cursor))
+
+    assert daemon.has_unread_owner_message(7004) is expected
+
+
+@pytest.mark.parametrize("provenances,cursor,owner_waiting", [
+    (["local-notify", "local-notify"], 0, False),
+    ([None, "local-notify"], 1, False),
+    ([None], 0, True),
+    (["local-notify", None], 0, True),
+    ([None, "local-notify"], 0, True),
+])
+@pytest.mark.parametrize("needs_choice", [False, True])
+def test_parked_lifecycle_only_revives_unread_owner_backlog(
+        monkeypatch, provenances, cursor, owner_waiting, needs_choice):
+    common.update_registry(lambda reg: reg.update({"7004": _dialog(
+        ended="2026-10-03T12:00:00+0000", parked=True, session_id="sid",
+        engine="claude", reopen="compact" if not needs_choice else None,
+    )}))
+    inbox = common.state_path("topics", "7004", "inbox.jsonl")
+    for provenance in provenances:
+        record = {"text": "queued", "kind": "notification" if provenance else "text"}
+        if provenance is not None:
+            record["provenance"] = provenance
+        common.append_jsonl(inbox, record)
+    with open(common.state_path("topics", "7004", "cursor"), "w") as f:
+        f.write(str(cursor))
+    revives, logs, questions = [], [], []
+    monkeypatch.setattr(daemon, "pending_reopens", {})
+    monkeypatch.setattr(daemon, "_auto_reviving", set())
+    monkeypatch.setattr(daemon, "_reopen_needs_asking", lambda entry: needs_choice)
+    monkeypatch.setattr(daemon, "revive_one", lambda *a, **kw:
+                        revives.append(kw["cause"]) or ("resumed", None))
+
+    def ask(_cfg, tid, entry):
+        questions.append(tid)
+        daemon.pending_reopens[str(tid)] = {"state": "delivered"}
+        return True
+
+    monkeypatch.setattr(daemon, "offer_reopen_choice", ask)
+    monkeypatch.setattr(daemon, "api", lambda *a, **kw: pytest.fail("unexpected API call"))
+    monkeypatch.setattr(daemon, "_tmux", lambda *a, **kw: pytest.fail("parked pane touched"))
+    monkeypatch.setattr(daemon, "log", logs.append)
+    monkeypatch.setattr(daemon.threading, "Thread", lambda target, **kw:
+                        SimpleNamespace(start=target))
+    sleeps = []
+
+    def sleep_once(_seconds):
+        if sleeps:
+            raise KeyboardInterrupt
+        sleeps.append(True)
+
+    monkeypatch.setattr(daemon.time, "sleep", sleep_once)
+    with pytest.raises(KeyboardInterrupt):
+        daemon.lifecycle_loop(_CFG)
+
+    assert revives == (["parked"] if owner_waiting and not needs_choice else [])
+    assert questions == (["7004"] if owner_waiting and needs_choice else [])
+    assert bool(daemon.pending_reopens) is (owner_waiting and needs_choice)
+    assert sum("revive requested" in line for line in logs) == int(owner_waiting)
+    assert bool(common.os.path.exists(common.state_path("pending-reopens.json"))) is False
+
+
+@pytest.mark.parametrize("preset", [None, "compact"])
+def test_parked_auto_revive_rejects_notify_before_reopen_choice(monkeypatch, preset):
+    monkeypatch.setattr(daemon, "read_registry", lambda: {"7004": _dialog(
+        ended="2026-10-03T12:00:00+0000", parked=True, session_id="sid",
+        engine="claude", reopen=preset,
+    )})
+    monkeypatch.setattr(daemon, "pending_reopens", {})
+    common.append_jsonl(common.state_path("topics", "7004", "inbox.jsonl"),
+                        {"provenance": "local-notify", "text": "peer"})
+    monkeypatch.setattr(daemon, "_reopen_needs_asking", lambda entry: True)
+    monkeypatch.setattr(daemon, "offer_reopen_choice", lambda *a: pytest.fail("asked to reopen"))
+    monkeypatch.setattr(daemon, "_revive_with_choice", lambda *a: pytest.fail("preset revived"))
+    monkeypatch.setattr(daemon, "revive_one", lambda *a, **kw: pytest.fail("revived"))
+
+    daemon.maybe_auto_revive(_CFG, "7004")
 
 
 def test_notify_different_key_is_deliverable_without_redundant_unread_nudge(
@@ -630,3 +752,57 @@ def test_existing_nudge_primitive_reports_no_unread_without_touching_pane(monkey
     )
 
     assert daemon.maybe_nudge(7004, "%42") is False
+
+
+@pytest.mark.parametrize("authority", ["exemption", "carry-forward"])
+def test_parked_auto_revive_proceeds_for_an_owner_authority_with_peer_only_backlog(
+        monkeypatch, authority):
+    """#364 review: an exemption or an active carry-forward lets a parked seat wake even when
+    only notify records are unread (the park repair relies on this)."""
+    monkeypatch.setattr(daemon, "read_registry", lambda: {"7004": _dialog(
+        ended="2026-10-03T12:00:00+0000", parked=True, session_id="sid", engine="claude",
+    )})
+    monkeypatch.setattr(daemon, "pending_reopens", {})
+    common.append_jsonl(common.state_path("topics", "7004", "inbox.jsonl"),
+                        {"provenance": "local-notify", "text": "peer"})
+    monkeypatch.setattr(daemon, "load_park_exempt",
+                        lambda: {"7004"} if authority == "exemption" else set())
+    monkeypatch.setattr(daemon, "carry_forward_active", lambda tid: authority == "carry-forward")
+    reached = []
+    monkeypatch.setattr(daemon, "_reopen_needs_asking",
+                        lambda entry: reached.append(True) or False)
+    monkeypatch.setattr(daemon, "revive_one", lambda *a, **kw: ("revived", None))
+    monkeypatch.setattr(daemon.threading, "Thread",
+                        lambda target, **kw: type("T", (), {"start": lambda self: target()})())
+
+    daemon.maybe_auto_revive(_CFG, "7004")
+
+    assert reached == [True]
+
+
+def test_lifecycle_requests_a_revive_when_the_owner_check_fails(monkeypatch):
+    """#364 review r1, C4: a failed owner-backlog read in the sweep fails toward the wake."""
+    monkeypatch.setattr(daemon, "read_registry", lambda: {"7004": _dialog(
+        ended="2026-10-03T12:00:00+0000", parked=True, session_id="sid", engine="claude",
+    )})
+    monkeypatch.setattr(daemon, "pending_reopens", {})
+
+    def broken(tid):
+        raise OSError("inbox unreadable")
+
+    monkeypatch.setattr(daemon, "has_unread_owner_message", broken)
+    revives = []
+    monkeypatch.setattr(daemon, "maybe_auto_revive", lambda cfg, tid: revives.append(tid))
+    monkeypatch.setattr(daemon, "log", lambda *a: None)
+    calls = {"n": 0}
+
+    def sleep_once(_seconds):
+        calls["n"] += 1
+        if calls["n"] > 1:
+            raise KeyboardInterrupt
+
+    monkeypatch.setattr(daemon.time, "sleep", sleep_once)
+    with pytest.raises(KeyboardInterrupt):
+        daemon.lifecycle_loop(_CFG)
+
+    assert revives == ["7004"]

@@ -45,6 +45,34 @@ def _meta_cwd(path):
     return (session_meta(path) or {}).get("cwd")
 
 
+def compaction_cursor(path, previous):
+    """Read appended complete records; baseline history and replaced/truncated files.
+
+    The cursor contains no message text. The caller saves it only after a new
+    compaction's fixed cue was typed, so a failed attempt stays eligible next poll.
+    """
+    with open(path, "rb") as f:
+        stat = os.fstat(f.fileno())
+        identity = [stat.st_dev, stat.st_ino]
+        offset = previous.get("offset") if isinstance(previous, dict) else None
+        if (not isinstance(offset, int) or isinstance(offset, bool) or offset < 0
+                or previous.get("file") != identity or offset > stat.st_size):
+            return {"file": identity, "offset": stat.st_size}, False
+        f.seek(offset)
+        compacted = False
+        while line := f.readline():
+            if not line.endswith(b"\n"):
+                break  # writer has not finished this record; keep its start for next poll
+            offset = f.tell()
+            try:
+                row = json.loads(line)
+            except (ValueError, UnicodeError):
+                continue
+            if isinstance(row, dict) and row.get("type") == "compacted":
+                compacted = True
+        return {"file": identity, "offset": offset}, compacted
+
+
 def is_subagent_rollout(path):
     """True when the rollout belongs to a sub-agent thread rather than the session the
     user drives. Sub-agents share their parent's cwd AND its `session_id`, but carry

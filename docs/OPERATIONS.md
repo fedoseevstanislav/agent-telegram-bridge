@@ -47,8 +47,9 @@ its terminal, `/sessions` shows whether its pane is still alive. A dead pane sho
 posted a "session ended" notice and closed the topic.
 
 **Messages arrive but the session never notices.** The wake cue is best effort. If the session
-is not running a `recv --wait`, nothing will nudge it into reading — the messages are safe in
-the inbox and it will see them at its next `recv`. `tg-bridge status` shows the unread count per
+misses the arrival nudge, the sweep retries while unread messages persist (150 s grace,
+600 s cooldown). Both Claude and Codex end their turn without a background wait; on a
+`[tg-bridge]` line they run foreground `recv`. The messages stay in the inbox until read. `tg-bridge status` shows the unread count per
 topic, which is the ground truth.
 
 **Voice arrives as `[voice message — transcription failed: …]`.** The bracket says why.

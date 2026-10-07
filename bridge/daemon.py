@@ -25,7 +25,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from bridge.common import (
     api, append_jsonl, download_file, load_config, now_iso, openai_api_key,
-    read_registry, redact_secrets, secure_process_umask, secure_state_tree,
+    md_to_telegram_html, read_registry, redact_secrets, secure_process_umask, secure_state_tree,
     send_message, state_path,
     unsafe_state_ancestors, update_registry, valid_owner_id, validate_wake_claim,
 )
@@ -33,14 +33,14 @@ from bridge.transcribe import transcribe
 from bridge import codex_ctx, transcript
 
 POLL_TIMEOUT = 50
-ALLOWED_UPDATES = '["message"]'  # edited messages never enter a privileged command path
+ALLOWED_UPDATES = '["message","callback_query"]'  # edited messages never enter a privileged command path
 TMUX_TIMEOUT = 10  # s; bound every tmux call so a hung tmux op can't freeze a daemon thread —
                    # a tmux send-keys under _cf_lock once hung and froze the whole getUpdates
                    # loop (which takes _cf_lock per message). See _tmux and #110.
 PANE_LOCK_TIMEOUT = TMUX_TIMEOUT  # s; same reason as above, for the per-pane lock. #110 was
                    # exactly this failure with a different lock, and _pane_lock is now taken
                    # on the synchronous message-handler paths — so it must never be unbounded.
-NUDGE_DELAY = 4  # seconds; lets a blocking ask/recv --wait consume the reply first
+NUDGE_DELAY = 4  # seconds; lets a foreground blocking ask consume the reply first
 
 # Echo verification (#133): never press Enter on a pane that didn't take the text we typed —
 # a modal swallows the text and reads the Enter as "accept the highlighted option", which is
@@ -108,15 +108,11 @@ AUTOCF_REARM_PCT = max(0, AUTOCF_PCT - 10)  # hysteresis so it can't flap at the
 # the ones whose context climbs — are exactly the ones that must not be retried every tick.
 AUTOCF_RETRY_COOLDOWN = 15 * 60
 
-# Periodic self-heal sweep: catch sessions that went "dark" (turn ended without a
-# live, harness-tracked recv consuming the inbox) — interrupts/transient 529s that
-# skipped re-arming, or a detached `&` recv that drained the cursor then exited.
+# Periodic self-heal sweep: retry a visible backlog if its arrival nudge was missed.
 SWEEP_POLL = 60  # seconds between sweeps
-SWEEP_GRACE = 150  # seconds a topic must stay a dark candidate before we act (avoid racing the normal arm gap)
+SWEEP_GRACE = 150  # seconds an unread backlog must persist before we act
 SWEEP_COOLDOWN = 600  # min seconds between re-nudges of the same topic
-RECENT_DROP_WINDOW = 1200  # #105: only re-deliver the last inbox message if it arrived this
-                           # recently — a drop by a just-died listener is fresh; re-injecting
-                           # an old, already-handled message on every dead-listener sweep isn't.
+RECENT_INBOX_WINDOW = 1200  # preserve the park safety gate for recently drained messages
 
 SERVICE_KEYS = (
     "forum_topic_created", "forum_topic_edited", "forum_topic_closed",
@@ -158,11 +154,43 @@ def unread_count(thread_id):
     return total - cursor
 
 
+def has_unread_owner_message(thread_id):
+    """Whether the unread backlog contains a record not written by local notify.
+
+    The daemon authenticates Telegram ingress before appending it; notify marks both
+    peer and automation records with provenance. Count from the same line cursor as recv
+    so an already-drained owner message cannot make a peer wake a parked seat (#364).
+    """
+    inbox = state_path("topics", str(thread_id), "inbox.jsonl")
+    cursor = 0
+    try:
+        with open(os.path.join(os.path.dirname(inbox), "cursor")) as f:
+            cursor = int(f.read().strip() or 0)
+    except FileNotFoundError:
+        pass
+    try:
+        with open(inbox) as f:
+            return any(_owner_record(line) for index, line in enumerate(f) if index >= cursor)
+    except FileNotFoundError:
+        return False
+
+
+def _owner_record(line):
+    """An inbox line that may wake a parked seat. Only a well-formed local-notify record is
+    not one: an unreadable line counts as the owner's, so a bad line can never keep the
+    owner's own message from waking the seat."""
+    try:
+        record = json.loads(line)
+    except ValueError:
+        return True
+    return not (isinstance(record, dict) and record.get("provenance") == "local-notify")
+
+
 def last_inbox_message(thread_id):
-    """The last inbox record (a dict with 'from'/'text') for a topic, or None. Used to
-    RE-DELIVER a message that a dying/reaped recv drained — cursor advanced but the session
-    never saw it (#105). Best-effort: returns None on any read/parse error, including a last
-    line that is valid JSON but not an object (e.g. `[]`)."""
+    """Last inbox record for the park safety check and race report, or None.
+
+    Best-effort: read/parse errors and non-object JSON return None.
+    """
     inbox = state_path("topics", str(thread_id), "inbox.jsonl")
     if not os.path.exists(inbox):
         return None
@@ -180,12 +208,11 @@ def last_inbox_message(thread_id):
         return None
 
 
-def recent_inbox_drop(tid, now, window=RECENT_DROP_WINDOW):
-    """The last inbox record IF the inbox was last written within `window` seconds of `now`
-    — i.e. recent enough that a drop by a just-died listener is plausible — else None (#105).
+def recent_inbox_message(tid, now, window=RECENT_INBOX_WINDOW):
+    """Last inbox record if its file was written within `window` seconds.
 
-    Gates re-delivery on freshness (via file mtime) so a routine dead-listener sweep over a
-    session that's simply idle doesn't re-inject an old, already-handled message every time."""
+    Parking must still notice a recent arrival even if a recv already drained it.
+    """
     try:
         inbox = state_path("topics", str(tid), "inbox.jsonl")   # may makedirs -> OSError
         if now - os.path.getmtime(inbox) > window:
@@ -240,54 +267,17 @@ def nudge_text(tid, body):
     likely to be reading it — and that gap is recorded by name in the enumeration test rather
     than papered over.
 
-    Each of the three sites that DO come through here used to build its own prefix, which is
-    how a fourth could be added unaddressed. Nothing in Python holds that shut; the test that
-    enumerates this module's `recv --topic` strings does, within the limits it states."""
+    The sweep and arrival sites come through here; a new site could be added unaddressed.
+    Nothing in Python holds that shut; the test that enumerates this module's `recv --topic` strings does, within the limits it states."""
     return f"[tg-bridge] {nudge_address(tid)} {body}"
 
 
-def dead_listener_nudge(tid, rec=None):
-    """Text nudged into a topic whose background recv listener has died (#105).
-
-    If `rec` (a recent inbox record) is given, its text is re-delivered as a recap, because a
-    dying/reaped recv may have advanced the cursor without the session ever seeing the
-    message. The caller passes `rec` only when a drop is plausible (see recent_inbox_drop), so
-    an old, already-handled message isn't re-injected. Phrased so the agent judges whether it's
-    actually new — avoids a blind duplicate action. The snippet is newline-flattened (single
-    tmux send-keys line) and capped, with truncation flagged explicitly so a long message is
-    never presented as if complete."""
-    recap = ""
-    if rec and rec.get("text"):
-        body = rec["text"]
-        snippet = body[:400].replace("\n", " ")
-        more = "" if len(body) <= 400 else " […truncated — run recv; the full text may not be recoverable]"
-        recap = (
-            f" A dying listener may have dropped a message without waking you — "
-            f"most recent, from {rec.get('from')}: \"{snippet}\"{more}. If you have NOT "
-            f"already handled it, act on it now."
-        )
+def sweep_nudge_text(tid):
+    """Retry the instruction to drain a visible unread backlog."""
     return nudge_text(tid, (
-        f"Your background listener for topic {tid} isn't "
-        f"running, so new replies won't wake you.{recap} Drain with "
-        f"`tg-bridge recv --topic {tid}`, then re-arm "
-        f"`tg-bridge recv --topic {tid} --wait 86400` via run_in_background "
-        f"— NEVER a detached `&` shell job."
+        f"You have undelivered messages in topic {tid} "
+        f"— run `tg-bridge recv --topic {tid}` now and drain the inbox."
     ))
-
-
-def sweep_nudge_text(tid, flavor, now):
-    """The self-heal nudge text for a dark topic, dispatched by `flavor` (#105). This is the
-    exact call idle_sweep_loop makes, factored out so the dispatch is unit-testable:
-      * "unread" — messages sit undrained in the inbox; tell the session to drain + re-arm.
-      * otherwise — the recv listener has died; re-deliver a FRESH dropped message if any."""
-    if flavor == "unread":
-        return nudge_text(tid, (
-            f"You have undelivered messages in topic {tid} "
-            f"— run `tg-bridge recv --topic {tid}` now and drain the inbox. "
-            f"For claude: then re-arm ONE long background wait with "
-            f"run_in_background (never a detached `&`)."
-        ))
-    return dead_listener_nudge(tid, recent_inbox_drop(tid, now))
 
 
 def _tmux(argv, **kwargs):
@@ -901,6 +891,17 @@ def should_auto_revive(info):
             and bool(info.get("session_id")) and not info.get("feed"))
 
 
+def _park_authority_holds(tid):
+    """An exemption or an active carry-forward for this topic. An unreadable exemption file
+    or a failed read counts as holding, as in `_park_repair`: an authority that cannot be
+    read cannot prove it is absent."""
+    try:
+        exempt = load_park_exempt()
+        return exempt is None or str(tid) in exempt or carry_forward_active(tid)
+    except Exception:
+        return True
+
+
 def maybe_auto_revive(cfg, thread_id, cause="auto"):
     tid = str(thread_id)
     if tid in pending_reopens:
@@ -910,6 +911,16 @@ def maybe_auto_revive(cfg, thread_id, cause="auto"):
         # they choose (C4).
         return
     entry = read_registry().get(tid)
+    # A parked seat wakes only for the owner (#364): their unread message, their topic-reopen,
+    # or an authority the park raced past — an exemption or a carry-forward. A peer's
+    # notify alone must not spend the owner's context allowance or ask a reopen question.
+    if isinstance(entry, dict) and entry.get("parked") and cause != "reopen":
+        try:
+            peer_only = not has_unread_owner_message(tid) and not _park_authority_holds(tid)
+        except Exception:
+            peer_only = False  # an unreadable inbox must never block the owner's own wake
+        if peer_only:
+            return
     if not should_auto_revive(entry):
         return
     # A3 is a property of the SESSION, not of how the revive happened to be triggered. Gating
@@ -1011,7 +1022,7 @@ def mark_ended(thread_id, observed_pane):
 
 
 def lifecycle_loop(cfg):
-    """Detect dead session terminals and ask parked topics with unread inbox records to revive."""
+    """Detect dead terminals and request parked revives for unread owner messages."""
     while True:
         time.sleep(LIFECYCLE_POLL)
         try:
@@ -1019,10 +1030,17 @@ def lifecycle_loop(cfg):
                 if info.get("ended") and info.get("parked"):
                     # A pending reopen question (or a revive already in flight) makes
                     # maybe_auto_revive return early; say "requested" once, not every poll.
-                    if (unread_count(thread_id) > 0
+                    try:
+                        owner_waiting = has_unread_owner_message(thread_id)
+                    except Exception as e:
+                        # A failed read must not keep the owner's own message from waking
+                        # the seat; maybe_auto_revive's gate fails the same way.
+                        log(f"lifecycle: parked topic {thread_id}: inbox check failed ({e})")
+                        owner_waiting = True
+                    if (owner_waiting
                             and str(thread_id) not in pending_reopens
                             and str(thread_id) not in _auto_reviving):
-                        log(f"lifecycle: parked topic {thread_id}: record appended, "
+                        log(f"lifecycle: parked topic {thread_id}: owner message unread, "
                             "revive requested via unread inbox")
                         maybe_auto_revive(cfg, thread_id)
                     continue
@@ -1101,13 +1119,26 @@ def _park_activity(tid, info):
         return last
 
 
+# A nudge typed into the pane can be stored wrapped as pasted content (#359).
+_PASTED_PREFIX = re.compile(r'\s*<pasted_content id="[^"]*">\s*')
+
+
+def _is_bridge_nudge(content):
+    match = _PASTED_PREFIX.match(content)
+    return content[match.end() if match else 0:].startswith("[tg-bridge]")
+
+
 def _session_last_activity(info):
     """Epoch of the last timestamped record in the session's OWN artifact — the transcript
     for claude, the rollout for codex — falling back to its mtime when it has no timestamped
     record, or None when it cannot be aged. For claude, trailing listener re-arm turns are
     skipped (#355): a turn started by a task notification reporting a KILLED background task
     (the harness's 2-hour cap) or by text the bridge typed into the pane (a dead-listener
-    nudge, a revive brief), whose only tool calls are `tg-bridge recv`. A turn started
+    nudge, a revive brief, also when stored as pasted content) that used only Bash and Read
+    and, if it used Bash, has a Bash command whose text contains `tg-bridge recv`. The text
+    is only searched, not parsed or checked to have run: seats drain in many shapes (`exec
+    0</dev/null; tg-bridge recv …`, `cat <task output> 2>&1 | head; tg-bridge recv …`). So
+    Bash work done in such a turn next to that text is skipped too. A turn started
     by a COMPLETED task counts, whatever it returned: that errs toward keeping the session
     awake. A message a skipped turn drained is not lost to the clock: `_park_activity` also
     reads the inbox. When the bounded walk sees only re-arm turns, the earliest timestamp
@@ -1135,6 +1166,8 @@ def _session_last_activity(info):
             partial = b""
             last = earliest = None
             active = False
+            # This turn so far: a Bash command whose text lacks `tg-bridge recv`, one with it.
+            bash_work = recv = False
             while end:
                 # Keep the byte before a window boundary in this bounded read. It tells us
                 # whether the first fragment continues a record from the previous window.
@@ -1183,17 +1216,25 @@ def _session_last_activity(info):
                             tool_input = block.get("input")
                             command = (tool_input.get("command")
                                        if isinstance(tool_input, dict) else None)
-                            if (block.get("name") != "Bash" or not isinstance(command, str)
-                                    or not command.startswith("tg-bridge recv")):
+                            if block.get("name") == "Read":
+                                continue
+                            if block.get("name") != "Bash" or not isinstance(command, str):
                                 active = True
+                            elif "tg-bridge recv" in command:
+                                recv = True
+                            else:
+                                bash_work = True
                     elif kind == "user":
                         if isinstance(content, str) and (
-                                content.startswith("[tg-bridge]")
+                                _is_bridge_nudge(content)
                                 or (content.startswith("<task-notification>")
                                     and "<status>killed</status>" in content)):
                             # Discard this turn's timestamps and continue into the preceding turn.
+                            if bash_work and not recv:
+                                active = True
                             if not active:
                                 last = None
+                                bash_work = recv = False
                         elif not (isinstance(content, list) and content and all(
                                 isinstance(block, dict) and block.get("type") == "tool_result"
                                 for block in content)):
@@ -1378,7 +1419,7 @@ def _park_gates_hold(tid, pane, occupant, cutoff, claim_token=None):
     # A message arrived within the last few minutes. Its recv may already have drained it
     # and advanced the cursor, so unread_count cannot see it (r4, finding 3). For claude the
     # park clock already counts the inbox write (#355); this gate is what holds codex.
-    if recent_inbox_drop(tid, time.time()) is not None:
+    if recent_inbox_message(tid, time.time()) is not None:
         return _park_refused(tid, "recent inbox drop")
     if not pane_is_idle(pane):
         return _park_refused(tid, "pane not idle")
@@ -1526,11 +1567,16 @@ def _park_repair(cfg, tid):
     guard, and a read failure counts as lost, because an authority that cannot be read
     cannot prove the race was won (r4, finding 1). A drained message (cursor advanced by
     the dying recv, invisible to unread_count — r4, finding 3) is re-appended to the
-    inbox so the revive actually replays it. And because maybe_auto_revive is ALLOWED to
+    inbox so a later revive can replay it. And because maybe_auto_revive is ALLOWED to
     do nothing (a pending choice; an undeliverable question — r4, finding 2), the repair
     verifies something durable is in flight and otherwise says so in the topic: the
-    notice the owner can always see is the recovery path of last resort."""
+    notice the owner can always see is the recovery path of last resort. A replayed
+    notify record stays queued (#364): the repair requests a revive for an unread owner
+    record, a lost exemption or carry-forward, or a failed read of any of these.
+    `maybe_auto_revive` may still decline when its own successful re-check finds a
+    peer-only backlog and no authority; a peer-only backlog alone leaves the seat parked."""
     lost = []
+    authority_lost = False  # an exemption or carry-forward: the owner's or the system's, not a peer's
     drop = None
     try:
         if unread_count(tid) > 0:
@@ -1538,7 +1584,7 @@ def _park_repair(cfg, tid):
     except Exception as e:
         lost.append(f"the inbox could not be read ({e})")
     try:
-        drop = recent_inbox_drop(tid, time.time())
+        drop = recent_inbox_message(tid, time.time())
         if drop is not None:
             lost.append("a message may have been drained by the dying listener")
     except Exception as e:
@@ -1546,25 +1592,26 @@ def _park_repair(cfg, tid):
     try:
         if carry_forward_active(tid):
             lost.append("a carry-forward became active")
+            authority_lost = True
     except Exception as e:
         lost.append(f"the carry-forward state could not be read ({e})")
+        authority_lost = True
     try:
         exempt = load_park_exempt()
         if exempt is None or str(tid) in exempt:
             lost.append("an exemption was added (or the file became unreadable)")
+            authority_lost = True
     except Exception as e:
         lost.append(f"the exemption file could not be checked ({e})")
+        authority_lost = True
     if not lost:
         return
-    with contextlib.suppress(Exception):
-        log(f"idle-park: topic {tid} lost a race to the kill — {'; '.join(lost)} — "
-            f"reviving")
     replay_failed = False
     if drop is not None:
-        # Make the drained record UNREAD again so the revive's briefing replays it. A
+        # Make the drained record UNREAD again so a later revive can replay it. A
         # duplicate (if the old session did handle it) is honest and says so; a lost
         # turn is silent. If the append itself fails, the record stays behind the
-        # cursor and NOTHING will replay it — that is a lost owner turn, so the
+        # cursor and NOTHING will replay it — that is a lost inbox record, so the
         # fallback notice below becomes mandatory and asks for a resend (r5, f2).
         try:
             redelivery = dict(drop)
@@ -1578,7 +1625,22 @@ def _park_repair(cfg, tid):
             with contextlib.suppress(Exception):
                 log(f"idle-park: re-delivery append failed for topic {tid}: {e}")
     try:
-        maybe_auto_revive(cfg, tid)
+        owner_waiting = has_unread_owner_message(tid)
+        owner_check_failed = False
+    except Exception as e:
+        owner_waiting = False
+        owner_check_failed = True
+        with contextlib.suppress(Exception):
+            log(f"idle-park: repair inbox check failed for topic {tid}: {e}")
+    if not (owner_waiting or authority_lost or replay_failed or owner_check_failed):
+        # Only peer notify records were in play: they stay queued for the owner's next wake.
+        return
+    try:
+        if owner_waiting or authority_lost or owner_check_failed:
+            with contextlib.suppress(Exception):
+                log(f"idle-park: topic {tid} lost a race to the kill — {'; '.join(lost)} — "
+                    f"requesting a revive")
+            maybe_auto_revive(cfg, tid)
     except Exception as e:
         with contextlib.suppress(Exception):
             log(f"idle-park: repair revive failed for topic {tid}: {e}")
@@ -1607,7 +1669,7 @@ def _park_repair(cfg, tid):
     if replay_failed or not durable:
         text = ("⚠️ This terminal was parked in the same instant something needed it"
                 + (", and the automatic revive did not come up" if not durable else "")
-                + (". Your last message could not be queued for replay — please resend "
+                + (". A message could not be queued for replay — please resend "
                    "it" if replay_failed else "")
                 + ". Nothing else is lost — write anything here and the conversation "
                   "resumes.")
@@ -1656,7 +1718,7 @@ def _is_topic_gone_error(exc):
     return any(m in str(exc).lower() for m in _TOPIC_GONE_MARKERS)
 
 
-def reply(cfg, thread_id, text):
+def reply(cfg, thread_id, text, *, reply_markup=None, message_ids=None):
     """Send a daemon notice to a topic. Returns True when it was delivered.
 
     HTML-render agent/daemon Markdown + auto-split + plain-text fallback (#89). The ⚙️ prefix
@@ -1669,9 +1731,18 @@ def reply(cfg, thread_id, text):
     notice as having been delivered before starting side effects must be able to tell. Auto
     carry-forward posted its start notice and then compacted and resumed the session regardless,
     leaving the owner with neither the notice nor the kill-switch (Codex review of PR #162).
-    Any other failure propagates unchanged."""
+    Any other failure propagates unchanged. `message_ids` optionally collects Telegram's
+    accepted ids without changing the bool contract — a reopen question needs its own id
+    for edits and for rejecting a tap on an older question (#373)."""
     try:
-        send_message(cfg["bot_token"], cfg["chat_id"], f"⚙️ {text}", thread_id or None)
+        deliveries = send_message(cfg["bot_token"], cfg["chat_id"], f"⚙️ {text}",
+                                  thread_id or None,
+                                  **({"reply_markup": reply_markup} if reply_markup is not None else {}))
+        if message_ids is not None:
+            for delivery in deliveries:
+                message_id = delivery["result"].get("message_id")
+                if type(message_id) is int and message_id > 0:
+                    message_ids.append(message_id)
         # A delivery Telegram ACCEPTED is the one positive observation a bot gets that the
         # topic is open — sends to a closed topic are rejected. Use it to retire a stale
         # `closed` (#212): the flag is only ever learned from events, and #206 rightly
@@ -2695,8 +2766,9 @@ _HELP_CF_CYCLE = (
     "and auto-resume it from those next-steps. Send any message to halt."
 )
 _HELP_CF_COMPACT = (
-    "/carryforward (or /cf) — bridge-driven: I wait for the session to go idle, run /compact, "
-    "then tell it to carry on from the summary. Send any message to halt."
+    "/compact (or /cf) — bridge-driven: I wait for the session to go idle, move it to "
+    "Sonnet for the compaction, run /compact, move it back to its own model, then tell it "
+    "to carry on from the summary. Send any message to halt."
 )
 
 HELP_TEXT = """Bridge commands (work in any session topic):
@@ -2713,7 +2785,7 @@ HELP_TEXT = """Bridge commands (work in any session topic):
 /peek — last ~25 lines of the session's terminal
 !<text> — interrupt + hand <text> to the session as its next instruction
 voice message starting with "stop"/"стоп" — same as !<text>
-any other /command (e.g. /compact, /cost) — typed into the session's terminal
+any other /command (e.g. /cost) — typed into the session's terminal
 
 Convention: sessions echo their understanding of a request and wait for your "go" \
 (да/давай/ok also work). Put "go" inside the request itself to skip the wait."""
@@ -2737,16 +2809,14 @@ SPAWN_BOOTSTRAP = """You were spawned from Telegram by the owner via the agent-t
 Set up your channel to them before anything else (the tg-channel skill has the full protocol):
 1. Run: tg-bridge register --name {name_q} — note the printed topic_id N.
 2. Echo your understanding of the task in 1-3 sentences: tg-bridge send --topic N "...".
-3. Wait for their go: tg-bridge recv --topic N --wait 900. If the task below already contains an explicit \
+3. End your turn and wait for their go. When they write, a "[tg-bridge]" line is typed into this terminal — \
+run a FOREGROUND tg-bridge recv --topic N and act on it. If the task below already contains an explicit \
 go-ahead (e.g. "go"), start immediately after echoing instead of waiting.
 Keep communicating through the topic (updates at milestones, questions via ask). If a send exits 3 it \
 means the owner wrote again while you were working — run `tg-bridge recv --topic N` and compose what you say \
 with their latest messages taken into account, rather than answering the earlier ones as if they were the \
-whole picture. When idle, stay SILENT: \
-arm one long background wait (recv --wait 86400, run_in_background), end your turn, and never send \
-greetings/recaps/"still waiting" on timeouts — a timeout is not news. The wait MUST be a harness-tracked \
-run_in_background task and NEVER a bare shell `&` (e.g. `recv ... &`) — a detached recv drains the reply \
-and exits without ever waking you. Your task:
+whole picture. When idle, end your turn and stay SILENT: when a "[tg-bridge]" line appears here, \
+run a FOREGROUND tg-bridge recv --topic N and act on it. Never send greetings, recaps, or "still waiting". Your task:
 {task}"""
 
 SPAWN_BOOTSTRAP_NO_TASK = """You were spawned from Telegram by the owner via the agent-telegram-bridge /claude \
@@ -2754,14 +2824,12 @@ command, without a task yet — they will give it in your Telegram topic. Set up
 (the tg-channel skill has the full protocol):
 1. Run: tg-bridge register --name {name_q} — note the printed topic_id N.
 2. Send a one-line greeting saying you're ready for instructions: tg-bridge send --topic N "...".
-3. Wait for their message with ONE long background wait: tg-bridge recv --topic N --wait 86400 \
-(run_in_background), then end your turn. A timeout (exit 2) is not news — re-arm it silently. The wait MUST \
-be a harness-tracked run_in_background task and NEVER a bare shell `&` (e.g. `recv ... &`) — a detached recv \
-drains the reply and exits without ever waking you. Never send \
+3. End your turn. When they write, a "[tg-bridge]" line is typed into this terminal — run a FOREGROUND \
+tg-bridge recv --topic N and act on it. Never send \
 greetings, recaps, or "still waiting" messages while idle; speak only when they write or assigned work \
 produces something. When the task arrives, echo your understanding and follow the tg-channel discipline."""
 
-# Codex can't arm background waits, so its idle protocol is nudge-driven: the daemon
+# Every seat uses the nudge-driven idle protocol: the daemon
 # types a [tg-bridge] line into the pane whenever a new message lands.
 CODEX_BOOTSTRAP = """You were spawned from Telegram by the owner via the agent-telegram-bridge /codex command. \
 Set up your channel to them before anything else:
@@ -2775,8 +2843,7 @@ and if a send exits 3, the owner wrote again while you worked — recv, then com
 latest messages taken into account. \
 questions via tg-bridge ask. When idle, end your turn and stay SILENT — never send greetings or recaps. \
 READING their messages: only with a FOREGROUND tg-bridge recv --topic N when a "[tg-bridge]" nudge appears — \
-NEVER run recv --wait in the background: a background wait drains their messages before you act on them, and \
-the session goes silent to them. SENDING a multi-line message: write the text to a file (with real line \
+SENDING a multi-line message: write the text to a file (with real line \
 breaks), then send that file on stdin — tg-bridge send --topic N - < /tmp/reply.txt. NEVER put a literal \
 \\n inside a quoted argument (tg-bridge send --topic N "a\\nb"): the shell won't interpret it and Telegram \
 shows a literal \\n. \
@@ -2788,8 +2855,7 @@ command, without a task yet — they will give it in your Telegram topic. Set up
 1. Run: tg-bridge register --name {name_q} — note the printed topic_id N.
 2. Send a one-line greeting saying you're ready for instructions: tg-bridge send --topic N "...".
 3. End your turn. When they write, a "[tg-bridge]" line is typed into this terminal — that is your cue to \
-run a FOREGROUND tg-bridge recv --topic N and act on what it returns; NEVER run recv --wait in the \
-background (a background wait drains their messages before you act, and the session goes silent). While idle \
+run a FOREGROUND tg-bridge recv --topic N and act on what it returns. While idle \
 stay SILENT — never send greetings, recaps, or "still waiting" messages. SENDING a multi-line message: write \
 it to a file (with real line breaks), then send that file on stdin — tg-bridge send --topic N - < \
 /tmp/reply.txt. NEVER put a literal \\n in a quoted argument (the shell won't interpret it; Telegram shows a \
@@ -3317,6 +3383,149 @@ def _process_autocf(cfg, thread_id, info, pane, pct, engine, exempt, autocf_fire
     return fire
 
 
+_CONTEXT_CUE_PROBLEMS = set()
+
+
+def _load_context_cue():
+    """Read the optional host configuration fresh; invalid input disables the cue."""
+    try:
+        with open(state_path("codex-context-cue.json")) as f:
+            config = json.load(f)
+        if not isinstance(config, dict):
+            raise ValueError("expected an object")
+        cue = config.get("cue")
+        if not isinstance(cue, str) or not cue.strip():
+            raise ValueError("cue must be a nonempty string")
+        prefixes = config.get("name_prefixes")
+        if (not isinstance(prefixes, list)
+                or any(not isinstance(p, str) or not p for p in prefixes)):
+            raise ValueError("name_prefixes must be a list of nonempty strings")
+        seats = config.get("seats")
+        if not isinstance(seats, list):
+            raise ValueError("seats must be a list")
+        for seat in seats:
+            if not isinstance(seat, dict):
+                raise ValueError("each seat must be an object")
+            folder = seat.get("folder")
+            if (not isinstance(folder, str) or not os.path.isabs(folder)
+                    or "\0" in folder):
+                raise ValueError("seat folder must be an absolute path")
+            cwds = seat.get("rollout_cwds", [folder])
+            if (not isinstance(cwds, list)
+                    or any(not isinstance(cwd, str) or not os.path.isabs(cwd)
+                           or "\0" in cwd for cwd in cwds)):
+                raise ValueError("rollout_cwds must be a list of absolute paths")
+            if "name" in seat and not isinstance(seat["name"], str):
+                raise ValueError("seat name must be a string")
+        return config
+    except FileNotFoundError:
+        return None  # An absent file is the ordinary off switch.
+    except (json.JSONDecodeError, RecursionError):
+        problem = "invalid JSON"
+    except UnicodeError:
+        problem = "invalid text encoding"
+    except OSError as e:
+        problem = f"unreadable file (errno {e.errno})"
+    except ValueError as e:
+        problem = str(e)
+    # Do not quote file contents or repeat the same error on every poll.
+    if problem not in _CONTEXT_CUE_PROBLEMS:
+        _CONTEXT_CUE_PROBLEMS.add(problem)
+        log(f"Codex context cue disabled: {problem}")
+    return None
+
+
+def _context_cue_member(info, config):
+    name = info.get("name")
+    return (isinstance(name, str) and name.startswith(tuple(config["name_prefixes"]))
+            and any(info.get("cwd") == seat["folder"]
+                    and ("name" not in seat or name == seat["name"])
+                    for seat in config["seats"]))
+
+
+def _codex_context_cue(tid, info, pane):
+    # Configuration is a snapshot for this call, including both terminal gates and stamping.
+    config = _load_context_cue()
+    if config is None:
+        return
+    cwd = info.get("cwd")
+    if (not _context_cue_member(info, config)
+            or any(info.get(k) for k in ("ended", "parked", "feed", "closed"))
+            or not pane_alive(pane)):
+        return
+    seat = next(seat for seat in config["seats"] if seat["folder"] == cwd
+                and ("name" not in seat or info["name"] == seat["name"]))
+    rollout_cwds = seat.get("rollout_cwds", [cwd])
+
+    def bound_topic():
+        # Registration already writes this private binding; real ids never ship in code.
+        try:
+            with open(os.path.join(cwd, ".tg-bridge-topic")) as f:
+                return f.read(32).strip() == str(tid)
+        except OSError:
+            return False
+
+    if not bound_topic():
+        return
+    sid = info.get("session_id")
+    selected_name = info["name"]
+    selected_pid = pane_pid(pane)
+
+    def live_rollout():
+        pid = pane_pid(pane)
+        if not pid or pid != selected_pid:
+            return None
+        opened, roots = codex_ctx.open_rollouts_for_pids(codex_ctx.process_tree(pid))
+        path = (roots[0] if len(roots) == 1 else
+                codex_ctx.recorded_rollout_for_pane(pid) if not opened else None)
+        meta = codex_ctx.session_meta(path) if path else None
+        if (sid and meta and meta.get("id") == sid and rollout_uuid(path) == sid
+                and meta.get("cwd") in rollout_cwds and not codex_ctx.is_subagent_rollout(path)):
+            return path
+        return None
+
+    path = live_rollout()
+    if not path:
+        return
+    previous = info.get("codex_compaction_cursor")
+    cursor, compacted = codex_ctx.compaction_cursor(path, previous)
+    if cursor == previous:
+        return
+
+    def still_ours():
+        current = read_registry().get(str(tid), {})
+        return (_context_cue_member(current, config)
+                and current.get("name") == selected_name
+                and pane_pid(pane) == selected_pid
+                and current.get("pane") == pane and current.get("session_id") == sid
+                and current.get("cwd") == cwd
+                and current.get("codex_compaction_cursor") == previous
+                and not any(current.get(k) for k in ("ended", "parked", "feed", "closed"))
+                and pane_alive(pane) and engine_of_pane(pane) == "codex"
+                and bound_topic()
+                # The registry can lag a replacement runtime on the same pane.
+                and live_rollout() == path)
+
+    if compacted:
+        status = type_line(pane, config["cue"], still_ok=still_ours)
+        log(f"Codex context reminder: topic {tid}, terminal result={status}")
+        if status != "sent":
+            return
+    # A crash after Enter but before this stamp may repeat the harmless fixed cue.
+    # Stamping BEFORE Enter would instead lose a reminder; no reservation is delivery.
+    def stamp(reg):
+        current = reg.get(str(tid), {})
+        if (_context_cue_member(current, config)
+                and current.get("name") == selected_name
+                and pane_pid(pane) == selected_pid
+                and current.get("pane") == pane and current.get("session_id") == sid
+                and current.get("cwd") == cwd
+                and not any(current.get(k) for k in ("ended", "parked", "feed", "closed"))
+                and current.get("codex_compaction_cursor") == previous):
+            current["codex_compaction_cursor"] = cursor
+    update_registry(stamp)
+
+
 def warning_loop(cfg):
     warn_path = state_path("warnings.json")
     autocf_path = state_path("autocf.json")
@@ -3379,6 +3588,10 @@ def warning_loop(cfg):
                 # warn/auto-cf state. (Codex review, PR #97)
                 engine = engine_of_pane(pane)
                 if engine == "codex":
+                    try:
+                        _codex_context_cue(thread_id, info, pane)
+                    except Exception as e:
+                        log(f"Codex context reminder error for topic {thread_id}: {e}")
                     warned.pop(thread_id, None)
                     autocf_fired.pop(thread_id, None)
                     _cf_clear_unfinished(thread_id)  # same per-topic state (#239)
@@ -3454,10 +3667,11 @@ def pane_is_idle(pane):
 
 
 def idle_sweep_loop(cfg):
-    """Periodic self-heal: nudge sessions that went dark — visible unread backlog (both
-    engines), or (claude only) an empty inbox with no live recv listener while the pane is
-    idle, which means a dying/detached recv drained the cursor without waking the session.
-    A bug here must never crash the daemon: broad try/except per iteration and per topic."""
+    """Retry unread arrival nudges for either engine after a sustained backlog.
+
+    An empty inbox is normal idle state. A bug here must never crash the daemon:
+    broad try/except per iteration and per topic.
+    """
     while True:
         try:
             now = time.time()
@@ -3476,15 +3690,7 @@ def idle_sweep_loop(cfg):
                         continue  # undeterminable engine / pane not in fleet: skip
                     unread = unread_count(tid)
 
-                    flavor = None
-                    if unread > 0:
-                        flavor = "unread"  # visible backlog; applies to claude AND codex
-                    elif engine == "claude":
-                        # dead-listener case (claude only — codex never has a recv listener)
-                        recv = has_live_recv(tid)
-                        if recv is False and pane_is_idle(pane):
-                            flavor = "dead-listener"
-                    if not flavor:
+                    if unread <= 0:
                         continue
 
                     candidates.add(str(tid))
@@ -3497,18 +3703,14 @@ def idle_sweep_loop(cfg):
                     if now - _last_sweep_nudge.get(str(tid), 0) < SWEEP_COOLDOWN:
                         continue  # rate-limited
 
-                    # #105: "unread" = messages sit undrained; else the recv listener died and
-                    # we re-deliver a fresh dropped message. Dispatch factored into
-                    # sweep_nudge_text so the call site is exercised by unit tests.
-                    text = sweep_nudge_text(tid, flavor, now)
+                    text = sweep_nudge_text(tid)
                     try:
                         status = type_line(pane, text)
-                        undelivered = (f"{unread} undrained message(s)" if unread > 0
-                                       else "a dropped message")
+                        undelivered = f"{unread} undrained message(s)"
                         if status == "sent":
                             _last_sweep_nudge[str(tid)] = now
                             _unreadable_streak.pop(str(tid), None)
-                            log(f"self-heal nudged pane {pane} (topic {tid}, {flavor}, unread={unread})")
+                            log(f"self-heal nudged pane {pane} (topic {tid}, unread={unread})")
                         else:
                             # Deliberately NOT stamping _last_sweep_nudge: nothing was
                             # delivered, so the next sweep must retry rather than sit out
@@ -3971,6 +4173,25 @@ def handle_message(cfg, msg):
     if not text:
         return
 
+    # #373: an exact answer can arrive before the question. Consume it BEFORE append, so
+    # `compact` never becomes the resumed session's next task. This sits after the existing
+    # kill-switch and command routing: a lone word must not exempt a live continuation from
+    # being halted, and slash forms still belong to the daemon when no question is pending.
+    choice = _reopen_answer_choice(text) if kind == "text" else None
+    if choice and str(thread_id) not in pending_reopens:
+        entry = read_registry().get(str(thread_id))
+        if (should_auto_revive(entry) and (entry.get("engine") or "claude") == "claude"
+                and str(thread_id) not in _auto_reviving):
+            with _pending_reopen_lock:
+                # The owner's explicit answer supplies the authority here; no unseen
+                # question is being armed. The usual answer path sends the status first,
+                # then starts the worker and owns its failure/retry transitions.
+                pending_reopens[str(thread_id)] = {"entry": dict(entry), "tokens": None,
+                                                   "state": "delivered"}
+            _save_pending_reopens()
+            if check_pending_reopen(cfg, thread_id, text):
+                return
+
     record = {
         "ts": now_iso(),
         "message_id": msg["message_id"],
@@ -3994,6 +4215,45 @@ def handle_message(cfg, msg):
     log(f"inbox <- topic {thread_id} {kind} message {msg['message_id']}")
     maybe_auto_revive(cfg, thread_id)
     schedule_nudge(thread_id, wake_claim)
+
+
+def handle_callback_query(cfg, query):
+    """Only a tap on the CURRENT delivered reopen question can supply a choice (#373).
+
+    Callbacks have their own door: they must never enter message routing, an inbox, or the
+    carry-forward kill-switch. Even a rejected/stale tap is answered so Telegram stops its
+    spinner, but group membership and possession of callback data confer no authority."""
+    try:
+        sender = query.get("from")
+        message = query.get("message")
+        owner = cfg.get("owner_id")
+        if (not valid_owner_id(owner) or not isinstance(sender, dict)
+                or sender.get("id") != owner or sender.get("is_bot")
+                or not isinstance(message, dict)):
+            return
+        chat = message.get("chat")
+        data = query.get("data")
+        if (not isinstance(chat, dict) or chat.get("id") != cfg["chat_id"]
+                or data not in ("reopen:compact", "reopen:full")):
+            return
+        tid = message.get("message_thread_id", 0)
+        message_id = message.get("message_id")
+        with _pending_reopen_lock:
+            pending = pending_reopens.get(str(tid))
+            if (not pending or pending.get("state") != "delivered"
+                    or pending.get("kind") == "fresh"
+                    or type(message_id) is not int or message_id <= 0
+                    or type(pending.get("message_id")) is not int
+                    or pending["message_id"] != message_id):
+                return
+            # Keep the identity check and transition together: a worker can re-arm a
+            # question while polling continues, and an old tap must not answer its successor.
+            check_pending_reopen(cfg, tid, data.split(":", 1)[1])
+    finally:
+        try:
+            api(cfg["bot_token"], "answerCallbackQuery", {"callback_query_id": query.get("id")})
+        except Exception as e:
+            log(f"could not answer reopen callback query: {e}")
 
 
 # ===========================================================================
@@ -4073,8 +4333,8 @@ def _session_path():
 # task is still running and unnotified, the session has been human-idle past its gate
 # window, the main loop is not busy, and no other active background task blocks reaping.
 # A kill is reported as `killed` / "was stopped" with an EMPTY output file, which is what
-# distinguishes it from a real `recv --wait` timeout: that prints "(no reply within
-# timeout)" and exits 2.
+# distinguished it from a legacy recv timeout, which printed "(no reply within
+# timeout)" and exited 2. New recv waits are refused before reading (#361).
 #
 # On Linux "pressure" is not a pressure signal at all: `Bun.ant.memoryPressureLevel()` is
 # macOS-only, so the check degrades to `os.freemem() < tengu_bg_low_mem_mb` (default
@@ -4370,10 +4630,10 @@ def snapshot_loop(cfg):
 
 RESTORE_BRIEFING_CLAUDE = (
     "[tg-bridge] {opening}; this is the SAME conversation, resumed. {persisted} Your Telegram "
-    "topic is {tid} {topic_state}. Re-arm your listener now: run `tg-bridge recv "
-    "--topic {tid} --wait 86400` as ONE harness run_in_background task (NEVER a detached `&` "
-    "shell job), then end your turn. Do not send a greeting or recap — stay silent until the owner "
-    "writes or your own work produces something."
+    "topic is {tid} {topic_state}. End your turn. When the owner writes, a [tg-bridge] "
+    "line appears here — run a foreground `tg-bridge recv --topic {tid}` and act on it. "
+    "Do not send a greeting or recap — stay silent until the owner writes or your own work "
+    "produces something."
 )
 RESTORE_BRIEFING_CODEX = (
     "[tg-bridge] {opening}; this is the SAME session, resumed. {persisted} Your Telegram "
@@ -4386,8 +4646,8 @@ RESTORE_FRESH_CLAUDE = (
     "{fresh_reason}, so you start clean. {persisted} Do NOT run `tg-bridge register`; your "
     "topic already exists as {tid} {topic_state}. Post a one-line note that you are starting "
     "without the previous context and are ready: `tg-bridge send --topic {tid} \"...\"`. "
-    "Then arm ONE long `tg-bridge recv --topic {tid} --wait 86400` via run_in_background "
-    "(never a detached `&`) and end your turn."
+    "Then end your turn. When the owner writes, a [tg-bridge] line appears here — run a "
+    "foreground `tg-bridge recv --topic {tid}` and act on it."
 )
 RESTORE_FRESH_CODEX = (
     "[tg-bridge] You are a FRESH codex session on Telegram topic {tid}: {opening_lc}, and "
@@ -4627,8 +4887,8 @@ def last_model_for_session(sid):
 # destroys nothing, so a timer only creates a way to lose the choice. Measured 2026-08-25:
 # a 300s window expired unanswered and left a dead session behind an open topic with nothing
 # to say so — a silent dead end, which is strictly worse than waiting.
-REOPEN_FULL_WORDS = ("full", "fully", "as-is", "asis", "полностью")
-REOPEN_COMPACT_WORDS = ("compact", "compacted", "cf", "сжать", "компакт")
+REOPEN_FULL_WORDS = ("full", "f", "fully", "as-is", "asis", "полностью")
+REOPEN_COMPACT_WORDS = ("compact", "c", "compacted", "cf", "сжать", "компакт")
 REOPEN_FRESH_WORDS = ("fresh", "new", "заново", "новая", "новую")
 
 
@@ -4898,8 +5158,11 @@ def answer_resume_picker(pane, choice, deadline=None):
     if not key:
         return "failed"
     deadline = deadline or (time.time() + RESUME_MODAL_WAIT)
+    idle_since = None
     while time.time() < deadline:
-        if _resume_picker_present(_safe_peek(pane)):
+        screen = _safe_peek(pane)
+        if _resume_picker_present(screen):
+            idle_since = None
             # Re-verify INSIDE the lock. Checking before taking it is a TOCTOU: the picker
             # can be dismissed or replaced between the look and the keystroke, and then the
             # key lands in whatever is live now. This daemon already learned that in
@@ -4919,6 +5182,18 @@ def answer_resume_picker(pane, choice, deadline=None):
                     return "failed"
             log(f"resume picker answered '{choice}' on pane {pane}")
             return "answered"
+        # pane_is_idle only means "no busy signal" — a blank/loading pane also passes it.
+        # Require Claude's empty input row as positive evidence, on consecutive looks: one
+        # repaint before a late picker must not send us into the briefing/compact path (#373).
+        if (any(line.strip() == "❯" for line in screen.splitlines())
+                and not _cf_text_is_busy(screen) and not _cf_modal_present(screen)):
+            if idle_since is None:
+                idle_since = time.time()
+            elif time.time() - idle_since >= RESUME_IDLE_GRACE:
+                log(f"resume picker absent on pane {pane} — Claude's idle prompt is ready")
+                return "absent"
+        else:
+            idle_since = None
         time.sleep(2)
     log(f"resume picker never appeared on pane {pane} — nothing to answer")
     return "absent"
@@ -4936,12 +5211,68 @@ def reopen_question(entry, tokens):
     else:
         cost = "re-read its whole history (size unknown — no usage record found)"
     return (
-        f"🔄 Reopening '{entry.get('name', '?')}'. Resuming the full session will {cost}.\n\n"
-        f"Reply `compact` to choose Claude's summary option if its resume picker appears; "
-        f"otherwise the bridge resumes the session and then runs `/compact` — or "
-        f"`full` to resume the whole session as-is.\n"
-        f"Nothing starts until you answer; the question waits and anything else re-asks it."
+        f"🔄 Reopening '{' '.join(str(entry.get('name', '?')).split())}'. Full will {cost}.\n"
+        f"`compact` resumes from a summary; `full` brings back the whole session.\n"
+        f"Tap a button or type `c` / `f`; nothing starts until you answer."
     )
+
+
+REOPEN_KEYBOARD = {"inline_keyboard": [[
+    {"text": "Compact", "callback_data": "reopen:compact"},
+    {"text": "Full", "callback_data": "reopen:full"},
+]]}
+
+
+def _send_reopen_question(cfg, thread_id, pending):
+    """Publish the id with the question it describes, never reconstruct it from chat state.
+
+    A resend/re-ask replaces that id only after Telegram accepts the new question. An
+    ambiguous send still allows typed answers, as before, but cannot authorize a tap on a
+    message whose id we never observed (#373)."""
+    message_ids = []
+    delivered = reply(cfg, thread_id, reopen_question(pending["entry"], pending.get("tokens")),
+                      reply_markup=REOPEN_KEYBOARD, message_ids=message_ids)
+    if delivered:
+        with _pending_reopen_lock:
+            pending.pop("message_id", None)
+            if message_ids:
+                pending["message_id"] = message_ids[0]
+    return delivered
+
+
+def _edit_reopen_message(cfg, thread_id, pending, text, keyboard=None):
+    """Edit one reopen message, or send that same text when an edit fails (#373).
+
+    Retain a fallback's accepted id so the final line edits it rather than posting again.
+    Empty markup is explicit: both a typed answer and a tap retire the question's buttons."""
+    markup = keyboard if keyboard is not None else {"inline_keyboard": []}
+    message_id = pending.get("message_id")
+    if message_id:
+        try:
+            api(cfg["bot_token"], "editMessageText", {
+                "chat_id": cfg["chat_id"], "message_id": message_id,
+                "text": md_to_telegram_html(f"⚙️ {text}"), "parse_mode": "HTML",
+                "reply_markup": json.dumps(markup, separators=(",", ":")),
+            })
+            return
+        except Exception as e:
+            log(f"reopen message edit failed for topic {thread_id}: {e} — sending the text")
+    message_ids = []
+    if reply(cfg, thread_id, text, reply_markup=markup, message_ids=message_ids) and message_ids:
+        with _pending_reopen_lock:
+            pending["message_id"] = message_ids[0]
+
+
+def _finish_reopen_message(cfg, thread_id, pending, compacted):
+    elapsed = max(0, int(time.time() - pending["started_at"]))
+    how = "compacted" if compacted else "in full"
+    try:
+        _edit_reopen_message(cfg, thread_id, pending,
+                             f"✅ '{pending['entry'].get('name', '?')}' is back — {how} · {elapsed} s.")
+    except Exception as e:
+        # The session is up: a failed final edit AND send must not reach the revive worker
+        # as a startup crash, falsely report it still down, and re-arm a stale question.
+        log(f"could not send final reopen status for topic {thread_id}: {e}")
 
 
 def offer_reopen_choice(cfg, thread_id, entry):
@@ -4965,7 +5296,7 @@ def offer_reopen_choice(cfg, thread_id, entry):
         pending_reopens[tid] = {"entry": dict(entry), "tokens": tokens, "state": "prepared"}
     durable = _save_pending_reopens()
     try:
-        delivered = reply(cfg, thread_id, reopen_question(entry, tokens))
+        delivered = _send_reopen_question(cfg, thread_id, pending_reopens[tid])
     except Exception as e:
         # Round 3, finding 6: an exception here (PossiblyDelivered above all) left the record
         # stuck at `prepared` — unanswerable by design, and only re-asked at process start, so
@@ -5017,7 +5348,8 @@ def resend_undelivered_reopen_questions(cfg):
         stored = pending.get("entry") or entry
         text = (fresh_restart_question(stored) if fresh
                 else reopen_question(stored, pending.get("tokens")))
-        if reply(cfg, int(tid), text):
+        if (reply(cfg, int(tid), text) if fresh
+                else _send_reopen_question(cfg, int(tid), pending)):
             pending_reopens[tid]["state"] = "delivered"
             log(f"re-delivered the {'fresh-restart' if fresh else 'reopen'} question for "
                 f"topic {tid} after a restart")
@@ -5052,7 +5384,17 @@ def _rearm_after_failed_revive(cfg, tid, entry):
         kind = (pending or {}).get("kind")
         if kind:
             restored["kind"] = kind
+        if (pending or {}).get("message_id"):
+            restored["message_id"] = pending["message_id"]
         pending_reopens[tid] = restored
+    if (pending or {}).get("started_at") is not None:
+        try:
+            _edit_reopen_message(cfg, int(tid), restored, reopen_question(entry, tokens),
+                                 keyboard=REOPEN_KEYBOARD)
+        except Exception as e:
+            # Restoring the buttons is best-effort; a broken edit AND send must not swallow
+            # the independent failure notice or leave the typed retry unarmed (#373).
+            log(f"could not restore reopen question for topic {tid}: {e}")
     _save_pending_reopens()
 
 
@@ -5194,6 +5536,10 @@ def _revive_with_choice(cfg, thread_id, entry, choice):
             return False
         _auto_reviving.add(tid)
 
+    with _pending_reopen_lock:
+        pending = pending_reopens.get(tid)
+        reopen_status = pending if pending and "started_at" in pending else None
+
     def _run():
         try:
             # The cause must say the BRIDGE parked this session when it did — asking the
@@ -5202,14 +5548,15 @@ def _revive_with_choice(cfg, thread_id, entry, choice):
             revive_cause = ("parked" if (read_registry().get(tid) or {}).get("parked")
                             else "reopen")
             status, _task = revive_one(cfg, tid, entry, brief=True, cause=revive_cause,
-                                       resume_choice=choice, respect_close=True)
+                                       resume_choice=choice, respect_close=True,
+                                       **({"reopen_status": reopen_status} if reopen_status else {}))
             log(f"reopen ({choice}, cause={revive_cause}) topic {tid}: {status}")
             if status == "failed":
                 # Do not let a failed revive be a log line only: that is the silent dead end.
                 _rearm_after_failed_revive(cfg, tid, entry)
                 reply(cfg, int(tid),
                       "⚠️ The revive failed — the session is still down. The question is "
-                      "open again: reply `compact` or `full` to retry.")
+                      "open again: reply `compact`/`c` or `full`/`f` to retry.")
             else:
                 # The worker owns this transition (round 3, finding 5). Only a revive that
                 # actually came up may consume the question.
@@ -5221,7 +5568,7 @@ def _revive_with_choice(cfg, thread_id, entry, choice):
             _rearm_after_failed_revive(cfg, tid, entry)
             reply(cfg, int(tid),
                   "⚠️ The revive crashed — the session is still down. The question is open "
-                  "again: reply `compact` or `full` to retry.")
+                  "again: reply `compact`/`c` or `full`/`f` to retry.")
         finally:
             with _auto_revive_lock:
                 _auto_reviving.discard(tid)
@@ -5289,6 +5636,16 @@ def _forget_pending_reopen(tid):
     _save_pending_reopens()
 
 
+def _reopen_answer_choice(text, allow_slash=False):
+    # Keep the exact same normalization on the early-word and pending-question paths.
+    # Leading punctuation is content, never authority for a costly full resume (#195 r3).
+    word = (text or "").strip().lower().rstrip(".!?")
+    if allow_slash and word in ("/compact", "/full"):
+        word = word[1:]
+    return ("full" if word in REOPEN_FULL_WORDS
+            else "compact" if word in REOPEN_COMPACT_WORDS else None)
+
+
 def check_pending_reopen(cfg, thread_id, text):
     """True iff this message was consumed as an answer to the reopen question.
 
@@ -5313,15 +5670,12 @@ def check_pending_reopen(cfg, thread_id, text):
         # deliberately one that should_auto_revive rejects. Branch before any of the resume
         # path's validation touches it.
         return _check_fresh_restart(cfg, thread_id, pending, word)
-    if word in ("/compact", "/full"):
-        # Muscle memory: while the session is dead, `/compact` cannot mean Claude's own
-        # command, because there is nothing running to compact. Matched EXACTLY rather than
-        # by stripping a sigil character set — round 2, finding 7: `lstrip("/!")` also
-        # swallowed `!fully` (a real interrupt) into an expensive full resume, and turned
-        # `/cf` into `compact` even though `/cf` is the real carry-forward command.
-        word = word[1:]
-    choice = ("full" if word in REOPEN_FULL_WORDS
-              else "compact" if word in REOPEN_COMPACT_WORDS else None)
+    # Muscle memory: while the session is dead, `/compact` cannot mean Claude's own
+    # command, because there is nothing running to compact. Matched EXACTLY rather than
+    # by stripping a sigil character set — round 2, finding 7: `lstrip("/!")` also
+    # swallowed `!fully` (a real interrupt) into an expensive full resume, and turned
+    # `/cf` into `compact` even though `/cf` is the real carry-forward command.
+    choice = _reopen_answer_choice(text, allow_slash=True)
     # Finding 5: the stored entry is a SNAPSHOT. Between question and answer the topic may
     # have been revived by another path, re-registered under a new session id, or unbound
     # entirely. Round 2, finding 8 extended this to the re-ask: a stale snapshot was being
@@ -5346,6 +5700,17 @@ def check_pending_reopen(cfg, thread_id, text):
         # neither answerable nor lost, and the WORKER owns every transition out of it.
         with _pending_reopen_lock:
             pending_reopens[tid]["state"] = "reviving"
+            pending["started_at"] = time.time()
+        # Edit before starting the worker: a fast full resume can otherwise post "back"
+        # before the poll thread gets around to its progress edit, overwriting the result.
+        how = "compacting" if choice == "compact" else "in full"
+        try:
+            _edit_reopen_message(cfg, thread_id, pending,
+                                 f"🔄 Reopening '{current.get('name', '?')}' — {how}…")
+        except Exception as e:
+            # The answer is authoritative even when Telegram is unavailable. Never leave
+            # `reviving` with no worker just because both the edit and its fallback failed.
+            log(f"could not send reopen progress for topic {tid}: {e} — starting the revive")
         _save_pending_reopens()
         if not _revive_with_choice(cfg, thread_id, current, choice):
             _rearm_after_failed_revive(cfg, tid, current)
@@ -5354,12 +5719,11 @@ def check_pending_reopen(cfg, thread_id, text):
                   "answer again in a moment.")
             log(f"reopen revive did not start for topic {tid}; question left armed")
             return True
-        reply(cfg, thread_id, "Resuming the full session as-is." if choice == "full"
-              else "Reopening with the bridge compaction option.")
         return True
     # Not an answer: ask again and leave the question armed. There is no deadline, so this
     # can repeat indefinitely without ever stranding the session (A1).
-    reply(cfg, thread_id, reopen_question(pending["entry"], pending.get("tokens")))
+    _send_reopen_question(cfg, thread_id, pending)
+    _save_pending_reopens()
     log(f"reopen question re-asked for topic {tid} (answer was not full/compact)")
     return False
 
@@ -5426,6 +5790,7 @@ RESUME_MODAL_ROWS = ("Resume from summary", "Resume full session as-is",
                      "Don't ask me again")
 RESUME_MODAL_CHOICE = {"compact": "1", "full": "2"}
 RESUME_MODAL_WAIT = 90        # s to wait for the picker to render after launch
+RESUME_IDLE_GRACE = 2        # s of a visible idle input prompt before declaring it absent (#373)
 LIVE_PICKER_GRACE = 15
 LIVE_PICKER_POLL = 1
 # One budget for a whole mass restore's picker answering (#277). Without it, N large sessions
@@ -5679,8 +6044,9 @@ def _briefing_exhausted(pane, tid, engine, briefing_tpl, attempt, reason, retry_
     decisions and two of them were wrong: the settle timeout and the final compaction
     attempt both returned having scheduled nothing and escalated nothing, under a comment
     saying idle_sweep would cover it. It cannot — `idle_sweep_loop` never calls
-    `deliver_briefing`; it injects `sweep_nudge_text`, which carries no topic id, no re-arm
-    instruction and no restore cause, and for codex it only fires when unread > 0. So a
+    `deliver_briefing`; it injects `sweep_nudge_text`, which names the topic and tells the
+    seat to drain unread messages, but carries no restore cause. For either engine it
+    only fires when unread > 0. So a
     pane that stayed busy through the window was never told it had been revived (#172).
 
     `report_now` is a flag the caller sets when `type_line` returned `swallowed`. What that
@@ -5722,7 +6088,7 @@ def _briefing_exhausted(pane, tid, engine, briefing_tpl, attempt, reason, retry_
 
 
 def deliver_briefing(pane, tid, engine, briefing_tpl, attempt=1, settle=None, await_busy=False,
-                     restore=None):
+                     restore=None, on_ready=None):
     """Type the briefing into a resumed pane once it is up and idle. Crash-retry safety:
     never create a second concurrent recv — if a claude recv already listens, skip. While
     the pane is mid-turn the briefing is NOT typed (a mid-turn inject could corrupt input);
@@ -5737,6 +6103,19 @@ def deliver_briefing(pane, tid, engine, briefing_tpl, attempt=1, settle=None, aw
     collapses duplicate chains from repeated revives: whichever one lands first marks the
     topic, and the rest abandon."""
     window = RESTORE_SETTLE if settle is None else settle
+    # #373: the final owner-visible edit belongs AFTER briefing and any #353 switch back.
+    # Carry it through the existing retry chain; returning from an unsettled compaction is
+    # not evidence that either step ran, and must not prematurely claim the session is back.
+    ready_kwargs = {"on_ready": on_ready} if on_ready else {}
+
+    def _ready_if_listening():
+        # A listener can start during ANY wait or guarded injection, not just before the
+        # first attempt. Skipping a duplicate briefing then still means the session is back.
+        # Called only below the compaction wait/restore; a rebound pane is never our result.
+        if (on_ready and engine == "claude" and has_live_recv(str(tid)) and pane_alive(pane)
+                and (read_registry().get(str(tid)) or {}).get("pane") == pane):
+            on_ready()
+
     # #353: a switch back owed after a bridge-driven compaction comes before every reason below
     # to skip the briefing — a live recv, or the topic having moved on (the session in this
     # pane is still the one that was switched) — so its compaction wait moves up with it.
@@ -5759,14 +6138,19 @@ def deliver_briefing(pane, tid, engine, briefing_tpl, attempt=1, settle=None, aw
                                 f"{_model_note(restore)}")
         _briefing_exhausted(pane, tid, engine, briefing_tpl, attempt, "still compacting",
                             {"settle": settle, "await_busy": True,
-                             **({"restore": restore} if restore else {})})
+                             **({"restore": restore} if restore else {}), **ready_kwargs})
         return
     if restore:
-        restore_after_compaction(pane, tid, restore, _unguarded)
+        restored = restore_after_compaction(pane, tid, restore, _unguarded)
+        if restored != "ok":
+            on_ready = None  # the model warning is already sent; do not report a complete reopen
+            ready_kwargs = {}
     if attempt > 1 and not _briefing_still_ours(pane, tid, engine, "retry"):
+        _ready_if_listening()
         return
     if attempt == 1 and engine == "claude" and has_live_recv(str(tid)):
         log(f"revive: topic {tid} already has a live recv — skip briefing")
+        _ready_if_listening()
         return
     deadline, reached = time.time() + window, False
     while time.time() < deadline:
@@ -5784,7 +6168,7 @@ def deliver_briefing(pane, tid, engine, briefing_tpl, attempt=1, settle=None, aw
         # its listener — silent to the owner until something else happened to nudge it
         # (#172). Same exhaustion path as every other failed attempt.
         _briefing_exhausted(pane, tid, engine, briefing_tpl, attempt,
-                            f"not idle within {window}s")
+                            f"not idle within {window}s", retry_kwargs=ready_kwargs)
         return
     # Revalidate IMMEDIATELY before typing — on EVERY path, including a plain inline first
     # attempt. Review round 2 established why for the waited paths: the checks above run
@@ -5802,6 +6186,7 @@ def deliver_briefing(pane, tid, engine, briefing_tpl, attempt=1, settle=None, aw
     # actually allowed was typing into a pane the topic had already left, reproduced by the
     # #236 round-1 review for both engines with attempt=1 (#238).
     if not _briefing_still_ours(pane, tid, engine, "delivery"):
+        _ready_if_listening()
         return
     text = briefing_tpl.format(tid=tid)
     try:
@@ -5816,11 +6201,12 @@ def deliver_briefing(pane, tid, engine, briefing_tpl, attempt=1, settle=None, aw
             # Not a delivery failure: the topic left this pane while we were typing at it.
             # The chain that now owns the topic briefs it; retrying here would type at a
             # pane this topic no longer has any claim to.
+            _ready_if_listening()
             return
         if status != "sent":
             # Leave briefed_boot unset AND go through the exhaustion path. idle_sweep_loop
-            # cannot stand in for this: for codex it only makes a candidate when unread > 0,
-            # and it sends a generic re-arm nudge, not the briefing. A pane revived into a
+            # cannot stand in for this: for either engine it only makes a candidate when unread > 0,
+            # and it sends an unread nudge, not the briefing. A pane revived into a
             # modal with an empty inbox would otherwise stay unbriefed until the next inbound
             # message happened to arrive (#133 review).
             log(f"revive: briefing {status} for topic {tid} (pane {pane}, attempt {attempt})")
@@ -5829,6 +6215,7 @@ def deliver_briefing(pane, tid, engine, briefing_tpl, attempt=1, settle=None, aw
             # Timer thread for no reason. The swallowed case is passed in as `report_now` so
             # its owner report sits behind the same liveness gate as the final escalation.
             _briefing_exhausted(pane, tid, engine, briefing_tpl, attempt, f"briefing {status}",
+                                retry_kwargs=ready_kwargs,
                                 report_now=(status == "swallowed"))
             return
         boot = current_boot_id()
@@ -5842,13 +6229,15 @@ def deliver_briefing(pane, tid, engine, briefing_tpl, attempt=1, settle=None, aw
                 reg[_tid]["briefed_boot"] = _b
         update_registry(_mark)
         log(f"revive: briefed topic {tid} (engine {engine})")
+        if on_ready:
+            on_ready()
     except Exception as e:
         log(f"revive: briefing send failed for topic {tid}: {e}")
 
 
 def revive_one(cfg, tid, entry, fresh=False, brief=True, taken=None, cause="boot",
                fresh_requested=None, resume_choice=None, respect_close=False,
-               auto_summary=False, picker_deadline=None):
+               auto_summary=False, picker_deadline=None, reopen_status=None):
     """Revive a single session for topic `tid`. Idempotent: if the deterministic revive
     tmux session already exists (crash-retry), verify its engine and rebind instead of
     duplicating. With brief=False, launch+rebind+notice run synchronously and the (slow,
@@ -6014,9 +6403,10 @@ def revive_one(cfg, tid, entry, fresh=False, brief=True, taken=None, cause="boot
             compact_outcome, refusal = _compact_after_absent_picker(pane, tid, compact_plan)
             if compact_outcome == "injected":
                 picker_outcome = "injected"
-                reply(cfg, tid,
-                      "Claude's picker did not appear, so the bridge resumed the session and "
-                      "ran `/compact`.")
+                if reopen_status is None:
+                    reply(cfg, tid,
+                          "Claude's picker did not appear, so the bridge resumed the session and "
+                          "ran `/compact`.")
                 log(f"reopen: injected /compact on pane {pane} for topic {tid} after the "
                     "resume picker was absent")
             elif compact_outcome == "refused":
@@ -6156,7 +6546,7 @@ def revive_one(cfg, tid, entry, fresh=False, brief=True, taken=None, cause="boot
     if closed_again:
         log(f"revive: topic {tid} was closed again during the revive — session is up, "
             f"topic left closed")
-    else:
+    elif reopen_status is None:
         try:
             reply(cfg, int(tid), notice)  # fast; always inline so the owner sees it immediately
         except Exception as e:
@@ -6169,7 +6559,9 @@ def revive_one(cfg, tid, entry, fresh=False, brief=True, taken=None, cause="boot
         # took a manual nudge to arm the listener.
         deliver_briefing(pane, tid, engine, tpl, await_busy=compacting,
                          settle=COMPACT_SETTLE if compacting else None,
-                         **({"restore": task["restore"]} if task.get("restore") else {}))
+                         **({"restore": task["restore"]} if task.get("restore") else {}),
+                         **({"on_ready": lambda: _finish_reopen_message(
+                             cfg, tid, reopen_status, compacting)} if reopen_status else {}))
     status = "resumed" if not do_fresh else "fresh"
     # Only a reopen that was attempted AND failed is a reopen failure. On the reopen-choice
     # path the session came up fine and the bridge never touched the topic's state.
@@ -6942,14 +7334,21 @@ _cf_lock = threading.Lock()      # guards _pending_cf across handler + worker th
 
 
 def is_carry_forward_command(cmd):
-    """True for `/carryforward` (the primary, no-space form the owner uses), `/cf`, or
-    `/carry [forward]` — the daemon-driven carry-forward. In a bridge topic this
+    """True for `/carryforward`, `/cf`, `/carry [forward]`, or bare `/compact` while the
+    cycle is off — the daemon-driven carry-forward. In a bridge topic this
     intercepts `/carryforward` on purpose, because the daemon has to run /compact
     (the model can't compact itself). The session-side interactive skill still
     works in non-bridge sessions, where the daemon isn't in the path."""
     parts = cmd.split()
     if not parts:
         return False
+    if parts == ["/compact"]:
+        # Bare `/compact` is the same flow while the cycle is off, since then the flow IS a
+        # compaction — and the bridge's one moves the session to COMPACT_MODEL for it, where
+        # Claude's own would compact on whatever model the session is on. With arguments it
+        # stays Claude's own command (custom summary instructions), and with the cycle on
+        # it would mean the issue write-up, so it is relayed as before.
+        return not CARRY_FORWARD
     if parts[0] in ("/carryforward", "/cf"):
         return True
     if parts[0] == "/carry":
@@ -8033,6 +8432,11 @@ def main():
                     handle_message(cfg, msg)
                 except Exception as e:
                     log(f"handle_message error: {e}")
+            elif update.get("callback_query"):
+                try:
+                    handle_callback_query(cfg, update["callback_query"])
+                except Exception as e:
+                    log(f"handle_callback_query error: {e}")
         if updates:
             save_offset(offset)
 

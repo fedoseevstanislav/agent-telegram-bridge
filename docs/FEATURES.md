@@ -39,7 +39,7 @@ tg-bridge register --name "short task description"   # creates the topic, prints
 tg-bridge send --topic N - < /tmp/reply.txt          # the file's text becomes the message
 tg-bridge send --topic N --file ./report.html "here" # uploads the file, text is its caption
 tg-bridge ask --topic N "which one?" --timeout 600   # send, then block for a reply
-tg-bridge recv --topic N --wait 86400                # block until something arrives
+# For later replies: end your turn; on [tg-bridge], run foreground recv
 tg-bridge typing --topic N --seconds 120             # keep the typing indicator alive
 tg-bridge status                                     # daemon health and every topic
 ```
@@ -64,7 +64,7 @@ Anything starting with `/` in a topic is a command, never inbox content.
 | `/peek` | The last ~25 visible lines of the session's terminal. |
 | `/claude <name> [@~/path][: <task>]` | Start a Claude Code session. |
 | `/codex <name> [@~/path][: <task>]` | Start a Codex session. |
-| `/carryforward`, `/cf` | Have the session write a durable handover, then compact, then resume from it. |
+| `/compact`, `/cf`, `/carryforward` | Compact the session on Sonnet, switch it back to its own model, and tell it to carry on from the summary. `/compact` with instructions after it is Claude's own command, typed into the terminal. |
 | any other `/command` | Typed into the session's pane and executed, with a confirmation reply. |
 
 Plain text in **General** gets an immediate hint instead of vanishing: no session reads General.
@@ -108,7 +108,11 @@ a whole fleet.
 
 ### Carry-forward
 
-A model cannot compact itself, so the daemon acts as its hands. `/carryforward` makes the
+A model cannot compact itself, so the daemon acts as its hands. Bare `/compact`, `/cf` and
+`/carryforward` wait for the session to go idle, type `/compact`, wait for compaction to finish,
+and tell the session to carry on from the summary. With `TG_BRIDGE_CARRY_FORWARD=1`, `/cf` and
+`/carryforward` instead run the older cycle, and bare `/compact` is typed into the terminal as
+Claude's own command: the cycle makes the
 session write a dense handover — current state and concrete next steps — to a file in the state
 directory, records it to a GitHub issue (creating one if there is no focus issue), types
 `/compact`, clears the resume modal, waits for compaction to actually finish, and then tells the
@@ -135,6 +139,11 @@ recreates it.
 **Context warnings.** A session's topic is warned when its context usage first crosses 20%, then
 every further 10%. The mark re-arms when usage drops, so a compact does not silence it.
 
+**Codex context cues.** An optional private state-directory file selects seats and the text to
+type after their next native compaction. The daemon checks the topic binding and live root
+rollout, baselines historical events, and retries unsuccessful typing. With no file the feature
+is off. See [configuration](CONFIGURATION.md#codex-context-cues) for the schema.
+
 **5-hour limit → low priority.** The limit is account-wide, so when it is reached every live
 Claude session is switched to low-priority mode automatically — the same `/low-priority` you
 would type yourself — and each topic gets one line saying so and when the window resets. A
@@ -150,7 +159,23 @@ sessions that ended, account usage, daemon health. Also zero tokens.
 cache has expired, so the full re-read costs a great deal and buys nothing. The restore message
 names the sessions that were. A whole restore has one time budget for this; if a long restore
 uses it up, the sessions after that come back the old way rather than holding up the fleet. When
-you revive a session yourself by writing to it, you are still asked which you want.
+you revive a large session yourself by writing to it, you choose which you want.
+
+**Reopen a parked Claude session.** The question names the topic and the full resume's token
+cost (or says the size is unknown), with **Compact** and **Full** buttons. Typing `c` / `compact`
+or `f` / `full` also works. Compact chooses Claude's summary option when its picker appears;
+otherwise the bridge runs `/compact` after resuming, then restores the session's own model.
+The bridge stops waiting for the picker once Claude's idle input prompt stays visible for
+two seconds. The question becomes a progress line, then a final line saying the session is
+back, compacted or in full, with seconds elapsed since your answer. This edit comes after
+the briefing step and, for bridge compaction, the model restore. Warnings still arrive as
+separate messages; an edit that fails sends the same text as a new message.
+
+You can send a plain text message of just `compact` or `full` before the question arrives: a down Claude session
+reopens with that choice, with one status message updated when it is back. The answer word
+does not enter the session's inbox and does not set a preference for later reopens. Other
+messages to large sessions still get the question; small sessions reopen without it. Codex
+sessions keep their existing flow.
 
 **Lifecycle.** When a registered session's pane dies, its topic gets a "session ended" notice and
 is closed, and the registry is stamped — which stops nudges and warnings for it. Reopening the
@@ -176,10 +201,17 @@ Seats finished for issue #125. Reply with: notify --topic <mine> --idempotency-k
 EOF
 ```
 
-`notify` appends to the target's inbox, wakes its pane, and mirrors the message into both
-topics — signed with the **sender's** icon, so a peer message can never appear wearing the
+`notify` appends to the target's inbox, cues a live pane for the first unread batch, and
+mirrors the message into both topics — signed with the **sender's** icon, so a peer message can never appear wearing the
 recipient's signature. Your own topic shows `→ <them>: …` so both threads read as whole
 conversations.
+
+If the target is parked, `wake: parked-stored` and a stderr message tell you when it was
+parked and that the record was stored, not delivered. Peer and automation notifications
+cause no revive or reopen question. The owner's Telegram message or topic-reopen wakes the
+seat (so does a park that raced an exemption or a carry-forward); the queued notifications
+are available when the seat revives. The
+Telegram mirrors are still attempted immediately.
 
 The name is the honest ceiling, and so is every word of the result. `status: enqueued` means the
 record is written and fsynced — **process-crash durability with a fsynced file**, so a sender

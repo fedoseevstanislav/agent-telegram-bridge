@@ -53,7 +53,7 @@ def test_config_reload_revalidates_owner_id(tmp_path, monkeypatch):
 
 
 def test_edited_messages_are_not_requested_from_telegram():
-    assert json.loads(daemon.ALLOWED_UPDATES) == ["message"]
+    assert json.loads(daemon.ALLOWED_UPDATES) == ["message", "callback_query"]
 
 
 @pytest.mark.parametrize("text", ["/claude task", "/codex task", "/kill", "/stop", "!redirect"])

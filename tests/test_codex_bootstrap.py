@@ -26,9 +26,9 @@ def test_bootstrap_warns_against_literal_backslash_n():
 
 def test_bootstrap_forbids_background_recv():
     for b in BOOTSTRAPS:
-        assert "recv --wait" in b and "background" in b
-    assert "NEVER run recv --wait in the background" in daemon.CODEX_BOOTSTRAP
-    assert "NEVER run recv --wait in the" in daemon.CODEX_BOOTSTRAP_NO_TASK
+        assert "FOREGROUND" in b
+        assert "End your turn" in b
+        assert "--wait" not in b
 
 
 def test_bootstrap_still_nudge_driven_foreground_recv():

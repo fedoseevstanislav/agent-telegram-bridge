@@ -4,9 +4,7 @@ Layers:
   * cli: the read cursor must never advance before a message is durably on stdout —
     `print_records` then `sys.stdout.flush()` MUST both precede `save_cursor`, in `cmd_recv`
     AND in `cmd_ask` (which also flushes any pre-existing unread before advancing past it).
-  * daemon: `last_inbox_message` (last record) + `recent_inbox_drop` (freshness gate) +
-    `dead_listener_nudge` (re-delivery text) — the self-heal re-delivers the last message's
-    text when a listener has died, but only when it's fresh enough to be a plausible drop.
+  * daemon: last-record freshness helpers retained for park safety.
   * launcher: `bin/tg-bridge` runs the CLI unbuffered (`python3 -u`).
 """
 
@@ -260,95 +258,36 @@ def test_last_inbox_message_missing_text_key(tmp_path, monkeypatch):
     assert daemon.last_inbox_message(7) == {"from": "A"}
 
 
-# ---- daemon: recent_inbox_drop (freshness gate) ------------------------------
+# ---- daemon: recent_inbox_message (freshness gate) ------------------------------
 
-def test_recent_inbox_drop_returns_record_when_fresh(tmp_path, monkeypatch):
+def test_recent_inbox_message_returns_record_when_fresh(tmp_path, monkeypatch):
     _patch_daemon_state(tmp_path, monkeypatch)
     inbox = _write_inbox(tmp_path, 7, [json.dumps({"from": "S", "text": "fresh"}) + "\n"])
     os.utime(inbox, (1000, 1000))
     # now is only 10s after the write -> well within the window
-    assert daemon.recent_inbox_drop(7, now=1010, window=1200) == {"from": "S", "text": "fresh"}
+    assert daemon.recent_inbox_message(7, now=1010, window=1200) == {"from": "S", "text": "fresh"}
 
 
-def test_recent_inbox_drop_none_when_stale(tmp_path, monkeypatch):
-    # SHOULD-FIX (Codex #105 review): an old, already-handled last message must NOT be
-    # re-injected on a routine dead-listener sweep.
+def test_recent_inbox_message_none_when_stale(tmp_path, monkeypatch):
+    # Old messages must not indefinitely prevent parking.
     _patch_daemon_state(tmp_path, monkeypatch)
     inbox = _write_inbox(tmp_path, 7, [json.dumps({"from": "S", "text": "old"}) + "\n"])
     os.utime(inbox, (1000, 1000))
     # now is 5000s after the write -> far outside a 1200s window
-    assert daemon.recent_inbox_drop(7, now=6000, window=1200) is None
+    assert daemon.recent_inbox_message(7, now=6000, window=1200) is None
 
 
-def test_recent_inbox_drop_none_when_absent(tmp_path, monkeypatch):
+def test_recent_inbox_message_none_when_absent(tmp_path, monkeypatch):
     _patch_daemon_state(tmp_path, monkeypatch)
-    assert daemon.recent_inbox_drop(999, now=1000) is None
+    assert daemon.recent_inbox_message(999, now=1000) is None
 
 
-# ---- daemon: dead_listener_nudge ---------------------------------------------
-
-def test_dead_listener_nudge_redelivers_last_message():
-    text = daemon.dead_listener_nudge(7033, {"from": "Владелец", "text": "please pay the R1 invoice"})
-    assert "please pay the R1 invoice" in text          # the actual message is re-delivered
-    assert "Владелец" in text                          # attributed to the sender
-    assert "topic 7033" in text and "recv --topic 7033" in text
-    assert "act on it now" in text
-
-
-def test_dead_listener_nudge_no_recap_without_record():
-    text = daemon.dead_listener_nudge(7033, None)
-    assert "dropped a message" not in text              # no phantom recap
-    assert "Drain with" in text                         # but still the re-arm instruction
-
-
-def test_dead_listener_nudge_no_recap_on_empty_text():
-    text = daemon.dead_listener_nudge(7033, {"from": "A", "text": ""})
-    assert "dropped a message" not in text
-
-
-def test_dead_listener_nudge_flags_truncation_of_long_message():
-    # SHOULD-FIX (Codex #105 review): a >400-char message must be flagged as truncated, never
-    # presented as if complete (its tail may be unrecoverable once the cursor has advanced).
-    text = daemon.dead_listener_nudge(7033, {"from": "A", "text": "x" * 1000})
-    assert "x" * 400 in text
-    assert "x" * 401 not in text                         # snippet capped at 400 chars
-    assert "truncated" in text                           # and the cap is disclosed
-
-
-def test_dead_listener_nudge_flattens_newlines():
-    # the nudge is sent as a single tmux send-keys line; embedded newlines would break it
-    text = daemon.dead_listener_nudge(7033, {"from": "A", "text": "line1\nline2"})
-    assert "line1 line2" in text
-    assert "line1\nline2" not in text
-
-
-# ---- daemon: sweep_nudge_text — the exact dispatch idle_sweep_loop calls -----
-
-def test_sweep_nudge_text_dead_includes_fresh_message(tmp_path, monkeypatch):
-    # Pins the real call site: idle_sweep_loop uses sweep_nudge_text(tid, flavor, now). A
-    # fresh drop on the dead-listener flavor -> the message text is re-delivered.
-    _patch_daemon_state(tmp_path, monkeypatch)
-    inbox = _write_inbox(tmp_path, 7033, [json.dumps({"from": "S", "text": "just-dropped"}) + "\n"])
-    os.utime(inbox, (1000, 1000))
-    text = daemon.sweep_nudge_text(7033, "dead", now=1005)
-    assert "just-dropped" in text
-    assert "isn't running" in text                         # the dead-listener nudge, not "unread"
-
-
-def test_sweep_nudge_text_dead_skips_stale_message(tmp_path, monkeypatch):
-    # Same flavor, stale last message -> plain re-arm nudge, no recap.
-    _patch_daemon_state(tmp_path, monkeypatch)
-    inbox = _write_inbox(tmp_path, 7033, [json.dumps({"from": "S", "text": "handled-hours-ago"}) + "\n"])
-    os.utime(inbox, (1000, 1000))
-    text = daemon.sweep_nudge_text(7033, "dead", now=9999)
-    assert "handled-hours-ago" not in text
-    assert "Drain with" in text
-
+# ---- daemon: unread nudge ----------------------------------------------------
 
 def test_sweep_nudge_text_unread_flavor(tmp_path, monkeypatch):
-    # The "unread" flavor is the other dispatch branch: undrained inbox, not a dead listener.
+    # Only visible unread backlog gets a sweep nudge.
     _patch_daemon_state(tmp_path, monkeypatch)
-    text = daemon.sweep_nudge_text(7, "unread", now=1000)
+    text = daemon.sweep_nudge_text(7)
     assert "undelivered messages in topic 7" in text
     assert "isn't running" not in text                     # not the dead-listener wording
 

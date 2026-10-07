@@ -186,20 +186,6 @@ def _capture(monkeypatch):
     return out
 
 
-def test_recv_prints_the_elapsed_notice_and_still_exits_2(monkeypatch):
-    monkeypatch.setattr(cli, "resolve_topic", lambda args: 42)
-    monkeypatch.setattr(cli, "require_own_topic", lambda tid, cmd: None)
-    monkeypatch.setattr(cli, "wait_for_messages",
-                        lambda tid, timeout: ([], 0, EPOCH, 86400))
-    out = _capture(monkeypatch)
-
-    args = types.SimpleNamespace(topic="42", wait=86400, peek=False, json=False)
-    with pytest.raises(SystemExit) as exc:
-        cli.cmd_recv({}, args)
-
-    assert exc.value.code == 2, "exit 2 is how a session tells a timeout from a failure"
-    assert "24h 0m 0s" in out.text
-    assert EPOCH_UTC in out.text
 
 
 def test_ask_prints_the_elapsed_notice_and_still_exits_2(monkeypatch):
@@ -222,21 +208,6 @@ def test_ask_prints_the_elapsed_notice_and_still_exits_2(monkeypatch):
     assert EPOCH_UTC in out.text
 
 
-def test_a_wait_that_delivers_prints_no_timeout_notice(monkeypatch):
-    # The notice must stay on the empty path: printed unconditionally it would sit in the
-    # middle of a delivered message and every session would read a real reply as a timeout.
-    monkeypatch.setattr(cli, "resolve_topic", lambda args: 42)
-    monkeypatch.setattr(cli, "require_own_topic", lambda tid, cmd: None)
-    monkeypatch.setattr(cli, "wait_for_messages",
-                        lambda tid, timeout: ([{"text": "hi"}], 1, EPOCH, 3))
-    monkeypatch.setattr(cli, "drain_and_commit", lambda *a: None)
-    monkeypatch.setattr(cli, "send_typing", lambda cfg, tid: None)
-    out = _capture(monkeypatch)
-
-    args = types.SimpleNamespace(topic="42", wait=86400, peek=False, json=False)
-    cli.cmd_recv({}, args)          # must NOT raise SystemExit
-
-    assert "no reply within timeout" not in out.text
 
 
 def test_recv_without_wait_never_reports_a_wait_it_did_not_do(monkeypatch):

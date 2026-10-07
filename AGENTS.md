@@ -18,15 +18,15 @@ essentials, so you can recognise when you need it:
   *text as a message*. `send --topic N --file reply.txt` *uploads the file*, which makes the
   reader download a `.txt` to read a paragraph. If you wrote it for them to read, it is a
   message.
-- **Idle means silent.** Arm exactly one long wait — `recv --topic N --wait 86400` as a
-  harness-tracked background task — and end your turn. A timeout is not news; re-arm it without
-  saying anything. Never send greetings, status recaps, or "still waiting" messages: each one
-  wakes a human's phone.
-- **Never detach a wait with a bare `&`.** A backgrounded-by-shell `recv` consumes the reply and
-  exits without waking you, and the session goes dark to the person waiting on it.
+- **Idle means silent.** End your turn. When a `[tg-bridge]` line appears in this terminal,
+  run foreground `tg-bridge recv --topic N` and act on the messages. Never send greetings,
+  status recaps, or "still waiting" messages: each one wakes a human's phone.
+- **No background recv or ask.** For a later answer, send the question and end your turn;
+  the bridge will type the reply cue. A short foreground `ask --timeout` remains allowed.
 - **Exit codes are instructions.** `3` on send means new messages arrived while you worked —
   read them, then compose your reply taking them into account. `4` means you aimed at another
-  session's topic; use `notify` instead.
+  session's topic; use `notify` instead. `5` on recv means background waits are retired;
+  end your turn and read on the next bridge nudge.
 - **Echo only what you cannot trust.** Voice transcription garbles words. When an instruction
   reads garbled, contradictory, or genuinely ambiguous AND acting on the wrong reading would be
   hard to undo, reply with your understanding and wait. Otherwise state your reading in one line

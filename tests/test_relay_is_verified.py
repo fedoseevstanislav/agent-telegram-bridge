@@ -277,3 +277,33 @@ def test_the_title_alone_does_not_confirm(monkeypatch, topic):
     daemon._try_send_model({}, 4242, "opus", "%1", "claude", 1)
 
     assert seen["extra"] == 0
+
+
+# ---- bare /compact is the bridge's compaction, not a relayed keystroke ------------------
+
+def test_bare_compact_starts_the_bridge_flow_and_types_nothing(monkeypatch, topic):
+    # The bridge's flow moves the session to COMPACT_MODEL first; the relay would compact on
+    # whatever model the session is on.
+    pane = _pane(monkeypatch, CLAUDE_IDLE)
+    started = []
+    monkeypatch.setattr(daemon, "CARRY_FORWARD", False)
+    monkeypatch.setattr(daemon, "handle_carry_forward",
+                        lambda _cfg, tid, cmd, _info, p: started.append((tid, cmd, p)) or True)
+
+    daemon.handle_command({}, 4242, "/compact")
+
+    assert started == [(4242, "/compact", "%1")]
+    assert pane.submitted == []
+
+
+def test_compact_with_instructions_is_still_relayed(monkeypatch, topic):
+    pane = _pane(monkeypatch, CLAUDE_IDLE)
+    started = []
+    monkeypatch.setattr(daemon, "CARRY_FORWARD", False)
+    monkeypatch.setattr(daemon, "handle_carry_forward",
+                        lambda *a, **k: started.append(a) or True)
+
+    daemon.handle_command({}, 4242, "/compact keep the test names")
+
+    assert started == []
+    assert pane.submitted == ["/compact keep the test names"]
