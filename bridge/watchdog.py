@@ -13,7 +13,7 @@ import sys
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from bridge.common import api, load_config, now_iso, secure_process_umask, state_path
+from bridge.common import api, configured_groups, load_config, now_iso, secure_process_umask, state_path
 
 SERVICE = "agent-telegram-bridge.service"
 STATUS_EXCERPT_CHARS = 800
@@ -51,6 +51,8 @@ def save_state(state):
 
 
 def send_general(cfg, text):
+    if cfg.get("groups"):
+        text += "\nGroups: " + ", ".join(group["name"] for group in configured_groups(cfg))
     api(cfg["bot_token"], "sendMessage", {"chat_id": cfg["chat_id"], "text": text})
 
 

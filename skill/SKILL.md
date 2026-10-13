@@ -32,6 +32,7 @@ Name the topic after the task, not the session id. Verify the daemon first if an
 | Message another session | `tg-bridge notify --topic M --idempotency-key "N->M:<slug>"` (body on stdin) — see below |
 | …refused with exit 4 | you aimed `send`/`ask`/`recv` at another session's topic — use `notify` instead |
 | Daemon + topics health | `tg-bridge status` |
+| Move to another group (operator) | `tg-bridge move --topic N --to personal` — prints the new key; retains the session and unread messages. Requires the running daemon; refuses a pending reopen question or worker in flight. |
 
 ## Communication Discipline (required)
 
@@ -68,6 +69,7 @@ EOF
 ## Rules
 
 - **One topic per session.** Register once; reuse the same `--topic N` for the whole session. Do not register again after compaction if a topic id is already known.
+- **After an operator move, use the new key.** `current-topic` reports the new pane binding; `send`, `recv`, and `notify` also follow an old key's move pointer. A shared cwd bound to another topic is untouched; a moved live pane resolves its own key before that cwd file. Owner messages in the old Telegram topic get only a destination pointer.
 - **Feeds are not dialogs.** If you need a topic to POST events/notifications into (rather than talk with the owner), register it with `--feed`: it gets no pane binding, context warnings, idle nudges, or lifecycle notices. Never re-register a plain dialog topic for feed purposes — that double-binds your terminal.
 - **Replies are pull-based, with a wake-up nudge.** The owner's messages queue in the inbox. Check foreground `recv` at natural turn boundaries. When waiting for a later answer, end your turn; if you registered inside tmux, the bridge types a `[tg-bridge]` line into your terminal when a message arrives. Run the foreground `recv` it names and act on the messages. Always drain the inbox fully. A short foreground `ask --timeout` is also allowed when you need a blocking answer.
 - **Voice arrives as text.** Records tagged `(voice)` are transcriptions — treat exactly like typed text (Wispr-style typos possible).

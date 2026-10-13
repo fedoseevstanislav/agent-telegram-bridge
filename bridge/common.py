@@ -3,6 +3,7 @@
 import fcntl
 import hashlib
 import html as _html
+import inspect
 import json
 import os
 import re
@@ -15,6 +16,7 @@ import urllib.parse
 import urllib.request
 from contextlib import contextmanager
 from dataclasses import dataclass
+from functools import wraps
 
 CONFIG_PATH = os.path.expanduser("~/.config/agent-telegram-bridge/config.json")
 STATE_DIR = os.path.expanduser("~/.local/share/agent-telegram-bridge")
@@ -87,7 +89,229 @@ def load_config():
             raise SystemExit(f"config missing {key!r} in {CONFIG_PATH}")
     if not valid_owner_id(cfg["owner_id"]):
         raise SystemExit(f"config has invalid 'owner_id' in {CONFIG_PATH}")
+    _validate_groups(cfg)
     return cfg
+
+
+_GROUP_NAME = re.compile(r"[a-z][a-z0-9_-]{0,63}\Z")
+_TOPIC_KEY = re.compile(r"(?:(?P<group>[a-z][a-z0-9_-]{0,63}):)?(?P<thread>[0-9]+)\Z")
+
+
+def _validate_groups(cfg):
+    """Reject ambiguous routing before polling; diagnostics never include secret values."""
+    default = cfg.get("default_group", "work")
+    if not isinstance(default, str) or not _GROUP_NAME.fullmatch(default):
+        raise SystemExit("config has invalid default_group: expected a lowercase group slug")
+    groups = cfg.get("groups", [])
+    if not isinstance(groups, list):
+        raise SystemExit("config groups must be a list")
+    names, chats = {default}, {cfg["chat_id"]}
+    for index, group in enumerate(groups):
+        label = f"config groups[{index}]"
+        if not isinstance(group, dict):
+            raise SystemExit(f"{label} must be an object")
+        name = group.get("name")
+        if not isinstance(name, str) or not _GROUP_NAME.fullmatch(name):
+            raise SystemExit(f"{label} has invalid name: expected a lowercase group slug")
+        if name in names:
+            raise SystemExit(f"{label} repeats a group name (including the default group)")
+        chat = group.get("chat_id")
+        if type(chat) is not int or chat >= 0:
+            raise SystemExit(f"{label} chat_id must be a negative integer")
+        if chat in chats:
+            raise SystemExit(f"{label} repeats a chat_id (including the default group)")
+        if ("bot_token" in group) == ("bot_token_file" in group):
+            raise SystemExit(f"{label} needs exactly one of bot_token or bot_token_file")
+        if "bot_token_file" in group:
+            path = group["bot_token_file"]
+            if not isinstance(path, str) or not path:
+                raise SystemExit(f"{label} has invalid bot_token_file path")
+            handle, rejection = _open_secret_file(os.path.expanduser(path))
+            if rejection:
+                raise SystemExit(f"{label} bot_token_file {rejection}")
+            try:
+                with handle as f:
+                    token = f.read().strip()
+            except (OSError, UnicodeError):
+                raise SystemExit(f"{label} bot_token_file could not be read") from None
+        else:
+            token = group["bot_token"]
+        clean, rejection = _clean_secret(token)
+        if rejection:
+            raise SystemExit(f"{label} has invalid bot_token: {rejection}")
+        # Resolved only in memory. No state file or log ever needs the token.
+        group["bot_token"] = clean
+        names.add(name)
+        chats.add(chat)
+
+
+class TopicKeyError(RuntimeError):
+    """A topic key that names no configured group, or is malformed.
+
+    Not SystemExit (#377 review F1): daemon threads catch Exception, and a SystemExit raised
+    for a registry entry whose group was later removed from config ended those threads for
+    every group. Only the CLI turns this into an exit, at its own boundary."""
+
+
+def configured_groups(cfg):
+    """The top-level credentials remain the default group, even when extras are present."""
+    return [{"name": cfg.get("default_group", "work"),
+             "bot_token": cfg.get("bot_token"), "chat_id": cfg["chat_id"]}] + cfg.get("groups", [])
+
+
+def group_config(cfg, name=None):
+    name = name or cfg.get("default_group", "work")
+    for group in configured_groups(cfg):
+        if group["name"] == name:
+            return group
+    raise TopicKeyError("unknown Telegram group")
+
+
+def group_for_chat(cfg, chat_id, token=None):
+    for group in configured_groups(cfg):
+        if group["chat_id"] == chat_id and (token is None or group["bot_token"] == token):
+            return group
+    return None
+
+
+def topic_parts(key):
+    """Return (group name or None for the default, numeric Telegram thread id)."""
+    match = _TOPIC_KEY.fullmatch(str(key))
+    if not match:
+        raise TopicKeyError("invalid topic key: expected a thread id or group:thread")
+    return match["group"], int(match["thread"])
+
+
+def normalize_topic_key(key):
+    group, thread = topic_parts(key)
+    return f"{group}:{thread}" if group else thread
+
+
+def topic_key(cfg, group, thread):
+    return thread if group == cfg.get("default_group", "work") else f"{group}:{thread}"
+
+
+def topic_credentials(cfg, key):
+    """One route for every topic call: token, chat id, and the wire's numeric thread id."""
+    name, thread = topic_parts(key)
+    group = group_config(cfg, name)
+    # The default has exactly one spelling: aliases would split inboxes and authorization.
+    if name == cfg.get("default_group", "work"):
+        raise TopicKeyError("default-group topics use bare thread ids")
+    return group["bot_token"], group["chat_id"], thread
+
+
+def topic_sort_key(key):
+    try:
+        group, thread = topic_parts(key)
+    except TopicKeyError:
+        return "\uffff", 0, str(key)  # malformed keys sort last instead of breaking the sort
+    return group or "", thread, ""
+
+
+def resolve_moved_topic(key, registry=None):
+    """Follow tombstones, including repeated moves, without inventing another binding."""
+    key = normalize_topic_key(key)
+    registry = read_registry() if registry is None else registry
+    seen = set()
+    while True:
+        if str(key) in seen:
+            raise TopicKeyError("cycle in moved topic pointers")
+        seen.add(str(key))
+        info = registry.get(str(key), {})
+        if not info.get("moved_to"):
+            return key
+        key = normalize_topic_key(info["moved_to"])
+
+
+def move_request_path(key):
+    # The reply must stay at the original key even if another move starts before its
+    # first operator reads it. A mailbox inside the renamed folder would be reused.
+    return state_path("topics", f"{normalize_topic_key(key)}.move.json")
+
+
+@contextmanager
+def topic_lock(key, *, exclusive=False, blocking=True):
+    """Fence a move against operations using that topic's paths and daemon state.
+
+    Outside the topic folder: renaming the folder must not create a second lock inode.
+    Shared holds permit the existing message/worker concurrency; only a move is exclusive.
+    """
+    key = normalize_topic_key(key)
+    path = state_path("topic-locks", f"{key}.lock")
+    os.makedirs(os.path.dirname(path), mode=0o700, exist_ok=True)
+    with open(path, "a") as lock:
+        operation = fcntl.LOCK_EX if exclusive else fcntl.LOCK_SH
+        if not blocking:
+            operation |= fcntl.LOCK_NB
+        fcntl.flock(lock, operation)
+        try:
+            yield
+        finally:
+            fcntl.flock(lock, fcntl.LOCK_UN)
+
+
+@contextmanager
+def locked_topic(key):
+    """Pin the final key; a move that won the lock first makes us resolve again."""
+    while True:
+        key = resolve_moved_topic(key)
+        with topic_lock(key):
+            current = resolve_moved_topic(key)
+            if current != key:
+                key = current
+                continue
+            yield key
+            return
+
+
+def topic_operation(parameter, *, moved_result=None):
+    """Keep a daemon operation on its original binding, or abandon a stale worker.
+
+    Daemon timers/workers must not follow a tombstone and act with an old snapshot; CLI
+    commands instead use locked_topic to follow the pointer before reading any state.
+    """
+    def decorate(function):
+        signature = inspect.signature(function)
+
+        @wraps(function)
+        def run(*args, **kwargs):
+            key = signature.bind(*args, **kwargs).arguments[parameter]
+            with topic_lock(key):
+                if read_registry().get(str(key), {}).get("moved_to"):
+                    return moved_result
+                return function(*args, **kwargs)
+        return run
+    return decorate
+
+
+def latest_topics_by_pane(registry):
+    """Highest thread id within one group; creation time when groups differ.
+
+    Telegram numbers threads separately in each chat, so comparing the raw thread numbers
+    across groups can send warnings to an older binding. Keep the existing ordering for a
+    single group and use registration time only at the cross-group seam.
+    """
+    latest = {}
+    for key, info in registry.items():
+        if not isinstance(info, dict) or info.get("ended") or info.get("feed"):
+            continue
+        pane = info.get("pane")
+        if not pane:
+            continue
+        try:
+            group, thread = topic_parts(key)
+        except TopicKeyError:
+            continue  # a malformed key cannot be served; never let it stop the sweep (#377 F1)
+        previous = latest.get(pane)
+        if previous is None:
+            latest[pane] = key
+        elif group == topic_parts(previous)[0]:
+            if thread > topic_parts(previous)[1]:
+                latest[pane] = key
+        elif info.get("created", "") >= registry[previous].get("created", ""):
+            latest[pane] = key
+    return latest
 
 
 def state_path(*parts):
@@ -409,6 +633,23 @@ def api(token, method, params=None, timeout=70, retries=3):
 
 
 def _api_call(token, method, data, headers, timeout, retries):
+    # urllib's invalid-URL errors and an API error body can echo the URL, including the bot
+    # token. All callers log exceptions, so remove it at this one transport boundary.
+    try:
+        return _api_call_raw(token, method, data, headers, timeout, retries)
+    except Exception as exc:
+        raise _redact_bot_exception(token, exc) from None
+
+
+def _redact_bot_exception(token, exc):
+    """Both Bot API and file-download URLs carry credentials; callers persist errors."""
+    if isinstance(token, str) and token and token in str(exc):
+        kind = PossiblyDelivered if isinstance(exc, PossiblyDelivered) else RuntimeError
+        return kind(str(exc).replace(token, "[bot token redacted]"))
+    return exc
+
+
+def _api_call_raw(token, method, data, headers, timeout, retries):
     """The delivery-classification rules, in ONE place.
 
     `api` and `api_upload` differ only in how the body is encoded. Duplicating the retry
@@ -813,11 +1054,15 @@ def download_file(token, file_id, dest):
             with urllib.request.urlopen(url, timeout=120) as resp:
                 f.write(resp.read())
         os.replace(tmp, dest)      # rename does not follow a symlink at dest
-    except BaseException:
+    except BaseException as exc:
         try:
             os.unlink(tmp)         # never leave a partial file that looks downloaded
         except OSError:
             pass
+        if isinstance(exc, Exception):
+            # The raw file URL bypasses api(); an invalid URL or network error must not
+            # put the bot token into an attachment's inbox record or the daemon log.
+            raise _redact_bot_exception(token, exc) from None
         raise
     return dest
 

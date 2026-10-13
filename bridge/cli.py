@@ -2,6 +2,7 @@
 
 Commands:
   register --name NAME        create a forum topic for this session, print its id
+  move --topic KEY --to GROUP move a topic to another configured group, print the new key
   send TEXT                   send text into the session's topic
   recv [--peek]             print new inbox messages (--wait is retired)
   ask TEXT [--timeout N]      send, then block until a reply arrives (or timeout)
@@ -12,10 +13,11 @@ Commands:
   retheme [--apply]           give existing topics a theme-relevant forum icon (dry by default)
   reicon [--apply]            give existing topics a subject-matched signature icon (dry too)
 
-Topic resolution order: --topic flag, TG_BRIDGE_TOPIC env var, ./.tg-bridge-topic file.
+Topic resolution order: --topic flag, TG_BRIDGE_TOPIC env var, moved pane, ./.tg-bridge-topic.
 """
 
 import argparse
+import copy
 import hashlib
 import json
 import os
@@ -23,6 +25,7 @@ import re
 import subprocess
 import sys
 import time
+from functools import wraps
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -31,6 +34,8 @@ from bridge.common import (
     CAPTION_LIMIT, PossiblyDelivered, api, append_jsonl_once,
     commit_cursor_if_inbox_current, file_send_plan, load_config, now_iso, read_registry,
     send_file, send_message, state_path, update_registry,
+    TopicKeyError, group_config, normalize_topic_key, topic_credentials, topic_key, topic_parts, topic_sort_key,
+    locked_topic, move_request_path, resolve_moved_topic,
 )
 from bridge import codex_ctx
 from bridge.daemon import maybe_nudge, pane_alive
@@ -100,8 +105,7 @@ TOPIC_ICON_RULES = (
     (r"\b(video|film|movie|recording)\b", "🎬"),
     (r"\b(agent|bot|model|llm|ai|orchestra|prompt)\b", "🤖"),
 )
-_ICON_SET_CACHE = []   # [ {emoji: custom_emoji_id} ] — one slot, so "fetched and empty" is
-                       # distinguishable from "not fetched yet" without a sentinel global
+_ICON_SET_CACHE = {}   # bot fingerprint -> {emoji: custom_emoji_id}; empty is cached too
 ICON_SET_TIMEOUT = 5   # s; this call sits in front of registration — see icon_emoji_ids
 
 
@@ -131,8 +135,9 @@ def icon_emoji_ids(cfg):
     of cosmetics in front of the one call that actually registers the session. A decoration
     gets one short attempt — 5 s, no retry — and anything slower is treated exactly like a
     failure, which is "no themed icon"."""
-    if _ICON_SET_CACHE:
-        return _ICON_SET_CACHE[0]
+    fingerprint = hashlib.sha256(cfg["bot_token"].encode()).hexdigest()
+    if fingerprint in _ICON_SET_CACHE:
+        return _ICON_SET_CACHE[fingerprint]
     table = {}
     try:
         stickers = api(cfg["bot_token"], "getForumTopicIconStickers", {},
@@ -147,7 +152,7 @@ def icon_emoji_ids(cfg):
                 table.setdefault(emoji, emoji_id)
     except Exception:
         table = {}
-    _ICON_SET_CACHE.append(table)
+    _ICON_SET_CACHE[fingerprint] = table
     return table
 
 
@@ -190,32 +195,66 @@ def pick_icon(registry, topic_id, name=None):
     for icon in ICONS:
         if icon not in taken:
             return icon
-    return ICONS[int(topic_id) % len(ICONS)]  # palette exhausted; collisions acceptable
+    return ICONS[topic_parts(topic_id)[1] % len(ICONS)]  # palette exhausted; collisions acceptable
 
 
 def resolve_topic(args):
     if getattr(args, "topic", None):
-        return int(args.topic)
-    if os.environ.get("TG_BRIDGE_TOPIC"):
-        return int(os.environ["TG_BRIDGE_TOPIC"])
-    if os.path.exists(CWD_BINDING_FILE):
+        key = args.topic
+    elif os.environ.get("TG_BRIDGE_TOPIC"):
+        key = os.environ["TG_BRIDGE_TOPIC"]
+    elif (key := _moved_pane_topic()) is not None:
+        # Shared cwds may be bound to a different seat. Only a moved seat uses this
+        # fallback; all existing flag/env/file resolution stays unchanged otherwise.
+        pass
+    elif os.path.exists(CWD_BINDING_FILE):
         with open(CWD_BINDING_FILE) as f:
-            return int(f.read().strip())
-    raise SystemExit(
-        "no topic bound: pass --topic ID, set TG_BRIDGE_TOPIC, or run `tg-bridge register` first"
-    )
+            key = f.read().strip()
+    else:
+        raise SystemExit(
+            "no topic bound: pass --topic ID, set TG_BRIDGE_TOPIC, or run `tg-bridge register` first"
+        )
+    return resolve_moved_topic(key, read_registry())
+
+
+def _moved_pane_topic():
+    pane = os.environ.get("TMUX_PANE")
+    if not pane:
+        return None
+    registry = read_registry()
+    for info in registry.values():
+        if not info.get("moved_to"):
+            continue
+        key = resolve_moved_topic(info["moved_to"], registry)
+        bound = registry.get(str(key), {})
+        if bound.get("pane") == pane and not bound.get("ended") and not bound.get("feed"):
+            # Use the same ambiguity/liveness checks as current-topic, not a second
+            # definition of a live pane binding.
+            return current_topic_metadata(pane)["topic_id"]
+    return None
+
+
+def _topic_command(function):
+    @wraps(function)
+    def run(cfg, args):
+        with locked_topic(resolve_topic(args)) as key:
+            args = copy.copy(args)
+            args.topic = key
+            return function(cfg, args)
+    return run
 
 
 def cmd_register(cfg, args):
     name = args.name or f"session {now_iso()}"
     # The themed icon rides the CREATE call rather than a follow-up editForumTopic: one round
     # trip, and a topic is never briefly wrong. A None means "leave Telegram's default".
-    params = {"chat_id": cfg["chat_id"], "name": name}
-    emoji_id = theme_icon_id(cfg, name)
+    group = group_config(cfg, getattr(args, "group", None))
+    params = {"chat_id": group["chat_id"], "name": name}
+    emoji_id = theme_icon_id(group, name)
     if emoji_id:
         params["icon_custom_emoji_id"] = emoji_id
-    topic = api(cfg["bot_token"], "createForumTopic", params)
-    topic_id = topic["message_thread_id"]
+    topic = api(group["bot_token"], "createForumTopic", params)
+    topic_id = topic_key(cfg, group["name"], topic["message_thread_id"])
     entry = {"name": name, "created": now_iso(), "cwd": os.getcwd()}
     if args.feed:
         # event feed, not a dialog: no pane binding -> no warnings, nudges, or lifecycle notices
@@ -247,6 +286,60 @@ def cmd_register(cfg, args):
         print(f"Idle nudges enabled: new replies will be typed into tmux pane {entry['pane']}")
 
 
+def cmd_move(cfg, args):
+    """Ask the running daemon, which owns the in-memory busy state, to perform the move."""
+    key = resolve_moved_topic(args.topic, read_registry())
+    source = group_config(cfg, topic_parts(key)[0])
+    target = group_config(cfg, args.to)
+    if source["name"] == target["name"]:
+        raise SystemExit("refusing to move a topic to its own group")
+    with locked_topic(key) as key:
+        if group_config(cfg, topic_parts(key)[0])["name"] == target["name"]:
+            raise SystemExit("refusing to move a topic to its own group")
+        if not read_registry().get(str(key)):
+            raise SystemExit(f"topic {key} is not in the local registry")
+        topic_credentials(cfg, key)
+        path = move_request_path(key)
+        request = {"from": key, "to": target["name"], "state": "pending"}
+        if os.path.exists(path):
+            with open(path) as f:
+                previous = json.load(f)
+            if previous.get("state") in ("pending", "running"):
+                if previous.get("from") != key or previous.get("to") != target["name"]:
+                    raise SystemExit(f"topic {key} already has a move in progress")
+                request = previous
+            else:
+                os.unlink(path)
+        if not os.path.exists(path):
+            # Exclusive create handles two operator commands sharing the read lock. Link
+            # the finished temp file so the lifecycle loop never sees half-written JSON.
+            tmp = path + f".{os.getpid()}.tmp"
+            with open(tmp, "w") as f:
+                json.dump(request, f)
+            try:
+                os.link(tmp, path)
+            except FileExistsError:
+                raise SystemExit(f"topic {key} already has a move request") from None
+            finally:
+                os.unlink(tmp)
+    deadline = time.monotonic() + max(120, 2 * int(os.environ.get("TG_BRIDGE_LIFECYCLE_POLL", "30")))
+    while time.monotonic() < deadline:
+        with open(path) as f:
+            result = json.load(f)
+        if result.get("to") != request["to"]:
+            raise SystemExit("move request replaced by another operator; check the registry")
+        if result.get("state") == "done":
+            if result.get("error"):
+                raise SystemExit(result["error"])
+            print(f"topic_id={result['topic_id']}")
+            for warning in result.get("warnings", []):
+                print(f"warning: {warning}", file=sys.stderr)
+            return
+        time.sleep(0.1)
+    raise SystemExit(f"move request still pending in {path}; the running daemon processes it "
+                     "on its lifecycle poll. Check the registry before retrying.")
+
+
 def retheme_plan(cfg, registry):
     """[(topic_id, name, current_emoji, wanted_emoji)] for live dialog topics needing a change.
 
@@ -256,14 +349,15 @@ def retheme_plan(cfg, registry):
     a topic's icon back, so a topic themed by hand looks unthemed here and will be re-set to
     the same glyph at worst."""
     plan = []
-    for tid, info in sorted(registry.items(), key=lambda kv: int(kv[0])):
-        if not isinstance(info, dict) or info.get("feed") or info.get("ended"):
+    for tid, info in sorted(registry.items(), key=lambda kv: topic_sort_key(kv[0])):
+        if (not isinstance(info, dict) or info.get("feed") or info.get("ended")
+                or info.get("moved_to")):
             continue
         name = info.get("name")
         want = theme_emoji(name)
         if not want or info.get("topic_icon") == want:
             continue
-        plan.append((int(tid), name, info.get("topic_icon"), want))
+        plan.append((normalize_topic_key(tid), name, info.get("topic_icon"), want))
     return plan
 
 
@@ -281,16 +375,16 @@ def cmd_retheme(cfg, args):
     if not args.apply:
         print(f"{len(plan)} topic(s) would change. Re-run with --apply to write them.")
         return
-    ids = icon_emoji_ids(cfg)
     changed = 0
     for tid, name, _current, want in plan:
-        emoji_id = ids.get(want)
+        token, chat_id, thread = topic_credentials(cfg, tid)
+        emoji_id = icon_emoji_ids(group_config(cfg, topic_parts(tid)[0])).get(want)
         if not emoji_id:
             print(f"  topic {tid}: {want} is not in the bot-settable set — skipped")
             continue
         try:
-            api(cfg["bot_token"], "editForumTopic", {
-                "chat_id": cfg["chat_id"], "message_thread_id": tid,
+            api(token, "editForumTopic", {
+                "chat_id": chat_id, "message_thread_id": thread,
                 "icon_custom_emoji_id": emoji_id,
             })
         except Exception as e:
@@ -321,14 +415,14 @@ def reicon_plan(registry):
     rather than avoided."""
     holder = {}          # emoji -> topic id currently expected to carry it
     changeable = []
-    for tid, info in sorted(registry.items(), key=lambda kv: int(kv[0])):
-        if not isinstance(info, dict) or info.get("ended"):
+    for tid, info in sorted(registry.items(), key=lambda kv: topic_sort_key(kv[0])):
+        if not isinstance(info, dict) or info.get("ended") or info.get("moved_to"):
             continue
         icon = info.get("icon")
         if info.get("feed") or icon not in ICONS:
-            holder.setdefault(icon, int(tid))
+            holder.setdefault(icon, normalize_topic_key(tid))
             continue
-        changeable.append((int(tid), info.get("name"), icon))
+        changeable.append((normalize_topic_key(tid), info.get("name"), icon))
     plan = []
     for tid, name, icon in changeable:
         want, shared = subject_icon(name, set(holder))
@@ -368,14 +462,16 @@ def cmd_reicon(cfg, args):
 
 
 def send_typing(cfg, topic_id):
+    token, chat_id, thread = topic_credentials(cfg, topic_id)
     try:
-        api(cfg["bot_token"], "sendChatAction", {
-            "chat_id": cfg["chat_id"], "message_thread_id": topic_id, "action": "typing",
+        api(token, "sendChatAction", {
+            "chat_id": chat_id, "message_thread_id": thread, "action": "typing",
         })
     except Exception:
         pass  # indicator is best-effort, never fail the actual command
 
 
+@_topic_command
 def cmd_typing(cfg, args):
     topic_id = resolve_topic(args)
     deadline = time.time() + args.seconds
@@ -403,10 +499,11 @@ def custom_emoji_id(topic_id, info):
 
 
 def send_text(cfg, topic_id, text):
+    token, chat_id, thread = topic_credentials(cfg, topic_id)
     info = read_registry().get(str(topic_id), {})
     icon = info.get("icon")
     emoji_id = custom_emoji_id(topic_id, info)
-    if icon:  # one bot account; the per-thread emoji (assigned at register) is the signature
+    if icon:  # a group's bot speaks for its sessions; the per-thread emoji is the signature
         text = f"{icon} {text}"
     # Render agent Markdown as real Telegram formatting (HTML), splitting + plain-text
     # fallback handled in common.send_message (#89). The emoji prefix is safe literal text;
@@ -416,7 +513,7 @@ def send_text(cfg, topic_id, text):
     # pre-#292 one.
     extra = {"icon_custom_emoji": (icon, emoji_id)} if icon and emoji_id else {}
     try:
-        deliveries = send_message(cfg["bot_token"], cfg["chat_id"], text, topic_id, **extra)
+        deliveries = send_message(token, chat_id, text, thread, **extra)
     except PossiblyDelivered as e:
         journal_possibly_delivered(topic_id, "send", e, text)
         raise
@@ -434,6 +531,7 @@ def send_files(cfg, topic_id, paths, caption=None, as_document=False):
     Every path is validated BEFORE anything is posted. A three-file call whose third path is
     a typo must not leave two files already in the topic.
     """
+    token, chat_id, thread = topic_credentials(cfg, topic_id)
     info = read_registry().get(str(topic_id), {})
     icon = info.get("icon")
     emoji_id = custom_emoji_id(topic_id, info)
@@ -450,9 +548,9 @@ def send_files(cfg, topic_id, paths, caption=None, as_document=False):
         try:
             extra = ({"icon_custom_emoji": (icon, emoji_id)}
                      if index == 0 and caption and icon and emoji_id else {})
-            delivery = send_file(cfg["bot_token"], cfg["chat_id"], path,
+            delivery = send_file(token, chat_id, path,
                                  caption=caption if index == 0 else None,
-                                 thread_id=topic_id, as_document=as_document, **extra)
+                                 thread_id=thread, as_document=as_document, **extra)
         except PossiblyDelivered as e:
             # The text path journals a lost ACK; a file must too, or an ambiguous upload
             # leaves no evidence at all and a human cannot tell whether to resend (#211
@@ -579,6 +677,7 @@ def is_feed_topic(topic_id):
     return bool(read_registry().get(str(topic_id), {}).get("feed"))
 
 
+@_topic_command
 def cmd_send(cfg, args):
     topic_id = resolve_topic(args)
     # Before the unread guard below, and before stdin is consumed: a cross-topic sender must
@@ -643,7 +742,7 @@ def _check_pane_live(topic_id, pane):
 
 def require_live_dialog(topic_id):
     """Return the local registry entry for a live, pane-bound dialog topic."""
-    topic_id = int(topic_id)
+    topic_id = normalize_topic_key(topic_id)
     info = read_registry().get(str(topic_id))
     if not isinstance(info, dict):
         raise SystemExit(f"topic {topic_id} is not in the local registry")
@@ -694,7 +793,7 @@ def current_topic_metadata(pane=None):
     topic_id, info = _pane_dialog_topic(pane)
     _check_pane_live(topic_id, pane)
     return {
-        "topic_id": int(topic_id),
+        "topic_id": normalize_topic_key(topic_id),
         "name": info.get("name"),
         "pane": pane,
         "engine": info.get("engine"),
@@ -726,7 +825,7 @@ def caller_topic():
         _check_pane_live(topic_id, pane)   # raises SystemExit on dead pane, timeout, error
     except SystemExit:
         return None
-    return {"topic_id": int(topic_id), "name": info.get("name"), "icon": info.get("icon")}
+    return {"topic_id": normalize_topic_key(topic_id), "name": info.get("name"), "icon": info.get("icon")}
 
 
 def peer_label(caller):
@@ -768,7 +867,7 @@ def require_own_topic(topic_id, command):
     caller = caller_topic()
     if caller is None:
         return
-    topic_id = int(topic_id)
+    topic_id = normalize_topic_key(topic_id)
     if caller["topic_id"] == topic_id:
         return
     info = read_registry().get(str(topic_id))
@@ -800,15 +899,15 @@ def outbound_echo(cfg, caller, target_id, target_name, text):
     "posted"/"ambiguous"/"failed", or "skipped" when there is nothing to echo (automation
     with no topic of its own, or a session notifying itself).
     """
-    if caller is None or caller["topic_id"] == int(target_id):
+    if caller is None or caller["topic_id"] == normalize_topic_key(target_id):
         return "skipped"
     # An unnamed target degrades to the bare id rather than "topic N (topic N)".
     label = f"{target_name} (topic {target_id})" if target_name else f"topic {target_id}"
     icon = caller.get("icon")
     line = f"→ {label}: {text}"
     try:
-        send_message(cfg["bot_token"], cfg["chat_id"],
-                     f"{icon} {line}" if icon else line, caller["topic_id"])
+        token, chat_id, thread = topic_credentials(cfg, caller["topic_id"])
+        send_message(token, chat_id, f"{icon} {line}" if icon else line, thread)
         return "posted"
     except PossiblyDelivered:
         return "ambiguous"
@@ -820,7 +919,21 @@ def cmd_current_topic(_cfg, _args):
     print(json.dumps(current_topic_metadata(), ensure_ascii=False, sort_keys=True))
 
 
-def notify_topic(cfg, topic_id, sender, idempotency_key, text, owner_only=False):
+def notify_topic(cfg, topic_id, sender, idempotency_key, text, owner_only=False, agent_only=False):
+    # Both refusals run before the topic lock: taking the lock creates its file, and a
+    # refused call writes nothing (#393 reviews r1 C3, r2 C2).
+    if owner_only and agent_only:
+        raise SystemExit("--owner-only and --agent-only exclude each other")
+    if agent_only and caller_topic() is not None:
+        raise SystemExit(
+            "--agent-only is for automation; a session's notify is always mirrored so the "
+            "owner sees the traffic between sessions"
+        )
+    with locked_topic(topic_id) as key:
+        return _notify_topic(cfg, key, sender, idempotency_key, text, owner_only, agent_only)
+
+
+def _notify_topic(cfg, topic_id, sender, idempotency_key, text, owner_only=False, agent_only=False):
     """Store one local event, cue a live pane when appropriate, then mirror to Telegram.
 
     An ended parked topic has no live pane to nudge. Its inbox record waits for the owner's
@@ -830,6 +943,15 @@ def notify_topic(cfg, topic_id, sender, idempotency_key, text, owner_only=False)
     alert, a daily pulse. It is posted to Telegram with the same attribution and the same
     idempotency, but recorded in `notices.jsonl` instead of the inbox, so `recv` never returns
     it and the pane is not woken (usage alerts were waking an idle seat for nothing).
+
+    `agent_only`: the reverse — the event is for the AGENT, not for the owner: it is enqueued
+    and the pane is woken exactly as for an ordinary notify, but nothing is posted to Telegram
+    (owner request, 2026-10-08, #393: a coach-nudge cron's full instruction text was showing
+    in his chat ahead of the nudge the seat wrote). It is refused when the caller resolves to
+    a session pane (`caller_topic()`, i.e. its TMUX_PANE is a registered dialog), so an
+    ordinary session's notify stays mirrored and the owner keeps seeing traffic between
+    sessions. Like `--sender`, this rests on TMUX_PANE: a process that unsets it is treated as
+    automation. It keeps cooperating seats honest; it is not a security boundary.
 
     Two sender paths, decided by whether the caller resolves to a dialog topic of its own:
 
@@ -845,7 +967,8 @@ def notify_topic(cfg, topic_id, sender, idempotency_key, text, owner_only=False)
     if not text.strip():
         raise SystemExit("notification stdin must not be empty")
 
-    topic_id = int(topic_id)
+    topic_id = normalize_topic_key(topic_id)
+    token, chat_id, thread = topic_credentials(cfg, topic_id)
     caller = caller_topic()
     if caller is not None:
         kind, from_label = "peer", peer_label(caller)
@@ -897,6 +1020,9 @@ def notify_topic(cfg, topic_id, sender, idempotency_key, text, owner_only=False)
     # icon, and the icon is the sender's signature — a peer message would appear in the
     # target's own thread signed as the target. Compose the attribution here and call
     # send_message directly, keeping the same HTML/splitting/plain-text-fallback path.
+    if agent_only:
+        return {"status": "enqueued", "topic_id": topic_id, "wake": wake, "telegram": "skipped",
+                "echo": "skipped"}   # automation has no topic of its own to echo into
     if caller is not None:
         # The icon IS the signature (owner request, 2026-09-03: no "Name (topic N):" in the body);
         # the name+topic label stays in the inbox record and in the sender's own echo.
@@ -905,7 +1031,7 @@ def notify_topic(cfg, topic_id, sender, idempotency_key, text, owner_only=False)
     else:
         mirror = f"{from_label}: {text}"  # un-iconed: no session identity to sign with
     try:
-        deliveries = send_message(cfg["bot_token"], cfg["chat_id"], mirror, topic_id)
+        deliveries = send_message(token, chat_id, mirror, thread)
     except PossiblyDelivered as e:
         telegram = "ambiguous"
         journal_possibly_delivered(topic_id, "notify", e, mirror)
@@ -933,6 +1059,8 @@ def cmd_notify(cfg, args):
     # The flag is passed only when set, so the call shape every existing caller and test
     # stub knows stays the same for an ordinary notify.
     extra = {"owner_only": True} if getattr(args, "owner_only", False) else {}
+    if getattr(args, "agent_only", False):
+        extra["agent_only"] = True
     result = notify_topic(
         cfg, args.topic, args.sender, args.idempotency_key, text, **extra,
     )
@@ -1028,6 +1156,7 @@ def wait_for_messages(topic_id, timeout):
     return [], cursor, armed_at, time.time() - armed_at
 
 
+@_topic_command
 def cmd_recv(cfg, args):
     topic_id = resolve_topic(args)
     # Refuse even zero/negative waits before reading or touching the cursor: legacy
@@ -1054,6 +1183,7 @@ def cmd_recv(cfg, args):
             sys.stdout.flush()
 
 
+@_topic_command
 def cmd_ask(cfg, args):
     topic_id = resolve_topic(args)
     # Before the drain below: an `ask` at a foreign topic used to eat that session's whole
@@ -1085,8 +1215,11 @@ def cmd_status(cfg, args):
     )
     print(f"daemon: {result.stdout.strip() or result.stderr.strip()}")
     registry = read_registry()
-    for topic_id, info in sorted(registry.items(), key=lambda kv: int(kv[0])):
-        unread = len(read_new(topic_id, load_cursor(int(topic_id)))[0])
+    for topic_id, info in sorted(registry.items(), key=lambda kv: topic_sort_key(kv[0])):
+        if info.get("moved_to"):
+            print(f"topic {topic_id}: {info['name']} (moved to {info['moved_to']})")
+            continue
+        unread = len(read_new(topic_id, load_cursor(normalize_topic_key(topic_id)))[0])
         ended = f", ended {info['ended']}" if info.get("ended") else ""
         print(f"topic {topic_id}: {info['name']} (created {info['created']}, unread {unread}{ended})")
 
@@ -1097,14 +1230,19 @@ def build_parser():
 
     p = sub.add_parser("register", help="create a forum topic for this session")
     p.add_argument("--name", help="topic name (default: timestamp)")
+    p.add_argument("--group", help="configured group name (default: default_group or work)")
     p.add_argument("--bind", action="store_true", help=f"write {CWD_BINDING_FILE} in cwd")
     p.add_argument("--feed", action="store_true",
                    help="event feed topic: no pane binding, warnings, nudges, or lifecycle notices")
 
+    p = sub.add_parser("move", help="move a topic to another configured group (daemon must be running)")
+    p.add_argument("--topic", required=True, type=normalize_topic_key, help="source topic key")
+    p.add_argument("--to", required=True, help="target configured group name")
+
     p = sub.add_parser("send", help="send text or files to the topic")
     p.add_argument("text", nargs="?", help="message text, or - for stdin; "
                                            "with --file it becomes the caption")
-    p.add_argument("--topic", help="topic id")
+    p.add_argument("--topic", help="topic key: thread id or group:thread")
     p.add_argument("--file", action="append", dest="files", metavar="PATH",
                    help="absolute path to send as a file (repeatable)")
     p.add_argument("--as-document", action="store_true",
@@ -1113,19 +1251,19 @@ def build_parser():
                    help="send even if unread messages are waiting (progress pings)")
 
     p = sub.add_parser("recv", help="print new inbox messages")
-    p.add_argument("--topic", help="topic id")
+    p.add_argument("--topic", help="topic key: thread id or group:thread")
     p.add_argument("--wait", type=int, help="retired: exits 5; end your turn and read on a [tg-bridge] nudge")
     p.add_argument("--peek", action="store_true", help="do not advance the read cursor")
     p.add_argument("--json", action="store_true", help="print raw JSONL records")
 
     p = sub.add_parser("ask", help="send text and wait for a reply")
     p.add_argument("text", help="message text")
-    p.add_argument("--topic", help="topic id")
+    p.add_argument("--topic", help="topic key: thread id or group:thread")
     p.add_argument("--timeout", type=int, default=300, help="seconds to wait (default 300)")
     p.add_argument("--json", action="store_true", help="print raw JSONL records")
 
     p = sub.add_parser("typing", help="show a typing indicator in the topic while working")
-    p.add_argument("--topic", help="topic id")
+    p.add_argument("--topic", help="topic key: thread id or group:thread")
     p.add_argument("--seconds", type=int, default=5, help="how long to sustain it (default 5)")
 
     sub.add_parser(
@@ -1136,9 +1274,10 @@ def build_parser():
     p = sub.add_parser(
         "notify",
         help="read an event from stdin, enqueue it once into a topic's inbox, wake, and mirror "
-             "(--owner-only: mirror for the owner, no inbox record, no wake)",
+             "(--owner-only: mirror for the owner, no inbox record, no wake; --agent-only: "
+             "inbox record and wake, no mirror)",
     )
-    p.add_argument("--topic", required=True, type=int, help="target dialog topic id")
+    p.add_argument("--topic", required=True, type=normalize_topic_key, help="target dialog topic key")
     p.add_argument("--sender",
                    help="sender label stored in the inbox; required for automation, IGNORED "
                         "for a session pane (which derives its identity from its own topic)")
@@ -1148,6 +1287,12 @@ def build_parser():
                    help="post for the owner only: same attribution and idempotency, but the "
                         "event is recorded in notices.jsonl, never in the agent's inbox, and "
                         "the pane is not woken (usage alerts, pulses)")
+    p.add_argument("--agent-only", action="store_true",
+                   help="for the agent only: recorded in the inbox and the pane woken as usual, "
+                        "but nothing is posted to Telegram (automation instructions the owner "
+                        "need not see). Refused when called from a session pane (TMUX_PANE of a "
+                        "registered topic), so session-to-session traffic stays visible; like "
+                        "--sender it relies on TMUX_PANE and is not a security boundary")
 
     sub.add_parser("status", help="daemon health and registered topics")
 
@@ -1170,6 +1315,15 @@ def build_parser():
 
 def main():
     secure_process_umask()
+    try:
+        _main()
+    except TopicKeyError as e:
+        # Every path — argument parsing, current-topic, each command — reports a bad or
+        # unconfigured topic key as an exit message, never a traceback (#377 F1).
+        raise SystemExit(str(e))
+
+
+def _main():
     if os.environ.get("TMUX_PANE"):
         try:
             codex_ctx.record_current_pane_rollout()
@@ -1183,7 +1337,7 @@ def main():
     {"register": cmd_register, "send": cmd_send, "recv": cmd_recv,
      "ask": cmd_ask, "status": cmd_status, "typing": cmd_typing,
      "notify": cmd_notify, "retheme": cmd_retheme,
-     "reicon": cmd_reicon}[args.command](cfg, args)
+     "reicon": cmd_reicon, "move": cmd_move}[args.command](cfg, args)
 
 
 if __name__ == "__main__":

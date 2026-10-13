@@ -13,6 +13,7 @@ from datetime import datetime, timedelta, timezone
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from bridge.common import (  # noqa: E402
+    latest_topics_by_pane, normalize_topic_key, topic_credentials,
     PossiblyDelivered,
     api,
     load_config,
@@ -136,9 +137,12 @@ def transition_alert(previous_model, current_model, timestamp):
 
 
 def send_topic(cfg, topic_id, text):
-    api(cfg["bot_token"], "sendMessage", {
-        "chat_id": cfg["chat_id"],
-        "message_thread_id": int(topic_id),
+    token, chat_id, thread = topic_credentials(cfg, topic_id)
+    if ":" in str(topic_id):
+        text += f"\nTopic {topic_id}"
+    api(token, "sendMessage", {
+        "chat_id": chat_id,
+        "message_thread_id": thread,
         "text": text,
     })
 
@@ -450,17 +454,8 @@ def sweep(cfg):
     state = load_state()
     registry = read_registry()
     # Match the daemon's context-warning routing: a pane may re-register without ending
-    # its older topic, so only the most recent (highest-id) non-feed topic owns alerts.
-    latest_topic = {}
-    for raw_topic_id, info in registry.items():
-        try:
-            if not isinstance(info, dict) or info.get("ended") or info.get("feed"):
-                continue
-            pane = info.get("pane")
-            if pane and int(raw_topic_id) > int(latest_topic.get(pane, "-1")):
-                latest_topic[pane] = raw_topic_id
-        except Exception as exc:
-            log(f"topic {raw_topic_id}: {exc}")
+    # its older topic, so only the latest binding owns alerts (ids are per group).
+    latest_topic = latest_topics_by_pane(registry)
 
     for raw_topic_id, info in registry.items():
         try:
@@ -473,7 +468,7 @@ def sweep(cfg):
             if not pane_alive(pane) or engine not in ("claude", "codex"):
                 continue
             if engine == "codex":
-                check_codex(cfg, int(raw_topic_id), info, pane, state)
+                check_codex(cfg, normalize_topic_key(raw_topic_id), info, pane, state)
                 continue
             context = read_context(pane)
             session_id = context.get("session_id") if context else None
@@ -483,7 +478,7 @@ def sweep(cfg):
             path = transcript_path(cwd, session_id)
             if not os.path.isfile(path):
                 continue
-            check_transcript(cfg, int(raw_topic_id), session_id, path, state)
+            check_transcript(cfg, normalize_topic_key(raw_topic_id), session_id, path, state)
         except Exception as exc:
             log(f"topic {raw_topic_id}: {exc}")
     save_state(state)

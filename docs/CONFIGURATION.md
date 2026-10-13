@@ -54,6 +54,69 @@ equals it. Group membership grants nothing. If it is missing, zero, negative, or
 type, the daemon refuses ingress rather than falling back to trusting the group — including
 `true`, which Python would otherwise happily compare equal to user id 1.
 
+### Multiple groups and bots
+
+The top-level `bot_token` and `chat_id` always define the default group. Its name is `work`,
+or the optional `default_group` string. Add other forum supergroups with `groups`:
+
+```json
+{
+  "bot_token": "123456789:AAE...",
+  "chat_id": -1001234567890,
+  "owner_id": 987654321,
+  "default_group": "work",
+  "groups": [
+    {
+      "name": "personal",
+      "chat_id": -1009876543210,
+      "bot_token_file": "~/.config/agent-telegram-bridge/personal-token"
+    }
+  ]
+}
+```
+
+Names are unique lowercase slugs: start with a letter, then use letters, digits, underscores
+or hyphens, up to 64 characters. The default name and chat id must not appear again in the
+list; other chat ids must also be unique negative integers. Each entry requires exactly one
+of `bot_token` (a non-empty string without embedded control characters) or `bot_token_file`.
+A token file contains the plain token, with an optional trailing newline. Like the config,
+it must be a regular file owned by the service user with no group/other permission bits
+(`chmod 600`). Checks and reads use the same open descriptor. Invalid entries prevent startup;
+diagnostics identify the field without showing the token.
+
+One bot may serve several groups: repeat its token in their entries. The daemon runs one
+`getUpdates` poller per distinct token and maps updates to groups by chat id. Chats outside
+that bot's configured groups are ignored. In multi-group mode every bot has a cursor keyed
+by its token fingerprint, so changing the default bot or promoting an existing bot keeps
+their cursors separate. On the first multi-group startup, the current default bot inherits
+the existing `offset` before any extra poller starts; `offset` remains its compatibility mirror. The same `owner_id` authorizes ingress in every
+group; group membership grants no authority. Restart the daemon after changing the group list.
+
+Telegram thread ids repeat between groups. The bridge therefore uses a **topic key**:
+default-group thread 7 stays `7`; personal-group thread 7 is `personal:7`. These keys identify
+registry entries, topic folders, inboxes, cursors, outboxes, pending reopen questions,
+carry-forward files, warning/compaction state, `.tg-bridge-topic` and `TG_BRIDGE_TOPIC`.
+Existing default-group state needs no migration.
+
+Move an existing session with `tg-bridge move --topic 7 --to personal`; it prints the new
+key and retains the session and unread inbox. The running daemon processes the move on its
+lifecycle poll. See [moving a topic](FEATURES.md#moving-a-topic-between-groups) for refusals,
+old-key redirects, and shared-cwd bindings.
+
+```sh
+tg-bridge register --group personal --name Learning --bind
+tg-bridge send --topic personal:7 - < reply.txt
+tg-bridge recv --topic personal:7
+tg-bridge notify --topic personal:7 --sender scheduler --idempotency-key reminder-1 < reminder.txt
+```
+
+Every topic operation uses that group's token and chat id, and sends only the numeric thread
+id to Telegram. `notify` can cross groups: it writes and wakes the target's inbox, mirrors to
+the target's group, and echoes in the sender's own group. Fleet dashboard, morning digest,
+reboot/recovery summaries and daemon health alerts remain in the default group's General;
+their fleet data covers all groups. Spawn failure alerts go to the requesting group's General.
+Model watchdog alerts stay in their own topic and identify non-default topic keys.
+
 ---
 
 ## Optional
@@ -164,7 +227,7 @@ environment of the session running `tg-bridge`, and the daemon never sees it.
 | `TG_BRIDGE_TZ_OFFSET` | `3` | Hours from UTC for times shown to you. |
 | `TG_BRIDGE_AUTOCF_PCT` | `50` (`60` when the carry-forward cycle is on) | Context percentage at which the daemon compacts the session. |
 | `TG_BRIDGE_CARRY_FORWARD` | `0` | `1` restores the pre-2026-09-21 carry-forward cycle (write → GitHub issue → `/compact` → resume-from-next-steps) **and** its 60 % threshold. Off, the daemon types `/compact` at the threshold and the session continues from the built-in summary. |
-| `TG_BRIDGE_TOPIC` | unset | Pin the CLI to one topic. Resolution order is `--topic`, then this, then a `.tg-bridge-topic` file in the working directory — there is no `TMUX_PANE` fallback here; that is a separate mechanism the daemon uses to find a pane. **Read by the `tg-bridge` CLI on every invocation, not by the daemon** — so it belongs in the environment of whatever runs `tg-bridge`, and restarting the daemon neither sets it nor is needed to change it. |
+| `TG_BRIDGE_TOPIC` | unset | Pin the CLI to one topic key (`7` or `personal:7`); old keys follow move pointers. Resolution order is `--topic`, then this, then the pane binding for a moved live session, then a `.tg-bridge-topic` file in the working directory. Ordinary unmoved sessions retain flag/env/file resolution. **Read by the `tg-bridge` CLI on every invocation, not by the daemon** — so it belongs in the environment of whatever runs `tg-bridge`, and restarting the daemon neither sets it nor is needed to change it. |
 | `TG_BRIDGE_DASH_POLL` | `60` | Seconds between fleet-dashboard rebuilds. |
 | `TG_BRIDGE_CTX_POLL` | `30` | Seconds between context readings. |
 | `TG_BRIDGE_LIFECYCLE_POLL` | `30` | Seconds between session lifecycle checks. |
@@ -181,11 +244,15 @@ what this has been running on.
 
 | Path | Contents |
 |---|---|
-| `topics/<id>/inbox.jsonl` | Every message received in that topic, append-only |
-| `topics/<id>/cursor` | How many of those lines the session has consumed |
-| `topics/<id>/outbox.jsonl` | A journal of what was SENT: timestamp, message id, and a sha256 — never the text |
-| `topics/<id>/media/` | Downloaded images |
-| `registry.json` | Topic → session bindings |
+| `topics/<key>/inbox.jsonl` | Every message received in that topic, append-only |
+| `topics/<key>/cursor` | How many of those lines the session has consumed |
+| `topics/<key>/outbox.jsonl` | A journal of what was SENT: timestamp, message id, and a sha256 — never the text |
+| `topics/<key>/media/` | Downloaded images |
+| `registry.json` | Topic key → session bindings |
+| `topics/<source key>.move.json` | Operator move request and daemon result, retained at the source key |
+| `topic-locks/<key>.lock` | Shared operation / exclusive move lock, outside renamed topic folders |
+| `offset` | Default bot’s getUpdates cursor; compatibility mirror when groups are configured |
+| `offsets/<bot fingerprint>` | Each bot’s authoritative cursor in multi-group mode (SHA-256 of token; no token text) |
 | `codex-context-cue.json` | Optional private host configuration for Codex context cues |
 
 **Nothing here is rotated or archived.** After two and a half months of continuous use the

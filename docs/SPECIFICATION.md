@@ -2,7 +2,7 @@
 
 ## Architecture Overview
 
-The **agent-telegram-bridge** lets headless AI coding sessions (`claude` and `codex` CLIs running in tmux) hold a two-way conversation with a single human over one Telegram forum supergroup — one *session topic* per live session, voice transcribed and images downloaded. A single **daemon** is the sole Telegram `getUpdates` consumer: it routes inbound messages into per-topic inboxes, handles owner commands, spawns and monitors sessions, and renders a fleet dashboard. Each session drives its own side through the **`tg-bridge` CLI**. Secrets live only in chmod-600 config and an external OpenClaw config — never in code or logs.
+The **agent-telegram-bridge** lets headless AI coding sessions (`claude` and `codex` CLIs running in tmux) hold a two-way conversation with a single human over one or more Telegram forum supergroups — one *session topic* per live session, voice transcribed and images downloaded. A single **daemon** is the sole Telegram `getUpdates` consumer for each configured bot token: it routes inbound messages into per-topic inboxes, handles owner commands, spawns and monitors sessions, and renders a fleet dashboard. Each session drives its own side through the **`tg-bridge` CLI**. Secrets live only in chmod-600 config/token files and external OpenClaw secret sources — never in code or logs.
 
 **System context** — the external boundaries the bridge operates within:
 
@@ -97,7 +97,7 @@ erDiagram
     INBOX {
         string ts
         int message_id
-        int thread_id
+        string thread_id "topic key (int in default group)"
         string from
         string kind
         string text
@@ -123,21 +123,23 @@ erDiagram
 
 | Field | Type | Required | Constraints | Description |
 |---|---|---|---|---|
-| `bot_token` | str | yes | — | Telegram Bot API token (redacted). Embedded in the API URL (`common.py`). |
-| `chat_id` | int | yes | shape `-100XXXXXXXXXX` | The forum supergroup id (redacted). |
+| `bot_token` | str | yes | — | Default group’s Telegram Bot API token (redacted). Embedded in the API URL (`common.py`). |
+| `chat_id` | int | yes | shape `-100XXXXXXXXXX` | Default forum supergroup id (redacted). |
+| `default_group` | str | no | lowercase slug, up to 64 characters | Default group name; absent means `work`. |
+| `groups` | list of objects | no | unique names and negative integer chat ids; excludes default name/chat | Additional groups, each `{name, chat_id, bot_token}` or `{name, chat_id, bot_token_file}`. |
 | `owner_id` | int | yes | positive, non-boolean integer | Owner's Telegram user id. Missing or malformed configuration prevents startup. |
 | `openai_api_key` | str | no | non-empty, no control characters | Enables voice transcription. **First** of three sources (§6.14). |
 | `spawn_flags` | object | no | `{engine: str}` for `claude`/`codex` | Extra launch flags for spawned and revived sessions. **Absent means none** (§6.15). |
 | `issue_queue` | object | no | `{owner: str, label_prefix: str}`, both non-empty | Adds the dashboard/digest work-queue line. **Absent means no line.** |
 | `carry_forward_repo` | str | no | exactly one `/`, both halves non-empty | Target for the daemon-side fallback carry-forward issue. **Absent means no issue** — the file is still written. |
 
-`load_config()` raises `SystemExit` if `bot_token`, `chat_id`, or `owner_id` is missing, or if `owner_id` is not a positive non-boolean integer. Unknown keys are ignored.
+`load_config()` raises `SystemExit` if `bot_token`, `chat_id`, or `owner_id` is missing, or if `owner_id` is not a positive non-boolean integer. Invalid groups also prevent startup: each name begins with a lowercase ASCII letter and contains only lowercase letters, digits, underscores or hyphens; entries require exactly one token source. Token files use the config’s descriptor-based regular-file, service-user ownership and private-mode checks. Tokens are resolved in memory only; diagnostics name fields without secret values. Unknown keys are ignored.
 
 The two optional keys are read by callers that must tolerate what `load_config` rejects, so each treats every failure — a missing file, malformed JSON, **a top-level value that is not an object** (`true`, `7`, `null`, `[]`, a string), a document nested deeply enough to raise `RecursionError`, or a wrong-typed value — as "the key is absent", and neither lets the exception escape. The scalar case is not hypothetical: `json.load` accepts a bare `true`, so `load_config` raises `TypeError` from `key not in cfg`, and an uncaught one made every spawn and revive fail (#204 review).
 
 ### 3.2 Registry — `registry.json` (`common.py`)
 
-A JSON object keyed by `str(topic_id)`. Written atomically (temp + `os.replace`), and every partial update goes through `update_registry()` under an exclusive cross-process file lock (`common.py`) so the daemon loops, Timer threads, and the separate `register` process can't lose each other's writes.
+A JSON object keyed by the topic key: `str(thread_id)` for the default group, `<group>:<thread_id>` for every other group (for example `personal:7`). The default name never prefixes its keys, so existing state is not re-keyed. Written atomically (temp + `os.replace`), and every partial update goes through `update_registry()` under an exclusive cross-process file lock (`common.py`) so the daemon loops, Timer threads, and the separate `register` process can't lose each other's writes.
 
 | Field | Type | Required | Description |
 |---|---|---|---|
@@ -156,7 +158,11 @@ A JSON object keyed by `str(topic_id)`. Written atomically (temp + `os.replace`)
 
 The `pane` field is **first** written by the CLI `register` command; the daemon reads it at register time but **rebinds** it to the new tmux pane during revive (`_bind` → `update_registry`, `daemon.py,1892`). The daemon also writes `engine`, `session_id`, `boot_id`, and `briefed_boot`, and it both **stamps** `ended` on pane death (`mark_ended`) and **clears** it on revive (`daemon.py`).
 
-### 3.3 Inbox record — `topics/<id>/inbox.jsonl` (`daemon.py`)
+A moved source entry contains only `name` and `moved_to` (the destination topic key). It has
+no session or pane fields and cannot be revived. The destination receives every field of
+the source entry; later moves leave a chain of pointers followed by CLI commands.
+
+### 3.3 Inbox record — `topics/<key>/inbox.jsonl` (`daemon.py`)
 
 Append-only JSONL, one record per line.
 
@@ -164,13 +170,13 @@ Append-only JSONL, one record per line.
 |---|---|---|---|
 | `ts` | str | ISO | Receipt timestamp. |
 | `message_id` | int | Telegram ingress only | Telegram message id. A stable key a reader MAY use to dedup replays; the daemon does **not** dedup on it (see §7). |
-| `thread_id` | int | Telegram ingress only | Topic id (`message_thread_id`). |
+| `thread_id` | int or str | Telegram ingress only | Topic key; an integer for the default group or `<group>:<thread>` for another group. Telegram’s wire thread id stays numeric. |
 | `from` | str | — | `first_name or username or str(id)`. |
 | `kind` | str | `text \| voice \| audio \| video_note \| photo \| image \| notification \| peer` | Content kind; the three audio kinds are transcribed. `notification` identifies trusted local automation; `peer` identifies another bridge session, whose identity is derived from its pane binding rather than supplied by the caller. |
 | `text` | str | non-empty | Body; transcript for audio; for images the caption (if any) followed by the `[Image attached … : <path>]` note (`text = (caption + "\n" if caption) + note`, `daemon.py`). |
 | `provenance` | str | local notification only | `local-notify`; backward-compatible provenance for a synthetic record. |
 | `idempotency_key` | str | local ingress only, non-empty | Durable logical-event identity used to suppress repeat append/nudge/Telegram side effects. |
-| `sender_topic_id` | int | `peer` records only | Topic id of the sending session, derived from its `TMUX_PANE` registry binding. Present only when the caller resolved to a dialog topic of its own. |
+| `sender_topic_id` | int or str | `peer` records only | Topic key of the sending session, derived from its `TMUX_PANE` registry binding. Present only when the caller resolved to a dialog topic of its own. |
 
 A record with empty `text` is never written (`daemon.py`). Telegram ingress writes the original six fields. Local ingress writes the normal reader-facing four-field core (`ts`, `from`, `kind`, `text`) plus `provenance` and `idempotency_key`, and for a `peer` record also `sender_topic_id`; readers already tolerate additional/missing provenance fields. A `peer` record's `from` is `"<sender topic name> (topic <id>)"`, composed from the registry — `--sender` cannot set it. The inbox record itself is the notification idempotency ledger—there is no second event state model.
 
@@ -178,9 +184,10 @@ A record with empty `text` is never written (`daemon.py`). Telegram ingress writ
 
 | Path | Format | Role |
 |---|---|---|
-| `offset` | int | getUpdates ack cursor (highest `update_id` + 1). |
-| `topics/<id>/cursor` | int | Read position; **unread = inbox line count − cursor**. |
-| `topics/<id>/media/<message_id>.<ext>` | binary | Downloaded photos/image documents. |
+| `offset` | int | Default bot’s getUpdates ack cursor (highest `update_id` + 1), retained as a compatibility mirror in multi-group mode. |
+| `offsets/<SHA-256 of token>` | int | Authoritative independent ack cursor for each distinct bot token when `groups` is present; no token text is persisted. |
+| `topics/<key>/cursor` | int | Read position; **unread = inbox line count − cursor**. |
+| `topics/<key>/media/<message_id>.<ext>` | binary | Downloaded photos/image documents. |
 | `dashboard.json` | `{message_id}` | The pinned dashboard message id. |
 | `digest-snapshot.json` | `{ts_iso, costs, orchestra}` | Previous digest values for deltas. |
 | `warnings.json` | `{topic_id: threshold}` | Context-warning high-water mark (`warning_loop`). |
@@ -198,17 +205,29 @@ A record with empty `text` is never written (`daemon.py`). Telegram ingress writ
 
 ## 4. Interface Contract — the `tg-bridge` CLI
 
-`bin/tg-bridge` execs `python3 bridge/cli.py "$@"`. The subcommand is required. `load_config()` runs before every command except the registry-only `current-topic`. Topic resolution for `send/recv/ask/typing` is `--topic` → `TG_BRIDGE_TOPIC` env → `./.tg-bridge-topic` file → error (`cli.py`); `notify` deliberately requires an explicit `--topic`.
+Every `--topic` accepts a topic key. `.tg-bridge-topic` and `TG_BRIDGE_TOPIC` carry the same
+key, as do inbox/cursor/outbox folders, pending questions, carry-forward and warning state.
+`common.topic_parts` extracts the group and numeric thread; `topic_credentials` selects the
+bot token and chat id for topic API operations, including uploads, typing, topic edits,
+close/reopen, question edits and callback acknowledgements. Icon sticker caches are per bot.
+`current-topic` emits an integer `topic_id` for the default group and a string key otherwise.
+Cross-group `notify` uses the target's credentials for its mirror and the sender's credentials
+for its echo. The dashboard, digest, restore summary and service-health alerts remain fleet
+messages in the default group's General; spawn failure notices use the requesting group's
+General and model alerts use their topic's group.
+
+`bin/tg-bridge` execs `python3 bridge/cli.py "$@"`. The subcommand is required. `load_config()` runs before every command except the registry-only `current-topic`. Topic resolution for `send/recv/ask/typing` is `--topic` → `TG_BRIDGE_TOPIC` env → pane binding for a moved live session → `./.tg-bridge-topic` file → error (`cli.py`); resolved keys follow `moved_to` pointers. Unmoved sessions retain flag/env/file resolution. `notify` deliberately requires an explicit `--topic` and follows move pointers too.
 
 | Command | Inputs | Outputs (stdout / exit / side effects) |
 |---|---|---|
-| `register` | `--name` (default `session <ts>`), `--bind`, `--feed` | **out:** `topic_id=<id>` + mode line. **side effects:** calls `createForumTopic`; writes a registry entry (captures `pane` from `TMUX_PANE` if set; `--feed` → `📡`, no pane); `--bind` writes `.tg-bridge-topic`. **exit:** 0; uncaught `PossiblyDelivered`/`RuntimeError` → traceback (no auto-retry — a retry would duplicate the topic). |
+| `move` | Required `--topic KEY`, `--to GROUP` | **out:** `topic_id=<new key>`. The CLI publishes `topics/<source key>.move.json`; the daemon's lifecycle loop validates in-memory reopen/worker state and performs the move under the exclusive per-topic lock. All registry fields and topic files transfer; the old registry entry becomes a name/pointer, and its folder becomes an alias. The source gets a destination link and is closed; the destination gets a move notice. **exit:** non-zero for an own-group move, unknown topic/group, busy topic, or failed cutover. After a committed cutover, auxiliary failures are stderr warnings accompanying the new key. See [move behavior](FEATURES.md#moving-a-topic-between-groups). |
+| `register` | `--name` (default `session <ts>`), `--group NAME` (default group when absent), `--bind`, `--feed` | **out:** `topic_id=<id>` + mode line. **side effects:** calls `createForumTopic`; writes a registry entry (captures `pane` from `TMUX_PANE` if set; `--feed` → `📡`, no pane); `--bind` writes `.tg-bridge-topic`. **exit:** 0; uncaught `PossiblyDelivered`/`RuntimeError` → traceback (no auto-retry — a retry would duplicate the topic). |
 | `send` | `text` (positional; `-` = stdin), `--topic`, `--file PATH` (repeatable), `--as-document`, `--force` | **out:** `sent`, or a warning + `NOT resent`, or `NOT SENT —` + the unread records + the `recv` recovery line. **side effects:** emoji-prefixes, renders the Markdown subset to Telegram HTML and newline-aware-splits at 3800 chars (`_TG_HTML_LIMIT`), one `sendMessage` per chunk (§6.8) — **none at all** when refused. **exit:** **0 on success AND 0 on `PossiblyDelivered`** (deliberate — see §6.1); **3** when the topic has unread messages and `--force` was not given (#135); **4** when the topic is another live session's (§4.1a) — checked **before** the unread guard, so a foreign sender is never shown the target's records. The unread refusal previews the records **without** advancing the cursor, so `recv` remains the only cursor writer. Feed topics are exempt (nobody drains them). |
 | `recv` | `--topic`, `--wait N` (retired), `--peek`, `--json` | **out:** unread records, or nothing when empty. **side effects:** prints/flushes records before committing a stable cursor under the inbox lock; drains additions before retrying, then fires a typing indicator. `--peek` prints without committing or typing. **exit:** **0** = ordinary read; **4** = foreign topic on the committing path; **5** = any supplied `--wait`, refused before reading messages or touching the cursor, with stderr describing the nudge-driven protocol and the topic command. |
 | `ask` | `text` (positional), `--topic`, `--timeout N` (default 300), `--json` | Drains backlog to a stable cursor → sends → blocks for a reply → prints it, drains any racing additions, commits cursor, fires typing. **exit:** 0 = reply; 2 = timeout; **4** = another live session's topic (§4.1a), refused **before** the initial drain, so the target keeps its backlog and cursor. On `PossiblyDelivered` it warns (stderr) and waits anyway, without resending. |
 | `typing` | `--topic`, `--seconds N` (default 5) | Loops `sendChatAction(typing)` every 4 s until the deadline. **exit:** 0 (best-effort; send errors swallowed). |
 | `current-topic` | `TMUX_PANE` environment | Validates exactly one local, live, non-feed, non-ended registry binding. **out:** one JSON object with fixed keys `topic_id`, `name`, `pane`, `engine`, `cwd`. **exit:** 0 on one live binding; non-zero with a clear error for missing `TMUX_PANE`, missing/feed/ended/ambiguous bindings, pane timeout, or dead pane. Loads no bot config and has no side effects. |
-| `notify` | stdin body; required `--topic N`, `--idempotency-key KEY`; `--sender LABEL` required only when the caller has no dialog topic of its own | Resolves the **caller's** own topic from `TMUX_PANE` (registry plus a bounded pane-liveness probe; any failure means "unknown caller", i.e. the automation path), then validates the live dialog or ended parked target before side effects. Under an inbox lock, durably appends one record and fsyncs it — `peer` with derived `from`/`sender_topic_id` for a session caller (`--sender` ignored), `notification` with the free-text `--sender` otherwise — and fsyncs `topics/<id>/` when that append creates the inbox file (§6.4). For a live target, if this is the first unread record, injects only the normal recv cue through bounded tmux. An ended parked target is accepted without a pane probe: its inbox record is stored with `wake: parked-stored`, stderr names the parked-since (`ended`) timestamp and says it is stored, not delivered, and no revive or reopen question is requested by notify records alone. The Telegram mirrors still run. It then mirrors through `common.send_message` **directly, not `send_text`** (whose icon prefix is the *target's* signature): `<sender icon> <text>` for a peer (or `<sender label>: <text>` when it has no icon), un-iconed `<sender>: <text>` for automation. It then posts a Telegram-only outbound echo `→ <target label>: <text>` into the **caller's own** topic, signed with the caller's icon — skipped for automation and for a self-notify, run after the target mirror, and never raising. **out:** stdout carries **only** the machine-readable JSON result — `enqueued` with wake/Telegram/echo status, or `duplicate`; the shared nudge primitive and the Telegram-degraded warning both go to **stderr** so stdout stays parseable as JSON (#131). **exit:** 0 after durable local enqueue even if Telegram is `ambiguous`/`failed`; invalid input/topic/pane is non-zero before inbox/tmux/Telegram effects. A duplicate key performs none of those three effects. `--owner-only`: the event is for the owner reading the topic, not the agent — same attribution, same idempotency, but the record goes to `topics/<id>/notices.jsonl` (never the inbox, so `recv` never returns it), no pane wake, result `posted` with `wake: not-requested`; the same key stays deliverable to the inbox later. |
+| `notify` | stdin body; required `--topic KEY`, `--idempotency-key KEY`; `--sender LABEL` required only when the caller has no dialog topic of its own | Resolves the **caller's** own topic from `TMUX_PANE` (registry plus a bounded pane-liveness probe; any failure means "unknown caller", i.e. the automation path), then validates the live dialog or ended parked target before side effects. Under an inbox lock, durably appends one record and fsyncs it — `peer` with derived `from`/`sender_topic_id` for a session caller (`--sender` ignored), `notification` with the free-text `--sender` otherwise — and fsyncs `topics/<key>/` when that append creates the inbox file (§6.4). For a live target, if this is the first unread record, injects only the normal recv cue through bounded tmux. An ended parked target is accepted without a pane probe: its inbox record is stored with `wake: parked-stored`, stderr names the parked-since (`ended`) timestamp and says it is stored, not delivered, and no revive or reopen question is requested by notify records alone. The Telegram mirrors still run. It then mirrors through `common.send_message` **directly, not `send_text`** (whose icon prefix is the *target's* signature): `<sender icon> <text>` for a peer (or `<sender label>: <text>` when it has no icon), un-iconed `<sender>: <text>` for automation. It then posts a Telegram-only outbound echo `→ <target label>: <text>` into the **caller's own** topic, signed with the caller's icon — skipped for automation and for a self-notify, run after the target mirror, and never raising. **out:** stdout carries **only** the machine-readable JSON result — `enqueued` with wake/Telegram/echo status, or `duplicate`; the shared nudge primitive and the Telegram-degraded warning both go to **stderr** so stdout stays parseable as JSON (#131). **exit:** 0 after durable local enqueue even if Telegram is `ambiguous`/`failed`; invalid input/topic/pane is non-zero before inbox/tmux/Telegram effects. A duplicate key performs none of those three effects. `--owner-only`: the event is for the owner reading the topic, not the agent — same attribution, same idempotency, but the record goes to `topics/<key>/notices.jsonl` (never the inbox, so `recv` never returns it), no pane wake, result `posted` with `wake: not-requested`; the same key stays deliverable to the inbox later. |
 | `status` | (none) | Prints daemon `systemctl --user is-active` state + every registry topic with live unread counts (read-only). **exit:** 0. |
 
 There is no `peek` subcommand — "peek" is the `recv --peek` flag only.
@@ -223,7 +242,19 @@ Exempt by construction: the caller's own topic; feed, ended, and unregistered ta
 
 ### 5.1 Inbound message routing (`handle_message`, `daemon.py`)
 
-Guards run first (drop unless `chat.id == chat_id`; drop service messages, bots, and every sender other than the mandatory `owner_id`). The outer Telegram message sender is authoritative even for forwarded content. The routing text is `message.text or message.caption or ""`. Before the precedence below, a **carry-forward kill-switch** runs: while a daemon-driven carry-forward is auto-driving this topic, any inbound message that is **not** a read-only passive-status command (`/ctx /help /sessions /usage /peek`) halts the flow and is consumed (not delivered) — see §6.6. Then precedence (first match wins):
+The daemon starts one `poll_updates` loop per distinct bot token. A bot may serve several
+groups; `route_update` matches both its token and the update’s chat id before routing messages
+or callbacks. Unknown chats are ignored and logged without content. Each poller reads and
+atomically persists its own offset. The first multi-group startup associates the legacy
+`offset` with the current default token before starting extra pollers. Thereafter fingerprint
+cursors are authoritative even when the default token changes; `offset` mirrors the current
+default for compatibility. With no `groups` key, only the existing `offset` file is used.
+All groups share the same mandatory owner id. Service
+events accept the owner or that group’s own bot, and callback choices validate owner, group,
+thread key and current question message id before changing state.
+
+
+Guards run first (drop unless `chat.id` belongs to the polling bot’s configured groups; drop service messages, bots, and every sender other than the mandatory `owner_id`). The outer Telegram message sender is authoritative even for forwarded content. The routing text is `message.text or message.caption or ""`. Before the precedence below, a **carry-forward kill-switch** runs: while a daemon-driven carry-forward is auto-driving this topic, any inbound message that is **not** a read-only passive-status command (`/ctx /help /sessions /usage /peek`) halts the flow and is consumed (not delivered) — see §6.6. Then precedence (first match wins):
 
 ```mermaid
 stateDiagram-v2
@@ -394,7 +425,7 @@ A daemon nudge is scheduled only when the shared append critical section returns
 
 Normal Telegram ingress and `append_jsonl_once` take the same exclusive per-inbox writer flock and read the inbox line count plus cursor while holding it. The local helper additionally scans for the supplied `idempotency_key`, then either returns duplicate or appends and fsyncs one record. The append path that creates the first unread record returns a `WakeClaim` containing that cursor generation; other new records return no claim. This makes concurrent same-key retries resolve to one append and concurrent local or mixed-source events resolve to one wake owner. The winning local command validates its claim, wakes, and mirrors only after the durable commit. A retry with the same key returns duplicate before either side effect, including when the first Telegram result was ambiguous or failed. A different key is a new logical event and remains deliverable.
 
-**Durability claim.** The append flushes and fsyncs `inbox.jsonl` before any side effect, which covers the observed failure class exactly: a sender process that dies after exit 0 cannot lose the record. That is the whole claim — **process-crash durability with a fsynced file; no OS-crash pathname guarantee**. When the durable append is the call that creates the inbox file, `topics/<id>/` is fsynced once as well; this is partial hardening with nothing attached to it, because every ancestor of that directory may have been created by a writer that syncs nothing (`state_path`'s `makedirs`, the non-durable Telegram ingress append), so an existing pathname is not a persisted one and no append-time check can tell the two apart.
+**Durability claim.** The append flushes and fsyncs `inbox.jsonl` before any side effect, which covers the observed failure class exactly: a sender process that dies after exit 0 cannot lose the record. That is the whole claim — **process-crash durability with a fsynced file; no OS-crash pathname guarantee**. When the durable append is the call that creates the inbox file, `topics/<key>/` is fsynced once as well; this is partial hardening with nothing attached to it, because every ancestor of that directory may have been created by a writer that syncs nothing (`state_path`'s `makedirs`, the non-durable Telegram ingress append), so an existing pathname is not a persisted one and no append-time check can tell the two apart.
 
 The sole foreground reader emits and flushes records without holding either lock, preserving durable-before-cursor ordering. It then takes the wake-transition lock followed by the writer lock and advances the cursor only when the inbox line count still equals the emitted cursor. If a writer appended in the gap, the commit fails, the reader drains and flushes the added lines, and it retries. Wake dispatch takes only the transition lock, validates the claim generation, then performs bounded tmux. Consequently cursor advancement cannot make an old wake owner act on a later batch, while inbox writers are never held behind tmux.
 
@@ -433,7 +464,7 @@ Commands handled by the daemon (not passed through verbatim): `/help`, `/session
 
 ### 6.8 Emoji signature, icon assignment & outbound HTML (`cli.py, 107-114`; `common.py`)
 
-`send_text` prepends the topic's registry `icon` to every message (one bot account → the emoji is the signature). A topic carries **two** icons: this signature, and the forum topic icon Telegram shows in the topic list, which is themed from the topic's name via the `TOPIC_ICON_RULES` table in `cli.py` (#278; set from `getForumTopicIconStickers` ids at `createForumTopic` time, caught up by `tg-bridge retheme [--apply]`, recorded as `topic_icon`).
+`send_text` prepends the topic's registry `icon` to every message (the group’s bot account → the emoji is the signature). A topic carries **two** icons: this signature, and the forum topic icon Telegram shows in the topic list, which is themed from the topic's name via the `TOPIC_ICON_RULES` table in `cli.py` (#278; set from `getForumTopicIconStickers` ids at `createForumTopic` time, caught up by `tg-bridge retheme [--apply]`, recorded as `topic_icon`).
 
 `pick_icon` reads that same `TOPIC_ICON_RULES` table first: the topic name's first matching rule whose emoji no live topic carries is the signature — a later matching rule when the first one's emoji is taken (#296). Unlike the forum icon this is a plain emoji prepended as text, so it needs no `getForumTopicIconStickers` lookup and survives that call failing. A name matching no rule, or one whose every matching emoji is carried, falls back to the old behaviour: the first of a 16-emoji palette not in use by a non-ended entry, and on exhaustion `ICONS[topic_id % 16]`. Feed topics are pinned to `📡` and never consume a palette slot.
 
@@ -547,7 +578,7 @@ Ordering is load-bearing for codex: the bypass flag is a **root** flag, so `_res
 
 The owner pin (§6.12, §8) governs what arrives from Telegram and nothing that arrives any other way. Three local paths reach the same places without passing it, and each is narrowed here. The unifying rule: **write permission on a directory is permission to unlink and rename any entry in it, whatever that entry's own mode says.** A private file inside a shared directory is not private, so every check below is on the whole path, not the leaf.
 
-- **State.** `state_path` creates directories `0700` (not the umask's answer — under `umask 002` they arrive group-writable, and a peer who appends one well-formed line to `topics/<id>/inbox.jsonl` has put text in front of an agent). At daemon start, before any state is read, `secure_state_tree` removes group and other **write** from the state directory and every entry inside it, skipping symlinks so a `chmod` cannot reach outside the tree; it returns `(n_changed, before, after)` and the daemon logs what it changed. Read bits are deliberately left alone. `unsafe_state_ancestors` then names every directory above the state root that others can write — the daemon may not own those, so it reports rather than changes them. A directory carrying the sticky bit is exempt: `/tmp` is `1777` on purpose, and write there does not permit removing another user's entry.
+- **State.** `state_path` creates directories `0700` (not the umask's answer — under `umask 002` they arrive group-writable, and a peer who appends one well-formed line to `topics/<key>/inbox.jsonl` has put text in front of an agent). At daemon start, before any state is read, `secure_state_tree` removes group and other **write** from the state directory and every entry inside it, skipping symlinks so a `chmod` cannot reach outside the tree; it returns `(n_changed, before, after)` and the daemon logs what it changed. Read bits are deliberately left alone. `unsafe_state_ancestors` then names every directory above the state root that others can write — the daemon may not own those, so it reports rather than changes them. A directory carrying the sticky bit is exempt: `/tmp` is `1777` on purpose, and write there does not permit removing another user's entry.
 - **Config.** `load_config` calls `_open_secret_file`, which opens the file and judges that descriptor with `fstat`. `stat` then `open` resolve the same name twice, and a peer who can write any directory on the path can change what the name means in between, so the file that passed the check is not the file that gets parsed. Symlinks are followed and the target is what is judged, since the target is what is read. Rejection is `SystemExit` naming the reason and the `chmod 600` that fixes it — the config holds the bot token and `spawn_flags`, so whoever writes it chooses what runs as the owner.
 - **Install destinations.** `check_destination` runs **before** each `mkdir -p` — a directory created inside a writable parent is already replaceable by the time a later check would look at it — and walks from the destination up to `/`, refusing any ancestor that group or other can write without the sticky bit, naming the group's other members. It guards all three places the installer writes: the launcher directory (`$PREFIX`, which spawned sessions put first on `PATH` and from which they invoke `claude` and `codex` by bare name), the unit directory (`$UNIT_DIR`, where a rewritten unit runs on the next reload), and the skill link directory.
 - **Units** set `UMask=0077`, so a daemon started by a user manager with `umask 002` does not write group-readable state regardless.
@@ -594,8 +625,8 @@ A mid-turn pane, a withheld `Enter`, an unreadable pane and a lock or tmux error
 ## 8. Security & Privacy
 
 - **Owner pin** is the primary access gate: inbound is restricted to the mandatory `owner_id`, and forum service events are held to the same pin (§6.12). How much a spawned session may then do is a second, separate decision — `spawn_flags`, which defaults to none (§6.15). The pin is load-bearing either way: with flags configured it is the only thing between a Telegram message and an unattended shell, and with them absent it is still what decides whose messages reach a session at all. Missing or malformed `owner_id` disables ingress rather than falling back to the group.
-- **Secret handling:** `bot_token`/`chat_id`/`owner_id` live only in the chmod-600 config, which is also the first source for the optional `openai_api_key` (§6.14). No key is logged; the bot token appears only in the API URL. A key is rejected rather than sanitised when it carries control characters, because a key with an embedded newline makes `http.client` raise an exception containing the whole key.
-- **Chat pin:** messages from any chat other than the configured `chat_id` are dropped before processing.
+- **Secret handling:** `bot_token`/`chat_id`/`owner_id` live in the chmod-600 config; additional bot tokens may live in separate private token files. The config is also the first source for the optional `openai_api_key` (§6.14). No key is logged; the bot token appears only in the API URL. A key is rejected rather than sanitised when it carries control characters, because a key with an embedded newline makes `http.client` raise an exception containing the whole key.
+- **Chat pin:** messages and callbacks from chats outside the polling bot’s configured groups are dropped before processing. Group identity namespaces every thread key.
 - **Codex trust file:** the daemon appends per-cwd trust blocks to `~/.codex/config.toml` (a shared file); these accumulate over time.
 - **Local ingress trust boundary:** `notify` is a local CLI, not a socket/HTTP service. It exposes no credential and accepts only a dialog topic already present in the local registry with a live bound pane or an ended parked binding. Filesystem/process access to the bridge user's account is the trust prerequisite.
 - **Local filesystem surface (§6.16):** the owner pin governs Telegram and nothing else, so the three routes that reach an agent without it — replacing a binary the next spawn invokes, writing the config it reads, appending to a topic inbox — are closed by permissions instead. State is created `0700` and an existing tree is narrowed before it is read; the config is judged on the opened descriptor; the installer refuses any destination whose *path*, not merely whose leaf, others can write. Directories above the state root are reported, not changed, because they may not be the owner's to change.
@@ -639,10 +670,10 @@ Every acceptance criterion in one place: the claim (EARS phrasing), how it is ve
 ### Criteria
 
 - **C1 (AC-1)** [checked by: script · blocking] — WHEN a Telegram message arrives whose `chat.id` ≠ configured `chat_id`, the system SHALL drop it without inboxing.
-  check: send a message from a non-configured chat; assert no file appears under `topics/<id>/`.
+  check: send a message from a non-configured chat; assert no file appears under `topics/<key>/`.
 - **C2 (AC-2)** [checked by: script · blocking] — IF a message's outer sender id ≠ the mandatory `owner_id`, THEN the system SHALL drop it and log the rejection, including when the message carries forwarded content.
   check: send from a different user id; assert it is logged-rejected and not inboxed. Repeat with forwarded content and every spawn/control command family.
-- **C3 (AC-3)** [checked by: script · blocking] — WHEN a message is not a command, not a `!`/voice-stop-word interrupt, not in General (thread 0), and not a confirming pending-kill reply, the system SHALL append exactly one record to `topics/<id>/inbox.jsonl`.
+- **C3 (AC-3)** [checked by: script · blocking] — WHEN a message is not a command, not a `!`/voice-stop-word interrupt, not in General (thread 0), and not a confirming pending-kill reply, the system SHALL append exactly one record to `topics/<key>/inbox.jsonl`.
   check: send plain text to a topic; assert `inbox.jsonl` grows by exactly one line with the six-field schema.
 - **C4 (AC-4)** [checked by: script · blocking] — WHEN an inbound voice/audio/video_note is received, the system SHALL transcribe it and store the transcript as the record's `text` (AND IF transcription fails, store a failure placeholder), UNLESS the transcript's first word is a stop-word, in which case it is routed as an interrupt and SHALL NOT be stored.
   check: send a voice note; assert the record `kind` is `voice` and `text` is the transcript (or a `transcription failed` placeholder).

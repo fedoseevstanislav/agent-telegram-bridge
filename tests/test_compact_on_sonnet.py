@@ -293,8 +293,18 @@ def test_codex_topics_get_no_model_switch(monkeypatch, fake):
 
 def _halt_when(monkeypatch, fake, trigger):
     """Halt from the owner's side the first time `trigger` has been typed, at the point the
-    worker next looks at the pane — outside every lock, as a real Telegram message would."""
-    state = {"done": False, "replies": []}
+    worker next looks at the pane — outside every lock, as a real Telegram message would.
+    The halt's switch back (#397) is held in `state["after"]` for the test to run once the
+    worker has returned, as its own thread would once the worker let go of _settings_lock."""
+    state = {"done": False, "replies": [], "after": []}
+
+    class _Thread:
+        def __init__(self, target, args=(), daemon=None):
+            self.call = (target, args)
+
+        def start(self):
+            state["after"].append(self.call)
+    monkeypatch.setattr(daemon.threading, "Thread", _Thread)
 
     def alive(pane):
         if not state["done"] and trigger in fake.typed:
@@ -311,17 +321,27 @@ def _halt_when(monkeypatch, fake, trigger):
 ])
 def test_owner_message_halts_the_switch_and_restore_phases(monkeypatch, fake, trigger,
                                                             phase_left_on):
-    _halt_when(monkeypatch, fake, trigger)
+    # #353 C7 said a halt types nothing more. Since #397 the owner's rule is "go back to the
+    # previous model first": the worker still types nothing after the halt, and the halt's
+    # own thread switches the session back to its pair.
+    state = _halt_when(monkeypatch, fake, trigger)
     replies = _run(monkeypatch, fake)
     typed = fake.commands()
     after = typed[typed.index(trigger) + 1:]
-    assert after == [], f"typed after the halt: {after}"
+    assert after == [], f"the worker typed after the halt: {after}"
     assert daemon.COMPACT_RESUME_PROMPT not in typed
     halt = [r for r in replies if r.startswith("🛑 Carry-forward halted")]
     assert len(halt) == 1
     model, effort = phase_left_on
     assert f"`{model}` at `{effort}` effort" in halt[0]
     assert f"`{trigger}` was sent" in halt[0]
+    assert f"Switching the session back to `{PREV_MODEL}` at `{PREV_EFFORT}`" in halt[0]
+    assert len(state["after"]) == 1
+    for target, args in state["after"]:
+        target(*args)
+    typed = fake.commands()
+    assert typed[typed.index(trigger) + 1:] == [f"/model {PREV_MODEL}", f"/effort {PREV_EFFORT}"]
+    assert fake.settings.read_bytes() == SETTINGS_BYTES
     assert not any("could not confirm" in r for r in replies)  # a halt is not a failure
 
 
@@ -455,6 +475,10 @@ def test_a_halt_right_after_a_command_is_submitted_names_it(monkeypatch, fake):
     replies = _worker(monkeypatch, fake)
     fake.cached = False
     real_guard, state = daemon._cf_guard, {"done": False}
+    started = []  # the halt's switch back (#397) is held, not run: this test is about the note
+    monkeypatch.setattr(daemon.threading, "Thread",
+                        lambda target, args=(), daemon=None: type(
+                            "T", (), {"start": lambda self: started.append(args)})())
 
     def guard_then_halt(tid, token):
         inner = real_guard(tid, token)
@@ -473,3 +497,4 @@ def test_a_halt_right_after_a_command_is_submitted_names_it(monkeypatch, fake):
     assert len(halt) == 1
     assert f"`/model {daemon.COMPACT_MODEL}` was sent" in halt[0]
     assert fake.commands() == [f"/model {daemon.COMPACT_MODEL}"]
+    assert len(started) == 1, "a sent, unconfirmed switch must be switched back"

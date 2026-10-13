@@ -90,8 +90,10 @@ def session_lines(prev_costs, new_costs):
         if info.get("closed"):
             continue          # The owner closed this topic in Telegram — not part of their morning (#161)
         name = info.get("name") or session
+        if ":" in tid:
+            name += f" (topic {tid})"
         icon = info.get("icon") or "•"
-        unread = unread_count(int(tid))
+        unread = unread_count(tid)
         unread_flag = f" — {unread} unread!" if unread else ""
         if engine == "codex":
             # codex has no Claude statusline; derive ctx from its session rollout (#61)
@@ -124,8 +126,8 @@ def session_lines(prev_costs, new_costs):
 
 def ended_since(prev_ts):
     names = [
-        info.get("name", "?")
-        for info in read_registry().values()
+        info.get("name", "?") + (f" (topic {tid})" if ":" in tid else "")
+        for tid, info in read_registry().items()
         if info.get("ended") and info["ended"] > prev_ts
     ]
     return f"Ended since last digest: {', '.join(names)}" if names else None

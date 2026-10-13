@@ -31,7 +31,7 @@ def list_revivable():
     reg = read_registry()
     print(f"{'topic':>6} {'ended?':<6} {'engine':<7} {'name':<28} {'resolved session_id':<38}")
     for tid, info in reg.items():
-        if info.get("feed"):
+        if info.get("feed") or info.get("moved_to"):
             continue
         pane = info.get("pane")
         sid = info.get("session_id") or (daemon.context_session_id(pane) if pane else None)
@@ -61,7 +61,7 @@ def main(argv=None):
         if tid not in _parse_ids(args.topics):
             specs.append({"tid": tid, "fresh": True})
     for pair in _parse_ids(args.codex):
-        tid, _, uuid = pair.partition(":")
+        tid, _, uuid = pair.rpartition(":")
         if not (tid and uuid):
             print(f"bad --codex pair: {pair!r} (want <topic>:<uuid>)", file=sys.stderr)
             return 2

@@ -1,4 +1,4 @@
-"""Long-polling daemon: sole getUpdates consumer for the bridge bot.
+"""Long-polling daemon: sole getUpdates consumer for each configured bridge bot.
 
 Routes group messages by forum topic (message_thread_id) into per-topic JSONL
 inboxes under the state dir. Voice/audio messages are downloaded and
@@ -7,6 +7,7 @@ transcribed before being written to the inbox.
 
 import contextlib
 import fcntl
+import hashlib
 import json
 import math
 import os
@@ -28,6 +29,9 @@ from bridge.common import (
     md_to_telegram_html, read_registry, redact_secrets, secure_process_umask, secure_state_tree,
     send_message, state_path,
     unsafe_state_ancestors, update_registry, valid_owner_id, validate_wake_claim,
+    configured_groups, group_for_chat, latest_topics_by_pane, normalize_topic_key,
+    TopicKeyError, topic_credentials, topic_key, topic_parts,
+    group_config, move_request_path, resolve_moved_topic, topic_lock, topic_operation,
 )
 from bridge.transcribe import transcribe
 from bridge import codex_ctx, transcript
@@ -124,16 +128,16 @@ def log(msg):
     print(f"[{now_iso()}] {msg}", file=sys.stderr, flush=True)
 
 
-def load_offset():
-    path = state_path("offset")
+def load_offset(bot_key=None):
+    path = state_path("offsets", bot_key) if bot_key else state_path("offset")
     if os.path.exists(path):
         with open(path) as f:
             return int(f.read().strip() or 0)
     return 0
 
 
-def save_offset(offset):
-    path = state_path("offset")
+def save_offset(offset, bot_key=None):
+    path = state_path("offsets", bot_key) if bot_key else state_path("offset")
     tmp = path + ".tmp"
     with open(tmp, "w") as f:
         f.write(str(offset))
@@ -846,14 +850,18 @@ def report_blocked_pane(thread_id, pane, what, lead=MODAL_LEAD):
     return True
 
 
-def maybe_nudge(thread_id, pane, wake_claim=None):
-    """Type a wake-up line into the session's tmux pane if its inbox is still unread."""
+@topic_operation("thread_id", moved_result=False)
+def maybe_nudge(thread_id, pane, wake_claim=None, still_ok=None):
+    """Type a wake-up line into the session's tmux pane if its inbox is still unread.
+
+    `still_ok` is handed to type_line, which re-runs it before the first keystroke and
+    before Enter; the revive wake uses it to stop typing into a pane the topic has left."""
     try:
         inbox = state_path("topics", str(thread_id), "inbox.jsonl")
         # Built BEFORE the wake claim: addressing reads the registry, and the critical
         # section below is not the place to add file I/O (review r1, C8). The address can
         # therefore be stale by the time the keystrokes land — nothing revalidates the binding
-        # in between, and this path does not pass `still_ok` to type_line. A stale address
+        # in between unless the caller passes `still_ok` (only the revive wake does). A stale address
         # names the session that held the topic a moment ago, which is a weaker claim than the
         # line makes; it is the price of keeping the read out of the lock, and it is not
         # bounded here.
@@ -869,7 +877,7 @@ def maybe_nudge(thread_id, pane, wake_claim=None):
             if not pane_alive(pane):
                 log(f"nudge skipped, pane {pane} gone (topic {thread_id})")
                 return False
-            status = type_line(pane, text)
+            status = type_line(pane, text, **({"still_ok": still_ok} if still_ok else {}))
             if status != "sent":
                 log(f"nudge not delivered to pane {pane} (topic {thread_id}): {status}")
                 if status == "swallowed" and pane_is_persistently_swallowing(pane):
@@ -902,6 +910,7 @@ def _park_authority_holds(tid):
         return True
 
 
+@topic_operation("thread_id")
 def maybe_auto_revive(cfg, thread_id, cause="auto"):
     tid = str(thread_id)
     if tid in pending_reopens:
@@ -998,6 +1007,28 @@ def schedule_nudge(thread_id, wake_claim):
         threading.Timer(NUDGE_DELAY, maybe_nudge, args=(thread_id, pane, wake_claim)).start()
 
 
+def wake_if_unread(thread_id, pane):
+    """Wake a just-revived pane when messages already wait for it.
+
+    The message that revives a parked topic usually gets its wake before the revive binds a
+    live pane, so that wake is typed nowhere. Every message after it gets no claim, because
+    the batch counts as nudged (schedule_nudge above). Without this the session waited for
+    idle_sweep_loop, 2-4 minutes after its briefing (#395). When the arrival wake did land,
+    this adds one more "new message" line to the same pane.
+
+    The wake is maybe_nudge, run NUDGE_DELAY later on the timer thread: it rechecks unread,
+    pane liveness and a move, and type_line rechecks that the topic is still bound to this
+    pane before typing. Never raises: the caller still owes the owner the reopen status."""
+    try:
+        if unread_count(thread_id) <= 0:
+            return
+        still_bound = lambda: (read_registry().get(str(thread_id)) or {}).get("pane") == pane
+        threading.Timer(NUDGE_DELAY, maybe_nudge, args=(thread_id, pane, None),
+                        kwargs={"still_ok": still_bound}).start()
+    except Exception as e:
+        log(f"revive wake not scheduled for topic {thread_id}: {e}")
+
+
 def mark_ended(thread_id, observed_pane):
     """Stamp `ended`, but only while the topic is still bound to the pane that was observed
     dead. Observation and stamp are two separate moments: a concurrent revive can rebind the
@@ -1021,68 +1052,324 @@ def mark_ended(thread_id, observed_pane):
     return stamped
 
 
+def _move_notice(cfg, key):
+    name, thread = topic_parts(key)
+    group = group_config(cfg, name)
+    chat = str(group["chat_id"])
+    # Forum groups are supergroups. The private link omits Telegram's -100 prefix.
+    channel = chat[4:] if chat.startswith("-100") else chat.lstrip("-")
+    return f"[{group['name']} (topic {key})](https://t.me/c/{channel}/{thread})"
+
+
+# The new thread id is unknown until createForumTopic returns. An owner can write there
+# before that response, so fencing only the source lets ingress create a destination
+# inbox which the cutover must then reject (#380 review). Only unregistered ingress
+# takes this fence; messages in existing sessions keep their usual concurrency.
+_topic_creation_lock = threading.Lock()
+
+
+def move_topic(cfg, old_key, target_name):
+    """Move under the daemon's authority, without touching the session's terminal.
+
+    The CLI cannot inspect _pending_cf/_auto_reviving or an in-memory-only reopen question.
+    Its request is consumed here by the existing lifecycle loop; shared operation locks
+    keep a new worker or inbox reader from crossing the folder/registry cutover.
+    """
+    old_key = normalize_topic_key(old_key)
+    try:
+        # Creation comes before the topic fence: an unregistered command may itself
+        # acquire a registered topic's lock, so the reverse order would deadlock it.
+        with _topic_creation_lock, topic_lock(old_key, exclusive=True, blocking=False):
+            return _move_topic(cfg, old_key, target_name)
+    except BlockingIOError:
+        raise RuntimeError(f"topic {old_key} has an operation in flight; retry when it finishes") from None
+
+
+def _move_topic(cfg, old_key, target_name):
+    source = group_config(cfg, topic_parts(old_key)[0])
+    target = group_config(cfg, target_name)
+    topic_credentials(cfg, old_key)  # reject aliases of the default group before any API call
+    if source["name"] == target["name"]:
+        raise RuntimeError("refusing to move a topic to its own group")
+    entry = read_registry().get(str(old_key))
+    if not isinstance(entry, dict) or entry.get("moved_to"):
+        raise RuntimeError(f"topic {old_key} has no session to move")
+    with _pending_reopen_lock:
+        if str(old_key) in pending_reopens:
+            raise RuntimeError(f"topic {old_key} has a pending reopen question")
+    with _auto_revive_lock:
+        if str(old_key) in _auto_reviving:
+            raise RuntimeError(f"topic {old_key} has a revive in flight")
+    if carry_forward_active(old_key):
+        raise RuntimeError(f"topic {old_key} has a carry-forward in flight")
+    if entry.get("park_claim"):
+        raise RuntimeError(f"topic {old_key} is being parked")
+
+    from bridge.cli import CWD_BINDING_FILE, icon_emoji_ids
+
+    params = {"chat_id": target["chat_id"], "name": entry["name"]}
+    if entry.get("topic_icon"):
+        emoji_id = icon_emoji_ids(target).get(entry["topic_icon"])
+        if emoji_id:
+            params["icon_custom_emoji_id"] = emoji_id
+    created = api(target["bot_token"], "createForumTopic", params)
+    new_key = topic_key(cfg, target["name"], created["message_thread_id"])
+    old_dir = state_path("topics", str(old_key))
+    new_dir = state_path("topics", str(new_key))
+    renamed = aliased = False
+    try:
+        def transfer(reg):
+            nonlocal renamed, aliased
+            current = reg.get(str(old_key))
+            if not current or current.get("moved_to"):
+                raise RuntimeError("source topic changed while creating the destination")
+            if str(new_key) in reg or os.path.lexists(new_dir):
+                raise RuntimeError("destination topic already has local state")
+            os.makedirs(old_dir, mode=0o700, exist_ok=True)
+            os.rename(old_dir, new_dir)
+            renamed = True
+            # Inbox text is append-only and already contains absolute media/CF paths.
+            # An alias preserves those references AND the inode of each existing lock.
+            os.symlink(os.path.basename(new_dir), old_dir, target_is_directory=True)
+            aliased = True
+            reg[str(new_key)] = dict(current)  # every session field, including unknown flags
+            # The destination was just created open; a copied `closed` would silence its
+            # warnings and hide it from the digest (#380 review R2).
+            reg[str(new_key)].pop("closed", None)
+            reg[str(old_key)] = {"name": current["name"], "moved_to": new_key}
+        update_registry(transfer)
+    except Exception:
+        if aliased:
+            os.unlink(old_dir)
+        if renamed:
+            os.rename(new_dir, old_dir)
+        # Only the destination created by this attempt, never an existing local topic.
+        try:
+            api(target["bot_token"], "deleteForumTopic", {
+                "chat_id": target["chat_id"], "message_thread_id": created["message_thread_id"],
+            })
+        except Exception:
+            pass
+        raise
+
+    warnings = []
+    binding = os.path.join(entry.get("cwd") or "", CWD_BINDING_FILE)
+    if entry.get("cwd") and os.path.isfile(binding):
+        try:
+            with open(binding) as f:
+                bound = f.read().strip()
+            if bound == str(old_key):
+                with open(binding, "w") as f:
+                    f.write(str(new_key))
+        except OSError:
+            warnings.append("could not rewrite the cwd topic binding; use the new key explicitly")
+    with _cf_record_lock:
+        old_record = _cf_unfinished_path(old_key)
+        if os.path.exists(old_record):
+            try:
+                os.replace(old_record, _cf_unfinished_path(new_key))
+            except OSError:
+                warnings.append("could not move the unfinished carry-forward retry record")
+    with _model_lock:
+        _pending_model.pop(str(old_key), None)  # its Timer will see it was superseded
+    with _blocked_lock:
+        _blocked_reported.pop(str(old_key), None)
+        _unreadable_streak.pop(str(old_key), None)
+    pending_kills.pop(old_key, None)
+
+    # Once the local cutover committed, never roll it back for a cosmetic/API failure:
+    # sessions may already be using the new binding. Report which follow-up needs repair.
+    old_token, old_chat, old_thread = topic_credentials(cfg, old_key)
+    if entry.get("closed"):
+        try:
+            api(old_token, "reopenForumTopic", {"chat_id": old_chat, "message_thread_id": old_thread})
+        except Exception:
+            warnings.append("could not reopen the old topic for its move notice")
+    for key, text in ((old_key, f"Session moved to {_move_notice(cfg, new_key)}."),
+                      (new_key, f"Session moved here from {_move_notice(cfg, old_key)}.")):
+        try:
+            token, chat, thread = topic_credentials(cfg, key)
+            send_message(token, chat, f"⚙️ {text}", thread)
+        except Exception:
+            warnings.append(f"could not post the move notice in topic {key}")
+    try:
+        api(old_token, "closeForumTopic", {"chat_id": old_chat, "message_thread_id": old_thread})
+    except Exception:
+        warnings.append(f"could not close the old topic {old_key}")
+    return new_key, warnings
+
+
+def process_topic_moves(cfg):
+    """One file per requested topic; completed requests are never executed again."""
+    for key in read_registry():
+        try:
+            path = move_request_path(key)
+        except TopicKeyError:
+            continue
+        try:
+            with open(path) as f:
+                request = json.load(f)
+        except FileNotFoundError:
+            continue
+        if request.get("state") != "pending":
+            continue
+        request["state"] = "running"
+        _write_move_result(path, request)
+        try:
+            new_key, warnings = move_topic(cfg, request["from"], request["to"])
+            request.update(topic_id=new_key, warnings=warnings)
+        except Exception as e:
+            # Even a transport stub or a third-party error may include credentials. The
+            # result reaches stdout via the CLI, so redact every configured bot here.
+            error = str(e)
+            for group in configured_groups(cfg):
+                error = error.replace(group["bot_token"], "[bot token redacted]")
+            request["error"] = error
+        request["state"] = "done"
+        _write_move_result(path, request)
+
+
+def _write_move_result(path, request):
+    tmp = path + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(request, f)
+    os.replace(tmp, path)
+
+
+def _sweepable_key(key):
+    """False for a malformed registry key. topic_lock parses the key, so without this check one
+    bad key raised inside the per-topic loop and stopped the sweep for every topic (#380 review,
+    A3 — the #377 hardening of latest_topics_by_pane, carried to the lock)."""
+    try:
+        normalize_topic_key(key)
+        return True
+    except TopicKeyError:
+        return False
+
+
+def recover_interrupted_moves(cfg):
+    """Finish, as an error report, any move a previous daemon left `running` (#380 review R1).
+
+    process_topic_moves only picks up `pending` requests, so without this a restart mid-move
+    left the request stuck and the operator's retry timing out. Nothing is retried here: the
+    destination topic may already exist, and a second createForumTopic would duplicate it."""
+    registry = read_registry()
+    for key in list(registry):
+        try:
+            _recover_interrupted_move(cfg, registry, key)
+        except Exception as e:
+            # One damaged request file must never stop the daemon from starting (#380 r3).
+            log(f"move request for topic {key} could not be recovered ({e.__class__.__name__}) "
+                f"— left as is")
+
+
+def _recover_interrupted_move(cfg, registry, key):
+    try:
+        path = move_request_path(key)
+        with open(path) as f:
+            request = json.load(f)
+    except (TopicKeyError, FileNotFoundError, ValueError, OSError):
+        return
+    if not isinstance(request, dict) or request.get("state") != "running":
+        return  # valid JSON of another shape is not a request (#380 review r2)
+    moved_to = (registry.get(str(key)) or {}).get("moved_to")
+    if moved_to:
+        request.pop("error", None)  # a stale error from a damaged file is not this outcome
+        request.update(topic_id=moved_to, warnings=[
+            "the daemon restarted after the registry moved; the move notices and closing "
+            "the old topic may be missing"])
+    else:
+        request["error"] = (
+            f"the daemon restarted during this move, before the registry changed; a topic "
+            f"named {(registry.get(str(key)) or {}).get('name')!r} may already exist in "
+            f"group {request.get('to')!r} — delete it there before retrying")
+    if request.get("error"):
+        # The error quotes the topic name; redact every configured bot as the normal
+        # path does before anything reaches the request file (#380 review r2).
+        for group in configured_groups(cfg):
+            request["error"] = request["error"].replace(group["bot_token"], "[bot token redacted]")
+    request["state"] = "done"
+    _write_move_result(path, request)
+    log(f"move of topic {key} was interrupted by a restart — reported in its request file")
+
+
 def lifecycle_loop(cfg):
     """Detect dead terminals and request parked revives for unread owner messages."""
     while True:
         time.sleep(LIFECYCLE_POLL)
         try:
+            process_topic_moves(cfg)
             for thread_id, info in read_registry().items():
-                if info.get("ended") and info.get("parked"):
-                    # A pending reopen question (or a revive already in flight) makes
-                    # maybe_auto_revive return early; say "requested" once, not every poll.
-                    try:
-                        owner_waiting = has_unread_owner_message(thread_id)
-                    except Exception as e:
-                        # A failed read must not keep the owner's own message from waking
-                        # the seat; maybe_auto_revive's gate fails the same way.
-                        log(f"lifecycle: parked topic {thread_id}: inbox check failed ({e})")
-                        owner_waiting = True
-                    if (owner_waiting
-                            and str(thread_id) not in pending_reopens
-                            and str(thread_id) not in _auto_reviving):
-                        log(f"lifecycle: parked topic {thread_id}: owner message unread, "
-                            "revive requested via unread inbox")
-                        maybe_auto_revive(cfg, thread_id)
+                if not _sweepable_key(thread_id):
                     continue
-                pane = info.get("pane")
-                if not pane or info.get("ended"):
-                    continue  # no pane = liveness unknowable; ended = already handled
-                if pane_alive(pane):
-                    continue
-                if not mark_ended(thread_id, pane):
-                    continue  # rebound to a live pane mid-sweep — nothing ended (#237)
-                name = info.get("name", "?")
-                try:
-                    reply(cfg, int(thread_id), f"🔚 Session '{name}' ended — its terminal is gone. Closing this topic.")
-                    api(cfg["bot_token"], "closeForumTopic", {
-                        "chat_id": cfg["chat_id"], "message_thread_id": int(thread_id),
-                    })
-                except Exception as e:
-                    log(f"lifecycle notice failed for topic {thread_id}: {e}")
-                # The stamp was consistent when it landed, but the notice and close above
-                # ran OUTSIDE the lock: a revive can claim the topic in between, clear
-                # `ended`, rebind — and this sweep would then have closed the reopened
-                # topic of a live session (#270 review r1, finding 1). The revive's claim
-                # wins: undo the close and say so. The undo itself races an owner close
-                # landing inside the same instants; accepted — a reopen of a topic the
-                # owner is actively closing is one keystroke to redo, a closed topic on a
-                # live session is a dead letterbox until someone notices.
-                after = read_registry().get(str(thread_id)) or {}
-                if after.get("pane") != pane or not after.get("ended"):
-                    log(f"lifecycle: topic {thread_id} was claimed by a revive while its "
-                        f"end was being announced — reopening")
-                    if reopen_topic(cfg, thread_id):
+                with topic_lock(thread_id):
+                    info = read_registry().get(str(thread_id), {})
+                    if info.get("moved_to"):
+                        continue
+                    if info.get("ended") and info.get("parked"):
+                        # A pending reopen question (or a revive already in flight) makes
+                        # maybe_auto_revive return early; say "requested" once, not every poll.
                         try:
-                            reply(cfg, int(thread_id),
-                                  "↩️ Disregard the notice above — the session was revived "
-                                  "while this topic was being closed. It is open and live.")
+                            owner_waiting = has_unread_owner_message(thread_id)
                         except Exception as e:
-                            log(f"lifecycle: correction notice failed for topic "
-                                f"{thread_id}: {e}")
-                    continue
-                log(f"session ended: topic {thread_id} ({name}), pane {pane} gone")
+                            # A failed read must not keep the owner's own message from waking
+                            # the seat; maybe_auto_revive's gate fails the same way.
+                            log(f"lifecycle: parked topic {thread_id}: inbox check failed ({e})")
+                            owner_waiting = True
+                        if (owner_waiting
+                                and str(thread_id) not in pending_reopens
+                                and str(thread_id) not in _auto_reviving):
+                            log(f"lifecycle: parked topic {thread_id}: owner message unread, "
+                                "revive requested via unread inbox")
+                            maybe_auto_revive(cfg, thread_id)
+                        continue
+                    pane = info.get("pane")
+                    if not pane or info.get("ended"):
+                        continue  # no pane = liveness unknowable; ended = already handled
+                    if pane_alive(pane):
+                        continue
+                    if not mark_ended(thread_id, pane):
+                        continue  # rebound to a live pane mid-sweep — nothing ended (#237)
+                    name = info.get("name", "?")
+                    try:
+                        reply(cfg, normalize_topic_key(thread_id), f"🔚 Session '{name}' ended — its terminal is gone. Closing this topic.")
+                        token, chat_id, thread = topic_credentials(cfg, thread_id)
+                        api(token, "closeForumTopic", {
+                            "chat_id": chat_id, "message_thread_id": thread,
+                        })
+                    except Exception as e:
+                        log(f"lifecycle notice failed for topic {thread_id}: {e}")
+                    # The stamp was consistent when it landed, but the notice and close above
+                    # ran OUTSIDE the lock: a revive can claim the topic in between, clear
+                    # `ended`, rebind — and this sweep would then have closed the reopened
+                    # topic of a live session (#270 review r1, finding 1). The revive's claim
+                    # wins: undo the close and say so. The undo itself races an owner close
+                    # landing inside the same instants; accepted — a reopen of a topic the
+                    # owner is actively closing is one keystroke to redo, a closed topic on a
+                    # live session is a dead letterbox until someone notices.
+                    after = read_registry().get(str(thread_id)) or {}
+                    if after.get("pane") != pane or not after.get("ended"):
+                        log(f"lifecycle: topic {thread_id} was claimed by a revive while its "
+                            f"end was being announced — reopening")
+                        if reopen_topic(cfg, thread_id):
+                            try:
+                                reply(cfg, normalize_topic_key(thread_id),
+                                      "↩️ Disregard the notice above — the session was revived "
+                                      "while this topic was being closed. It is open and live.")
+                            except Exception as e:
+                                log(f"lifecycle: correction notice failed for topic "
+                                    f"{thread_id}: {e}")
+                        continue
+                    log(f"session ended: topic {thread_id} ({name}), pane {pane} gone")
         except Exception as e:
             log(f"lifecycle_loop error: {e}")
+
+
+def _follow_moved_exemptions(values):
+    registry = read_registry()
+    return {str(resolve_moved_topic(str(value), registry))
+            if registry.get(str(value), {}).get("moved_to") else str(value)
+            for value in values}
 
 
 def load_park_exempt():
@@ -1098,7 +1385,7 @@ def load_park_exempt():
         with open(path) as f:
             data = json.load(f)
         if isinstance(data, list):
-            return {str(x) for x in data}
+            return _follow_moved_exemptions(data)
     except (OSError, ValueError):
         pass
     return None
@@ -1470,6 +1757,7 @@ def _claim_park(tid, pane):
     return update_registry(_claim)
 
 
+@topic_operation("tid")
 def _park_one(cfg, tid, pane, occupant, cutoff):
     """Claim, re-verify EVERYTHING, kill, notify — with a token-guarded undo on every
     failure path, and a post-kill REPAIR for what no pre-check can prevent. The claim
@@ -1545,7 +1833,7 @@ def _park_one(cfg, tid, pane, occupant, cutoff):
         try:
             hours = "many" if idle_h is None else f"{idle_h:.0f}"
             ctx_note = "" if parked_pct is None else f" Context: {parked_pct}% used."
-            reply(cfg, int(tid), (
+            reply(cfg, normalize_topic_key(tid), (
                 f"\U0001f4a4 Parked after {hours}h idle to free memory.{ctx_note} Write anything "
                 f"here to bring it back — the same conversation resumes (a large session "
                 f"will first ask whether to resume in full or from a summary)."))
@@ -1674,7 +1962,7 @@ def _park_repair(cfg, tid):
                 + ". Nothing else is lost — write anything here and the conversation "
                   "resumes.")
         try:
-            reply(cfg, int(tid), text)
+            reply(cfg, normalize_topic_key(tid), text)
         except Exception as e:
             with contextlib.suppress(Exception):
                 log(f"idle-park: repair notice failed for topic {tid}: {e}")
@@ -1689,12 +1977,12 @@ def set_topic_closed(thread_id, closed):
     forum_topic_closed / forum_topic_reopened service messages, or a send that Telegram
     rejects with TOPIC_CLOSED. Absent an event, a topic counts as open."""
     tid = str(thread_id or "")
-    if not tid or tid == "0":                     # General is not a closable topic
+    if not tid or topic_parts(tid)[1] == 0:       # General is not a closable topic
         return
 
     def _stamp(reg):
         entry = reg.get(tid)
-        if entry is None:
+        if entry is None or entry.get("moved_to"):
             return
         if closed:
             entry["closed"] = True
@@ -1735,8 +2023,8 @@ def reply(cfg, thread_id, text, *, reply_markup=None, message_ids=None):
     accepted ids without changing the bool contract — a reopen question needs its own id
     for edits and for rejecting a tap on an older question (#373)."""
     try:
-        deliveries = send_message(cfg["bot_token"], cfg["chat_id"], f"⚙️ {text}",
-                                  thread_id or None,
+        token, chat_id, thread = topic_credentials(cfg, thread_id or 0)
+        deliveries = send_message(token, chat_id, f"⚙️ {text}", thread or None,
                                   **({"reply_markup": reply_markup} if reply_markup is not None else {}))
         if message_ids is not None:
             for delivery in deliveries:
@@ -1751,12 +2039,17 @@ def reply(cfg, thread_id, text, *, reply_markup=None, message_ids=None):
         # reading a state that is no longer true. Purely passive: it records what was
         # observed and invokes nothing — no revival, no pending question (the hole #206
         # closed stays closed).
-        if str(thread_id or "") not in ("", "0"):
+        if thread != 0:
             if (read_registry().get(str(thread_id)) or {}).get("closed"):
                 set_topic_closed(thread_id, False)
                 log(f"topic {thread_id} accepted a message while marked closed — "
                     f"stale flag cleared (#212)")
         return True
+    except TopicKeyError as e:
+        # A registry entry for a group no longer in config (#377 review F1): drop this one
+        # reply instead of raising into the sweep that is also serving every other topic.
+        log(f"topic {thread_id}: {e} — reply dropped")
+        return False
     except RuntimeError as e:
         if not _is_topic_gone_error(e):
             raise
@@ -2055,7 +2348,7 @@ def sessions_overview():
                 ctx = _codex_ctx_dict(pane_id)
             pct = f"{int(float(ctx['pct']))}% ctx" if ctx else "ctx ?"
             cost = f", ${ctx['cost']:.2f}" if ctx and "cost" in ctx else ""
-            unread = unread_count(int(tid))
+            unread = unread_count(normalize_topic_key(tid))
             line += f"\n  topic {tid} '{info.get('name', '?')}' | {pct}{cost} | unread {unread}"
         else:
             line += "\n  not connected to the bridge"
@@ -2066,7 +2359,7 @@ def sessions_overview():
         f"{info.get('icon', '•')} {info.get('name', '?')} — topic {tid}, "
         + ("feed (no warnings/nudges)" if info.get("feed") else "registered without tmux (can't inspect)")
         for tid, info in read_registry().items()
-        if not info.get("pane") and not info.get("ended")
+        if not info.get("pane") and not info.get("ended") and not info.get("moved_to")
     ]
     return "Sessions in tmux:\n" + "\n".join(lines + headless)
 
@@ -2665,7 +2958,7 @@ def dashboard_body(orch_line):
                     ctx = _codex_ctx_dict(pane_id)
                 pct = f"{int(float(ctx['pct']))}%" if ctx else "?%"
                 cost = f" ${ctx['cost']:.0f}" if ctx and "cost" in ctx else ""
-                unread = unread_count(int(tid))
+                unread = unread_count(normalize_topic_key(tid))
                 flag = f" 📨{unread}" if unread else ""
                 icon = info.get("icon", "•")
                 name = info.get("name", session)
@@ -2975,6 +3268,10 @@ def spawn_session(cfg, thread_id, text):
         reply(cfg, thread_id, f"Can't spawn: tmux session '{tmux_name}' already exists. Pick another name.")
         return
     template = ENGINES[engine]["bootstrap" if task else "bootstrap_no_task"]
+    group_name = topic_parts(thread_id)[0]
+    if group_name:
+        template = template.replace("tg-bridge register --name",
+                                    f"tg-bridge register --group {group_name} --name")
     bootstrap = template.format(name_q=shlex.quote(name), task=task)
     if engine == "codex":
         try:
@@ -2994,10 +3291,10 @@ def spawn_session(cfg, thread_id, text):
         f"It will open its own topic and {followup} shortly."
     ))
     log(f"spawned {engine} tmux session {tmux_name} (topic {thread_id} asked)")
-    threading.Timer(SPAWN_VERIFY_DELAY, verify_spawn, args=(cfg, tmux_name, engine)).start()
+    threading.Timer(SPAWN_VERIFY_DELAY, verify_spawn, args=(cfg, tmux_name, engine, thread_id)).start()
 
 
-def verify_spawn(cfg, tmux_name, engine):
+def verify_spawn(cfg, tmux_name, engine, topic_id=0):
     """Report to General if the spawned TUI didn't survive startup."""
     out = _tmux(
         ["tmux", "list-panes", "-t", "=" + tmux_name, "-F", "#{pane_current_command}\t#{pane_pid}"],
@@ -3013,7 +3310,12 @@ def verify_spawn(cfg, tmux_name, engine):
         cap = _tmux(["tmux", "capture-pane", "-t", "=" + tmux_name, "-p"],
                              capture_output=True, text=True)
         tail = "\n" + "\n".join(line for line in cap.stdout.splitlines() if line.strip())[-500:]
-    api(cfg["bot_token"], "sendMessage", {"chat_id": cfg["chat_id"], "text": (
+    try:
+        token, chat_id, _thread = topic_credentials(cfg, topic_id)
+    except TopicKeyError as e:
+        log(f"spawn verify failed for {tmux_name}; alert not sent for topic {topic_id}: {e}")
+        return
+    api(token, "sendMessage", {"chat_id": chat_id, "text": (
         f"⚠️ Spawn '{tmux_name}' failed — the {engine} TUI isn't running "
         f"{SPAWN_VERIFY_DELAY}s after start.{tail}"
     )})
@@ -3209,7 +3511,7 @@ def load_autocf_exempt():
         with open(state_path("autocf_exempt.json")) as f:
             data = json.load(f)
         if isinstance(data, list):
-            return {str(x) for x in data}
+            return _follow_moved_exemptions(data)
     except (OSError, ValueError):
         pass
     return set()
@@ -3319,6 +3621,7 @@ def _autocf_decide(pct, engine, armed, active, threshold=None, rearm=None):
     return False, armed                      # armed & still high, or between rearm and threshold
 
 
+@topic_operation("thread_id")
 def _process_autocf(cfg, thread_id, info, pane, pct, engine, exempt, autocf_fired):
     """Per-topic auto carry-forward step (extracted from warning_loop for testability).
     Returns True iff a carry-forward fired. Topics in `exempt` (#119) never fire and have any
@@ -3365,7 +3668,7 @@ def _process_autocf(cfg, thread_id, info, pane, pct, engine, exempt, autocf_fire
         # The start notice carries the kill-switch instructions, so a carry-forward that ran
         # without it would compact and resume a session with its owner told nothing and given
         # no way to halt it. If the topic can't receive the notice, don't start (#161).
-        if not reply(cfg, int(thread_id),
+        if not reply(cfg, normalize_topic_key(thread_id),
                      (f"🔄 Auto carry-forward at {pct}% context — writing the carry-forward, "
                       f"compacting, then resuming from its next-steps."
                       if CARRY_FORWARD else
@@ -3377,7 +3680,7 @@ def _process_autocf(cfg, thread_id, info, pane, pct, engine, exempt, autocf_fire
         # THAT one can't be delivered. Without its answer we would persist armed=True for a
         # run that never started, and a reopen before the next closed-topic poll would strand
         # the retry (Codex round 2 of PR #162).
-        if not handle_carry_forward(cfg, int(thread_id), "/carryforward", info, pane):
+        if not handle_carry_forward(cfg, normalize_topic_key(thread_id), "/carryforward", info, pane):
             autocf_fired[thread_id] = False
             return False
     return fire
@@ -3461,7 +3764,7 @@ def _codex_context_cue(tid, info, pane):
         # Registration already writes this private binding; real ids never ship in code.
         try:
             with open(os.path.join(cwd, ".tg-bridge-topic")) as f:
-                return f.read(32).strip() == str(tid)
+                return f.read(128).strip() == str(tid)
         except OSError:
             return False
 
@@ -3526,6 +3829,20 @@ def _codex_context_cue(tid, info, pane):
     update_registry(stamp)
 
 
+def _follow_moved_state(registry, *tables):
+    """Warning-loop memory survives moves; persistent snapshots follow on the same tick."""
+    for key, info in registry.items():
+        if not isinstance(info, dict) or not info.get("moved_to"):
+            continue
+        try:
+            destination = str(resolve_moved_topic(key, registry))
+        except TopicKeyError:
+            continue  # a malformed pointer must not stop the warning sweep (#380 review r2)
+        for table in tables:
+            if key in table:
+                table.setdefault(destination, table.pop(key))
+
+
 def warning_loop(cfg):
     warn_path = state_path("warnings.json")
     autocf_path = state_path("autocf.json")
@@ -3553,75 +3870,81 @@ def warning_loop(cfg):
         time.sleep(CTX_POLL)
         try:
             registry = read_registry()
+            _follow_moved_state(registry, warned, autocf_fired)
             exempt = load_autocf_exempt()  # per-poll so exemptions hot-reload without a restart
             # one warning target per pane: its most recent (highest-id) non-feed topic —
-            # a session that re-registers must not double-warn through its older topics
-            latest = {}
-            for tid, info in registry.items():
-                pane = info.get("pane")
-                if pane and not info.get("ended") and not info.get("feed"):
-                    if int(tid) > int(latest.get(pane, "-1")):
-                        latest[pane] = tid
+            # a session that re-registers must not double-warn through its older topics;
+            # creation time breaks ties across groups, whose thread ids are independent
+            latest = latest_topics_by_pane(registry)
             for thread_id, info in registry.items():
-                pane = info.get("pane")
-                if not pane or info.get("ended") or info.get("feed"):
+                if not _sweepable_key(thread_id):
                     continue
-                if info.get("closed"):
-                    # Closed in Telegram: a context warning can't be delivered and an auto
-                    # carry-forward must not run unannounced (#161). Drop the per-topic state
-                    # too, so reopening it re-arms cleanly rather than resuming mid-ladder.
-                    warned.pop(thread_id, None)
-                    autocf_fired.pop(thread_id, None)
-                    _cf_clear_unfinished(thread_id)  # same per-topic state (#239)
-                    continue
-                if latest.get(pane) != thread_id:
-                    continue
-                # Codex self-manages context (excellent native compaction, low context-window
-                # usage), so the bridge's context machinery leaves it alone entirely: no context
-                # warnings AND no auto-carry-forward. (the owner 2026-07-13) Resolve engine from the
-                # LIVE fleet, not the registry field — a freshly registered pane may not have
-                # 'engine' set yet. engine_of_pane returns None for unknown, which stays on the
-                # claude path (warns) as before; only a confirmed "codex" is skipped.
-                # Do this BEFORE context_for(): a codex pane's context lookup can legitimately
-                # return None, and the stale-state cleanup below must still run so a later Claude
-                # reuse of the topic re-arms cleanly rather than staying suppressed by leftover
-                # warn/auto-cf state. (Codex review, PR #97)
-                engine = engine_of_pane(pane)
-                if engine == "codex":
-                    try:
-                        _codex_context_cue(thread_id, info, pane)
-                    except Exception as e:
-                        log(f"Codex context reminder error for topic {thread_id}: {e}")
-                    warned.pop(thread_id, None)
-                    autocf_fired.pop(thread_id, None)
-                    _cf_clear_unfinished(thread_id)  # same per-topic state (#239)
-                    continue
-                # `engine` is already resolved just above — hand it over so context_for
-                # doesn't re-walk the whole fleet once per topic per poll (#158).
-                ctx = context_for(pane, engine)
-                if not ctx:
-                    continue
-                pct = int(float(ctx["pct"]))
-                threshold = (pct // WARN_STEP) * WARN_STEP
-                last = warned.get(thread_id, 0)
-                if pct >= WARN_START and threshold > last:
-                    # Only bank the rung if they actually got it. Advancing unconditionally
-                    # lost the warning outright when the send failed and the topic was
-                    # reopened before the next poll could clear the state (Codex round 2).
-                    if reply(cfg, int(thread_id),
-                             f"⚠️ Context window {pct}% used ({info.get('name', '?')})"):
+                with topic_lock(thread_id):
+                    info = read_registry().get(str(thread_id), {})
+                    if info.get("moved_to"):
+                        continue
+                    pane = info.get("pane")
+                    if not pane or info.get("ended") or info.get("feed"):
+                        continue
+                    if info.get("closed"):
+                        # Closed in Telegram: a context warning can't be delivered and an auto
+                        # carry-forward must not run unannounced (#161). Drop the per-topic state
+                        # too, so reopening it re-arms cleanly rather than resuming mid-ladder.
+                        warned.pop(thread_id, None)
+                        autocf_fired.pop(thread_id, None)
+                        _cf_clear_unfinished(thread_id)  # same per-topic state (#239)
+                        continue
+                    if latest.get(pane) != thread_id:
+                        continue
+                    # Codex self-manages context (excellent native compaction, low context-window
+                    # usage), so the bridge's context machinery leaves it alone entirely: no context
+                    # warnings AND no auto-carry-forward. (the owner 2026-07-13) Resolve engine from the
+                    # LIVE fleet, not the registry field — a freshly registered pane may not have
+                    # 'engine' set yet. engine_of_pane returns None for unknown, which stays on the
+                    # claude path (warns) as before; only a confirmed "codex" is skipped.
+                    # Do this BEFORE context_for(): a codex pane's context lookup can legitimately
+                    # return None, and the stale-state cleanup below must still run so a later Claude
+                    # reuse of the topic re-arms cleanly rather than staying suppressed by leftover
+                    # warn/auto-cf state. (Codex review, PR #97)
+                    engine = engine_of_pane(pane)
+                    if engine == "codex":
+                        try:
+                            _codex_context_cue(thread_id, info, pane)
+                        except Exception as e:
+                            log(f"Codex context reminder error for topic {thread_id}: {e}")
+                        warned.pop(thread_id, None)
+                        autocf_fired.pop(thread_id, None)
+                        _cf_clear_unfinished(thread_id)  # same per-topic state (#239)
+                        continue
+                    # `engine` is already resolved just above — hand it over so context_for
+                    # doesn't re-walk the whole fleet once per topic per poll (#158).
+                    ctx = context_for(pane, engine)
+                    if not ctx:
+                        continue
+                    pct = int(float(ctx["pct"]))
+                    threshold = (pct // WARN_STEP) * WARN_STEP
+                    last = warned.get(thread_id, 0)
+                    if pct >= WARN_START and threshold > last:
+                        # Only bank the rung if they actually got it. Advancing unconditionally
+                        # lost the warning outright when the send failed and the topic was
+                        # reopened before the next poll could clear the state (Codex round 2).
+                        if reply(cfg, normalize_topic_key(thread_id),
+                                 f"⚠️ Context window {pct}% used ({info.get('name', '?')})"):
+                            warned[thread_id] = threshold
+                            log(f"context warning {pct}% -> topic {thread_id}")
+                    elif threshold < last:  # compact/clear happened; re-arm
                         warned[thread_id] = threshold
-                        log(f"context warning {pct}% -> topic {thread_id}")
-                elif threshold < last:  # compact/clear happened; re-arm
-                    warned[thread_id] = threshold
 
-                # Auto carry-forward (#92): at AUTOCF_PCT, drive the full carry-forward so
-                # the session self-manages context. handle_carry_forward waits for idle
-                # (never mid-turn), gates Claude-only, and guards against double-fire; the
-                # armed flag persists so we don't re-call it every poll while it runs.
-                # `engine` is resolved above (codex already skipped); a None here stays on the
-                # claude gate inside _autocf_decide, which only fires for engine == "claude".
-                _process_autocf(cfg, thread_id, info, pane, pct, engine, exempt, autocf_fired)
+                    # Auto carry-forward (#92): at AUTOCF_PCT, drive the full carry-forward so
+                    # the session self-manages context. handle_carry_forward waits for idle
+                    # (never mid-turn), gates Claude-only, and guards against double-fire; the
+                    # armed flag persists so we don't re-call it every poll while it runs.
+                    # `engine` is resolved above (codex already skipped); a None here stays on the
+                    # claude gate inside _autocf_decide, which only fires for engine == "claude".
+                    _process_autocf(cfg, thread_id, info, pane, pct, engine, exempt, autocf_fired)
+            # A move can land after this poll's registry snapshot. Remap before publishing
+            # too, so the next poll/restart never reloads a rung under a retired key.
+            _follow_moved_state(read_registry(), warned, autocf_fired)
             with open(warn_path + ".tmp", "w") as f:
                 json.dump(warned, f)
             os.replace(warn_path + ".tmp", warn_path)
@@ -3647,7 +3970,7 @@ def has_live_recv(tid):
             ["pgrep", "-af", f"tg-bridge recv --topic {tid}"],
             capture_output=True, text=True,
         )
-        pat = re.compile(rf"tg-bridge recv --topic {tid}(?:\D|$)")
+        pat = re.compile(rf"tg-bridge recv --topic {re.escape(str(tid))}(?:\s|$)")
         for line in out.stdout.splitlines():
             if pat.search(line):
                 return True
@@ -3871,7 +4194,9 @@ def service_event_is_trusted(cfg, msg):
     owner = _telegram_id(cfg.get("owner_id"))
     if owner is not None and sender_id == owner:
         return True
-    bot = bot_user_id(cfg)
+    chat = msg.get("chat")
+    group = group_for_chat(cfg, chat.get("id")) if isinstance(chat, dict) else None
+    bot = bot_user_id(group or cfg)
     return bot is not None and sender_id == bot
 
 
@@ -3941,9 +4266,56 @@ def _log_rejected_service_event(kind, thread_id, sender_id, sender_chat_id):
 
 
 def handle_message(cfg, msg):
+    """Fence trusted ingress against a move; an old Telegram thread stays a tombstone."""
+    chat = msg.get("chat")
+    group = group_for_chat(cfg, chat.get("id")) if isinstance(chat, dict) else None
+    sender = msg.get("from")
+    service = "forum_topic_closed" in msg or "forum_topic_reopened" in msg
+    trusted = (service_event_is_trusted(cfg, msg) if service else
+               valid_owner_id(cfg.get("owner_id")) and isinstance(sender, dict)
+               and sender.get("id") == cfg["owner_id"] and not sender.get("is_bot"))
+    if group is None or not trusted:
+        # Preserve the existing rejection logs; no lock file may be written for an
+        # unauthorized sender, including service events (#206).
+        return _handle_message(cfg, msg)
+    key = topic_key(cfg, group["name"], msg.get("message_thread_id", 0))
+    try:
+        registered = str(key) in read_registry()
+    except (OSError, ValueError):
+        registered = True  # preserve the kill-switch's existing broken-read path below
+    creation = contextlib.nullcontext() if registered else _topic_creation_lock
+    with creation, topic_lock(key):
+        try:
+            info = read_registry().get(str(key), {})
+        except (OSError, ValueError):
+            # A broken read cannot pre-empt the carry-forward kill-switch (#195 r3).
+            return _handle_message(cfg, msg)
+        if info.get("moved_to"):
+            if not any(field in msg for field in SERVICE_KEYS):
+                destination = resolve_moved_topic(key)
+                pointer = f"Session moved to {_move_notice(cfg, destination)}."
+                if not reply(cfg, key, pointer):
+                    # Admins can post in a closed old thread, but a bot send may still be
+                    # rejected with TOPIC_CLOSED. Reopen just for the pointer and re-close;
+                    # the rejected attempt delivered nothing and no session is revived.
+                    token, chat, thread = topic_credentials(cfg, key)
+                    api(token, "reopenForumTopic", {"chat_id": chat, "message_thread_id": thread})
+                    try:
+                        reply(cfg, key, pointer)
+                    finally:
+                        api(token, "closeForumTopic", {"chat_id": chat, "message_thread_id": thread})
+            return
+        return _handle_message(cfg, msg)
+
+
+def _handle_message(cfg, msg):
     chat = msg.get("chat", {})
-    if chat.get("id") != cfg["chat_id"]:
+    group = group_for_chat(cfg, chat.get("id")) if isinstance(chat, dict) else None
+    if group is None:
         return
+    wire_thread = msg.get("message_thread_id", 0)
+    thread_id = topic_key(cfg, group["name"], wire_thread)
+    token, _chat_id, _thread = topic_credentials(cfg, thread_id)
     # Record forum open/closed BEFORE the service-message drop (#161): these events are the
     # only source of truth the Bot API gives, and the digest uses them to list open topics only.
     if "forum_topic_closed" in msg or "forum_topic_reopened" in msg:
@@ -3965,12 +4337,12 @@ def handle_message(cfg, msg):
 
             _log_rejected_service_event(
                 "close" if "forum_topic_closed" in msg else "reopen",
-                msg.get("message_thread_id"),
+                thread_id,
                 _shown_id(msg.get("from")), _shown_id(msg.get("sender_chat")))
             return
         closed = "forum_topic_closed" in msg
-        set_topic_closed(msg.get("message_thread_id"), closed)
-        log(f"topic {msg.get('message_thread_id')} "
+        set_topic_closed(thread_id, closed)
+        log(f"topic {thread_id} "
             f"{'closed' if closed else 'reopened'} in Telegram")
         if not closed:
             # #195: ask before resuming. A full resume re-reads the whole context, which on a
@@ -3990,16 +4362,16 @@ def handle_message(cfg, msg):
             # _auto_reviving for the whole revive, and `ended` is cleared before that guard
             # is released. The manual path (revive_topics -> revive_one) never sets
             # _auto_reviving, so there it is `ended` alone that stops the echo.
-            _reopened = read_registry().get(str(msg.get("message_thread_id")))
+            _reopened = read_registry().get(str(thread_id))
             if unrevivable_reason(_reopened):
                 # #198: never fall silent here. The topic is open and the session is gone;
                 # whatever the reason, saying nothing leaves them watching a topic that will
                 # never answer — which is exactly what they reported.
-                offer_fresh_restart(cfg, msg.get("message_thread_id"), _reopened)
+                offer_fresh_restart(cfg, thread_id, _reopened)
             elif should_auto_revive(_reopened):
                 if ((_reopened.get("engine") or "claude") == "claude"
                         and _reopen_needs_asking(_reopened)):
-                    offer_reopen_choice(cfg, msg.get("message_thread_id"), _reopened)
+                    offer_reopen_choice(cfg, thread_id, _reopened)
                 else:
                     # Codex has no such picker, and a claude session under Claude's own
                     # thresholds will not be offered one either — so there is nothing to
@@ -4009,7 +4381,7 @@ def handle_message(cfg, msg):
                     # route reaches the same revive by a different door, and telling a codex
                     # session its terminal "was found dead when a message arrived" is the same
                     # false trigger the choice path was just fixed for (#236 review r1, C3/Q2).
-                    maybe_auto_revive(cfg, msg.get("message_thread_id"), cause="reopen")
+                    maybe_auto_revive(cfg, thread_id, cause="reopen")
     if any(key in msg for key in SERVICE_KEYS):
         return
     sender = msg.get("from", {})
@@ -4021,7 +4393,6 @@ def handle_message(cfg, msg):
             f"{sender.get('id')} ({sender.get('first_name') or sender.get('username')})")
         return
 
-    thread_id = msg.get("message_thread_id", 0)
     text = msg.get("text") or msg.get("caption") or ""
     kind = "text"
 
@@ -4083,17 +4454,11 @@ def handle_message(cfg, msg):
         except Exception as e:
             log(f"interrupt error (topic {thread_id}): {e}")
         return
-    if thread_id == 0:
-        # No session reads General — answer immediately instead of dead-lettering
-        # (and skip voice transcription: there's no reader to transcribe for).
-        try:
-            reply(cfg, 0, (
-                "Nobody reads General — sessions only see their own topics. "
-                "Write in a session's topic, or start one with /claude <name> or /codex <name>. "
-                "Commands that DO work here: /help /usage /sessions /claude /codex."
-            ))
-        except Exception as e:
-            log(f"general hint failed: {e}")
+    if wire_thread == 0:
+        # No session reads General: drop it without dead-lettering or transcribing. No reply
+        # either — service events the owner causes there (hiding General, a new title or
+        # photo) also land here, and a hint each time left unread messages in a topic he
+        # had hidden (#388).
         return
     if text and thread_id in pending_kills:
         try:
@@ -4105,9 +4470,11 @@ def handle_message(cfg, msg):
     file_id, audio_kind = extract_audio(msg)
     if file_id:
         kind = audio_kind
-        tmp = state_path("tmp", f"{msg['message_id']}.ogg")
+        filename = (f"{msg['message_id']}.ogg" if group["name"] == cfg.get("default_group", "work")
+                    else f"{thread_id}-{msg['message_id']}.ogg")
+        tmp = state_path("tmp", filename)
         try:
-            download_file(cfg["bot_token"], file_id, tmp)
+            download_file(token, file_id, tmp)
             transcript = transcribe(tmp, openai_api_key())
             log(f"transcribed {audio_kind} message {msg['message_id']} ({len(transcript)} chars)")
             if not transcript.strip():
@@ -4146,7 +4513,7 @@ def handle_message(cfg, msg):
             kind = img_kind
             path = state_path("topics", str(thread_id), "media", f"{msg['message_id']}.{img_ext}")
             try:
-                download_file(cfg["bot_token"], img_id, path)
+                download_file(token, img_id, path)
                 log(f"saved {img_kind} message {msg['message_id']} -> {path}")
                 note = f"[Image attached — view it before replying (Read tool / open the file): {path}]"
                 text = (text + "\n" if text else "") + note
@@ -4160,7 +4527,7 @@ def handle_message(cfg, msg):
                 name = safe_media_name(msg["message_id"], doc_name)
                 path = state_path("topics", str(thread_id), "media", name)
                 try:
-                    download_file(cfg["bot_token"], doc_id, path)
+                    download_file(token, doc_id, path)
                     log(f"saved file message {msg['message_id']} -> {path}")
                     note = f"[File attached — read it before replying: {path}]"
                 except Exception as e:
@@ -4202,7 +4569,7 @@ def handle_message(cfg, msg):
     }
     try:
         reply_to = msg.get("reply_to_message")
-        if (reply_to and reply_to.get("message_id") != thread_id
+        if (reply_to and reply_to.get("message_id") != wire_thread
                 and "forum_topic_created" not in reply_to):
             record["reply_to_message_id"] = int(reply_to["message_id"])
     except Exception as e:
@@ -4218,25 +4585,45 @@ def handle_message(cfg, msg):
 
 
 def handle_callback_query(cfg, query):
+    message = query.get("message")
+    chat = message.get("chat") if isinstance(message, dict) else None
+    group = group_for_chat(cfg, chat.get("id")) if isinstance(chat, dict) else None
+    sender = query.get("from")
+    if (group is not None and valid_owner_id(cfg.get("owner_id"))
+            and isinstance(sender, dict) and sender.get("id") == cfg["owner_id"]
+            and not sender.get("is_bot") and query.get("data") in ("reopen:compact", "reopen:full")):
+        key = topic_key(cfg, group["name"], message.get("message_thread_id", 0))
+        # The file fence precedes _pending_reopen_lock. Taking it inside that lock would
+        # deadlock a concurrent move inspecting pending questions under the exclusive fence.
+        with topic_lock(key):
+            return _handle_callback_query(cfg, query)
+    return _handle_callback_query(cfg, query)
+
+
+def _handle_callback_query(cfg, query):
     """Only a tap on the CURRENT delivered reopen question can supply a choice (#373).
 
     Callbacks have their own door: they must never enter message routing, an inbox, or the
     carry-forward kill-switch. Even a rejected/stale tap is answered so Telegram stops its
     spinner, but group membership and possession of callback data confer no authority."""
+    message = query.get("message")
+    chat = message.get("chat") if isinstance(message, dict) else None
+    group = group_for_chat(cfg, chat.get("id")) if isinstance(chat, dict) else None
+    # The poller drops unknown chats before this handler. Keep its old best-effort ACK for
+    # malformed direct calls too, without giving those calls authority over any question.
+    token, _chat_id, _thread = topic_credentials(
+        cfg, topic_key(cfg, group["name"], message.get("message_thread_id", 0)) if group else 0)
     try:
         sender = query.get("from")
-        message = query.get("message")
         owner = cfg.get("owner_id")
         if (not valid_owner_id(owner) or not isinstance(sender, dict)
                 or sender.get("id") != owner or sender.get("is_bot")
                 or not isinstance(message, dict)):
             return
-        chat = message.get("chat")
         data = query.get("data")
-        if (not isinstance(chat, dict) or chat.get("id") != cfg["chat_id"]
-                or data not in ("reopen:compact", "reopen:full")):
+        if group is None or data not in ("reopen:compact", "reopen:full"):
             return
-        tid = message.get("message_thread_id", 0)
+        tid = topic_key(cfg, group["name"], message.get("message_thread_id", 0))
         message_id = message.get("message_id")
         with _pending_reopen_lock:
             pending = pending_reopens.get(str(tid))
@@ -4251,7 +4638,7 @@ def handle_callback_query(cfg, query):
             check_pending_reopen(cfg, tid, data.split(":", 1)[1])
     finally:
         try:
-            api(cfg["bot_token"], "answerCallbackQuery", {"callback_query_id": query.get("id")})
+            api(token, "answerCallbackQuery", {"callback_query_id": query.get("id")})
         except Exception as e:
             log(f"could not answer reopen callback query: {e}")
 
@@ -4312,10 +4699,11 @@ def _revive_tmux_name(entry, tid, taken):
     on collision (another topic in this restore pass took the same slug, or a live session
     with that name isn't this topic's own pane). `taken` is a set carried across the pass."""
     name = entry.get("name")
-    base = session_slug(name) if name else f"{RESTORE_TMUX_PREFIX}-{tid}"
+    suffix = tid.replace(":", "-")  # tmux treats a colon as a session/window separator
+    base = session_slug(name) if name else f"{RESTORE_TMUX_PREFIX}-{suffix}"
     cand = base
     if cand in taken or _name_taken_by_other(cand, entry.get("pane")):
-        cand = f"{base}-{tid}"
+        cand = f"{base}-{suffix}"
     taken.add(cand)
     return cand
 
@@ -4593,7 +4981,8 @@ def snapshot_once():
                         # produced (claude, CODEX-SID) anyway. The gate above is an
                         # optimisation; this is the invariant.
                         cur = reg.get(_tid)
-                        if cur is not None and not cur.get("session_id") and cur.get("engine") != _e:
+                        if (cur is not None and not cur.get("moved_to")
+                                and not cur.get("session_id") and cur.get("engine") != _e):
                             cur["engine"] = _e
                     update_registry(_stamp_engine)
                     log(f"snapshot: topic {tid} engine={engine} (no session id yet)")
@@ -4609,7 +4998,7 @@ def snapshot_once():
                 continue
 
             def _stamp(reg, _tid=str(tid), _e=engine, _s=sid, _b=boot):
-                if _tid in reg:
+                if _tid in reg and not reg[_tid].get("moved_to"):
                     reg[_tid].update({"engine": _e, "session_id": _s, "boot_id": _b})
             update_registry(_stamp)
             log(f"snapshot: topic {tid} engine={engine} sid={sid[:8]}")
@@ -4853,8 +5242,9 @@ def reopen_topic(cfg, tid):
     answers reopen-of-open with TOPIC_NOT_MODIFIED). Any OTHER failure returns False so the
     caller can surface that the topic may still be closed instead of claiming success."""
     try:
-        api(cfg["bot_token"], "reopenForumTopic",
-            {"chat_id": cfg["chat_id"], "message_thread_id": int(tid)})
+        token, chat_id, thread = topic_credentials(cfg, tid)
+        api(token, "reopenForumTopic",
+            {"chat_id": chat_id, "message_thread_id": thread})
         set_topic_closed(tid, False)   # Telegram just confirmed it is open — don't wait for
         return True                    # the service message (restore_on_boot runs before
     except Exception as e:             # getUpdates, and a dropped update would strand it)
@@ -5249,8 +5639,9 @@ def _edit_reopen_message(cfg, thread_id, pending, text, keyboard=None):
     message_id = pending.get("message_id")
     if message_id:
         try:
-            api(cfg["bot_token"], "editMessageText", {
-                "chat_id": cfg["chat_id"], "message_id": message_id,
+            token, chat_id, _thread = topic_credentials(cfg, thread_id)
+            api(token, "editMessageText", {
+                "chat_id": chat_id, "message_id": message_id,
                 "text": md_to_telegram_html(f"⚙️ {text}"), "parse_mode": "HTML",
                 "reply_markup": json.dumps(markup, separators=(",", ":")),
             })
@@ -5275,6 +5666,7 @@ def _finish_reopen_message(cfg, thread_id, pending, compacted):
         log(f"could not send final reopen status for topic {thread_id}: {e}")
 
 
+@topic_operation("thread_id", moved_result=False)
 def offer_reopen_choice(cfg, thread_id, entry):
     """Ask whether to resume the session as-is or carry it forward first, and state what a
     full resume costs. Returns True iff the question was delivered AND the answer armed.
@@ -5348,8 +5740,14 @@ def resend_undelivered_reopen_questions(cfg):
         stored = pending.get("entry") or entry
         text = (fresh_restart_question(stored) if fresh
                 else reopen_question(stored, pending.get("tokens")))
-        if (reply(cfg, int(tid), text) if fresh
-                else _send_reopen_question(cfg, int(tid), pending)):
+        try:
+            key = normalize_topic_key(tid)
+        except TopicKeyError as e:
+            pending_reopens.pop(tid, None)  # one bad record must not strand the others (#377 F1)
+            log(f"reopen question for topic {tid} dropped: {e}")
+            continue
+        if (reply(cfg, key, text) if fresh
+                else _send_reopen_question(cfg, key, pending)):
             pending_reopens[tid]["state"] = "delivered"
             log(f"re-delivered the {'fresh-restart' if fresh else 'reopen'} question for "
                 f"topic {tid} after a restart")
@@ -5389,7 +5787,7 @@ def _rearm_after_failed_revive(cfg, tid, entry):
         pending_reopens[tid] = restored
     if (pending or {}).get("started_at") is not None:
         try:
-            _edit_reopen_message(cfg, int(tid), restored, reopen_question(entry, tokens),
+            _edit_reopen_message(cfg, normalize_topic_key(tid), restored, reopen_question(entry, tokens),
                                  keyboard=REOPEN_KEYBOARD)
         except Exception as e:
             # Restoring the buttons is best-effort; a broken edit AND send must not swallow
@@ -5398,6 +5796,7 @@ def _rearm_after_failed_revive(cfg, tid, entry):
     _save_pending_reopens()
 
 
+@topic_operation("thread_id", moved_result=False)
 def offer_fresh_restart(cfg, thread_id, entry):
     """Ask whether to start a fresh session in a topic whose own session cannot be resumed.
 
@@ -5479,6 +5878,7 @@ def _check_fresh_restart(cfg, thread_id, pending, word):
     return True
 
 
+@topic_operation("thread_id", moved_result=False)
 def _start_fresh_session(cfg, thread_id, entry):
     """Launch a fresh session bound to an existing topic. Mirrors _revive_with_choice's
     worker discipline: the WORKER owns the pending record, so a failure inside it gives the
@@ -5496,7 +5896,7 @@ def _start_fresh_session(cfg, thread_id, entry):
             log(f"fresh restart topic {tid}: {status}")
             if status == "failed":
                 _rearm_after_failed_revive(cfg, tid, entry)
-                reply(cfg, int(tid),
+                reply(cfg, normalize_topic_key(tid),
                       "⚠️ The fresh session failed to start. The question is open again: "
                       "reply `fresh` to retry.")
             else:
@@ -5504,7 +5904,7 @@ def _start_fresh_session(cfg, thread_id, entry):
         except Exception as e:
             log(f"fresh restart failed for topic {tid}: {e}")
             _rearm_after_failed_revive(cfg, tid, entry)
-            reply(cfg, int(tid),
+            reply(cfg, normalize_topic_key(tid),
                   "⚠️ The fresh session crashed on startup. The question is open again: "
                   "reply `fresh` to retry.")
         finally:
@@ -5521,6 +5921,7 @@ def _start_fresh_session(cfg, thread_id, entry):
         return False
 
 
+@topic_operation("thread_id", moved_result=False)
 def _revive_with_choice(cfg, thread_id, entry, choice):
     """Revive, then apply the requested resume choice.
 
@@ -5554,7 +5955,7 @@ def _revive_with_choice(cfg, thread_id, entry, choice):
             if status == "failed":
                 # Do not let a failed revive be a log line only: that is the silent dead end.
                 _rearm_after_failed_revive(cfg, tid, entry)
-                reply(cfg, int(tid),
+                reply(cfg, normalize_topic_key(tid),
                       "⚠️ The revive failed — the session is still down. The question is "
                       "open again: reply `compact`/`c` or `full`/`f` to retry.")
             else:
@@ -5566,7 +5967,7 @@ def _revive_with_choice(cfg, thread_id, entry, choice):
             # Same dead end by a different door: the answer was consumed when this thread
             # started, so without re-arming they are left with a "Resuming…" that never happened.
             _rearm_after_failed_revive(cfg, tid, entry)
-            reply(cfg, int(tid),
+            reply(cfg, normalize_topic_key(tid),
                   "⚠️ The revive crashed — the session is still down. The question is open "
                   "again: reply `compact`/`c` or `full`/`f` to retry.")
         finally:
@@ -6087,6 +6488,7 @@ def _briefing_exhausted(pane, tid, engine, briefing_tpl, attempt, reason, retry_
                         "session will stay unbriefed until you answer the prompt)")
 
 
+@topic_operation("tid")
 def deliver_briefing(pane, tid, engine, briefing_tpl, attempt=1, settle=None, await_busy=False,
                      restore=None, on_ready=None):
     """Type the briefing into a resumed pane once it is up and idle. Crash-retry safety:
@@ -6229,12 +6631,16 @@ def deliver_briefing(pane, tid, engine, briefing_tpl, attempt=1, settle=None, aw
                 reg[_tid]["briefed_boot"] = _b
         update_registry(_mark)
         log(f"revive: briefed topic {tid} (engine {engine})")
+        # The briefing says "end your turn and wait for a [tg-bridge] line"; a message that
+        # is already waiting would otherwise wait for idle_sweep_loop (#395).
+        wake_if_unread(tid, pane)
         if on_ready:
             on_ready()
     except Exception as e:
         log(f"revive: briefing send failed for topic {tid}: {e}")
 
 
+@topic_operation("tid", moved_result=("failed", None))
 def revive_one(cfg, tid, entry, fresh=False, brief=True, taken=None, cause="boot",
                fresh_requested=None, resume_choice=None, respect_close=False,
                auto_summary=False, picker_deadline=None, reopen_status=None):
@@ -6548,7 +6954,7 @@ def revive_one(cfg, tid, entry, fresh=False, brief=True, taken=None, cause="boot
             f"topic left closed")
     elif reopen_status is None:
         try:
-            reply(cfg, int(tid), notice)  # fast; always inline so the owner sees it immediately
+            reply(cfg, normalize_topic_key(tid), notice)  # fast; always inline so the owner sees it immediately
         except Exception as e:
             log(f"revive: topic notice failed for {tid}: {e}")
     if brief and needs_brief:
@@ -6776,6 +7182,7 @@ def handle_model(cfg, thread_id, text, info, pane):
     _try_send_model(cfg, thread_id, alias, pane, engine, 1)
 
 
+@topic_operation("thread_id")
 def _try_send_model(cfg, thread_id, alias, pane, engine, attempt):
     """Deliver `/model <alias>` when the pane is idle, retrying on a bounded timer. The
     whole decide-and-send is under _model_lock so a newer request can't slip an alias in
@@ -7109,7 +7516,7 @@ def _settings_notice(tid):
 
 def _reply_quietly(tid, text):
     try:
-        reply(load_config(), int(tid), text)
+        reply(load_config(), normalize_topic_key(tid), text)
     except Exception as e:
         log(f"compaction model switch: notice to topic {tid} failed: {e}")
 
@@ -7125,15 +7532,20 @@ def switch_for_compaction(pane, tid, plan, guard):
     return outcome
 
 
-def restore_after_compaction(pane, tid, plan, guard, compacted=True):
+def restore_after_compaction(pane, tid, plan, guard, compacted=True, halted=False):
     """Move the session back to plan["model"]/plan["effort"]. When that cannot be confirmed,
     the topic gets ONE notice naming what the session is left on (#353 C5). "aborted" sends
-    nothing: that is a halt, and the halt notice names the model itself."""
+    nothing: in the flow it is a halt, whose own thread switches back when the flow had moved
+    the model (#397); after a halt it is a new flow, which runs its own switch and restore."""
     steps = _restore_steps(plan)
     outcome, settings_ok = _run_model_steps(pane, plan, steps, guard)
     log(f"compaction model restore (topic {tid}, pane {pane}): {outcome}; {_model_note(plan)}")
     if outcome == "failed":
-        what = (f"This compaction ran on `{COMPACT_MODEL}` at `{COMPACT_EFFORT}`, and I"
+        if halted:
+            plan["notified"] = True  # set just before the notice: _after_halt adds no second
+        what = ("Your message cancelled the compaction, and I"
+                if halted else
+                f"This compaction ran on `{COMPACT_MODEL}` at `{COMPACT_EFFORT}`, and I"
                 if compacted else
                 f"I did not compact: the switch to `{COMPACT_MODEL}` at `{COMPACT_EFFORT}` "
                 f"could not be confirmed, and I")
@@ -7988,6 +8400,7 @@ def _cf_verify_or_create_issue(cfg, thread_id, name, cf_file, marker):
     return (ref, "daemon") if ref else (None, None)
 
 
+@topic_operation("thread_id", moved_result=False)
 def handle_carry_forward(cfg, thread_id, text, info, pane):
     """Start the daemon-driven carry-forward. Returns True iff a worker was started, so
     callers that recorded state on the assumption it ran can undo that (#161)."""
@@ -8064,6 +8477,7 @@ def handle_carry_forward(cfg, thread_id, text, info, pane):
     return True
 
 
+@topic_operation("thread_id")
 def _carry_forward_worker(cfg, thread_id, pane, cf_file, marker, token, name):
     tid = str(thread_id)
     restore_model = None  # bound in PHASE 2 (#353); the error path below still owes it
@@ -8332,13 +8746,46 @@ def halt_carry_forward(cfg, thread_id, reason):
     except subprocess.TimeoutExpired:
         log(f"carry-forward halt: tmux timed out interrupting pane {pane} (topic {thread_id}); "
             f"flow already popped, continuing")
-    # Tell the SESSION, not just the owner (#134). It was already handed the /carryforward
-    # instruction; left untold, it completes the protocol and then waits forever for a
-    # /compact that can never come — listener armed, inbox drained, every health signal
-    # green — while the owner reads it as ignoring them. Measured on a live topic
-    # (2026-08-06): three hours parked, recovered by exactly this one line typed by hand.
-    # After the pop on purpose: the flow is dead before the pane is told, so a session
-    # mid-write cannot see the notice, finish the flow, and be told twice.
+    # The flow may have moved the session to the compaction model. #353 C7 left it there and
+    # only named it; the owner's rule since #397 is "go back to the previous model first".
+    # The switch back waits for idle and for each command's confirmation, so it runs on its
+    # own thread, never on the getUpdates loop that called this; the notice follows it there.
+    plan = st.get("model_plan")
+    switch_back = _halt_needs_switch_back(plan)
+    if switch_back:
+        note = (f"Switching the session back to `{plan['model']}` at `{plan['effort']}` "
+                f"effort first; {_model_note(plan)[0].lower()}{_model_note(plan)[1:]}")
+        threading.Thread(target=_after_halt, args=(tid, pane, plan), daemon=True).start()
+    else:
+        note = _model_note(plan) if plan else ""
+        _halt_notice(tid, pane)
+    reply(cfg, thread_id, (
+        "🛑 Carry-forward halted — session interrupted. Your message was NOT delivered; "
+        "resend it if you want the session to act on it."
+        + (f" {note}" if note else "")
+    ))
+    log(f"carry-forward halted (topic {thread_id}, phase {st.get('phase')}): {reason}")
+    return True
+
+
+def _halt_needs_switch_back(plan):
+    """True when the halted flow moved the session off its own pair, or sent a command whose
+    effect is unconfirmed. A halt before the switch leaves nothing to undo."""
+    if not plan:
+        return False
+    now = plan["now"]
+    return bool(plan.get("sent")) or (now["model"], now["effort"]) != (plan["model"],
+                                                                       plan["effort"])
+
+
+def _halt_notice(tid, pane):
+    """Tell the SESSION, not just the owner (#134). It was already handed the /carryforward
+    instruction; left untold, it completes the protocol and then waits forever for a
+    /compact that can never come — listener armed, inbox drained, every health signal
+    green — while the owner reads it as ignoring them. Measured on a live topic
+    (2026-08-06): three hours parked, recovered by exactly this one line typed by hand.
+    Typed after the pop on purpose: the flow is dead before the pane is told, so a session
+    mid-write cannot see the notice, finish the flow, and be told twice."""
     try:
         if pane and pane_alive(pane):
             status = type_line(pane, (
@@ -8350,20 +8797,181 @@ def halt_carry_forward(cfg, thread_id, reason):
                 # message, whose nudge is a fresh delivery attempt into this pane. Log it
                 # so a parked session can still be traced to this refusal.
                 log(f"carry-forward halt: cancellation notice {status} for pane {pane} "
-                    f"(topic {thread_id}) — the session may still run the CF protocol")
+                    f"(topic {tid}) — the session may still run the CF protocol")
     except Exception as e:
         log(f"carry-forward halt: cancellation notice failed for pane {pane} "
-            f"(topic {thread_id}): {e}")
-    # #353 C7: the flow may have moved the session to the compaction model. A halt stops all
-    # further typing, the switch back included, so say where the session was left.
-    plan = st.get("model_plan")
-    reply(cfg, thread_id, (
-        "🛑 Carry-forward halted — session interrupted. Your message was NOT delivered; "
-        "resend it if you want the session to act on it."
-        + (f" {_model_note(plan)}" if plan else "")
-    ))
-    log(f"carry-forward halted (topic {thread_id}, phase {st.get('phase')}): {reason}")
-    return True
+            f"(topic {tid}): {e}")
+
+
+def _halt_guard(tid, pane):
+    """Guard for the switch back after a halt: yields True while no new flow owns the topic
+    and the pane is alive, holding _cf_lock for the body like _cf_guard. A new flow does its
+    own switching, so this one stops rather than type across it."""
+    @contextlib.contextmanager
+    def guard():
+        with _cf_lock:
+            yield str(tid) not in _pending_cf and pane_alive(pane)
+    return guard
+
+
+def _after_halt(tid, pane, plan):
+    """Switch a halted session back to its own model, then tell it the flow is cancelled.
+
+    The Escape has just interrupted the turn or the compaction. The switch is typed only once
+    the pane is sustained-idle, as the flow's own restore waits for the compaction to settle
+    before it types. Outcomes:
+    - switched back: the cancellation notice follows;
+    - not confirmed: restore_after_compaction sends its one notice; the cancellation notice
+      follows;
+    - the pane did not settle within CF_SETTLE_WAIT: no model command is typed, the owner gets
+      one notice naming the model left on, and the cancellation notice follows;
+    - the pane died, or a step raised before the switch back finished (or a final check raised
+      after one that did not finish): the owner gets one such notice too; after an error the
+      cancellation notice is still typed while the pane lives. A restore that is about to send
+      its own failure notice marks the plan first, so no second one follows. A final check that
+      raises after a confirmed switch back sends nothing: there is nothing left to repair;
+    - a new flow took the topic: nothing is typed and nothing is sent, since that flow switches
+      the model and instructs the session itself.
+    Which case applies is decided under _cf_lock. The cancellation notice is typed under it, so
+    no new flow can start between the check and the keystrokes (as _cf_inject_owned does). An
+    owner notice is sent after the lock is released: a flow that starts after the decision
+    may follow a notice that was true when it was decided. One more window is inherited from
+    _model_cmd: it can report "failed" after its last guard check, so a flow that starts in
+    that last moment can also be followed by one such notice."""
+    guard = _halt_guard(tid, pane)
+    reason = None
+    try:
+        deadline, streak = time.time() + CF_SETTLE_WAIT, 0
+        reason = "busy"
+        while time.time() < deadline:
+            with guard() as ok:
+                if not ok:
+                    reason = None
+                    break
+            if _cf_busy(pane):
+                streak = 0
+            else:
+                streak += 1
+                if streak >= CF_IDLE_SAMPLES:
+                    reason = "idle"
+                    break
+            time.sleep(CF_IDLE_INTERVAL)
+        if reason == "idle":
+            outcome = restore_after_compaction(pane, tid, plan, guard, halted=True)
+            reason = None if outcome == "aborted" else "done"
+    except Exception as e:
+        log(f"carry-forward halt: switch back failed for topic {tid}: {e}")
+        reason = "done" if plan.get("notified") else "error"
+    alive = None  # unknown until the check below returns
+    try:
+        with _cf_lock:
+            if str(tid) in _pending_cf:
+                log(f"carry-forward halt: a new flow owns topic {tid}; nothing more typed or sent")
+                return
+            alive = pane_alive(pane)
+            if alive:
+                _halt_notice(tid, pane)
+    except Exception as e:
+        log(f"carry-forward halt: final check failed for topic {tid}: {e}")
+    if reason != "done":  # "done": the restore ran, and sent its own notice if it failed
+        if alive is False:
+            reason = "gone"
+        elif alive is None:
+            reason = "error"
+        elif reason is None:  # the guard stopped it, and neither a new flow nor a dead pane
+            reason = "stopped"  # is left to explain why
+    if reason in ("busy", "gone", "error", "stopped"):
+        why = {"busy": "The session did not go idle after the halt",
+               "gone": "The session's terminal closed after the halt",
+               "error": "Switching the session back failed with an error",
+               "stopped": "Switching the session back was interrupted"}[reason]
+        log(f"carry-forward halt: topic {tid} not switched back ({reason})")
+        _reply_quietly(tid, f"⚠️ {why}, so I did not switch it back. {_model_note(plan)} "
+                            f"Send `/model {plan['model']}` and `/effort {plan['effort']}` "
+                            f"to put it back.")
+
+def polling_bots(cfg):
+    """One consumer per token; single-group installs keep their existing offset file."""
+    seen = set()
+    bots = []
+    for group in configured_groups(cfg):
+        token = group["bot_token"]
+        if token in seen:
+            continue
+        seen.add(token)
+        key = hashlib.sha256(token.encode()).hexdigest() if "groups" in cfg else None
+        bots.append((token, key))
+    return bots
+
+
+def initial_bot_offset(cfg, token, bot_key, legacy_offset=None):
+    if bot_key is None:
+        return load_offset() if legacy_offset is None else legacy_offset
+    path = state_path("offsets", bot_key)
+    if os.path.exists(path):
+        offset = load_offset(bot_key)
+    else:
+        # Adopt the old default cursor exactly once, BEFORE any other poller starts. Without
+        # recording its token here, replacing the top-level bot lends a new bot an old offset
+        # (skipping updates), while the old bot moved to an extra group replays from zero.
+        initialized = any(re.fullmatch(r"[0-9a-f]{64}", name)
+                          for name in os.listdir(os.path.dirname(path)))
+        offset = 0
+        if token == cfg["bot_token"] and not initialized:
+            offset = load_offset() if legacy_offset is None else legacy_offset
+        save_offset(offset, bot_key)  # even a bot with no updates has its own durable cursor
+    if token == cfg["bot_token"]:
+        save_offset(offset)  # keep a later return to single-group mode on this bot's cursor
+    return offset
+
+
+def route_update(cfg, token, update):
+    """Select by both bot and chat before the owner gate; never log an unknown chat's body."""
+    msg = update.get("message")
+    query = update.get("callback_query")
+    message = msg if isinstance(msg, dict) else (query.get("message") if isinstance(query, dict) else None)
+    chat = message.get("chat") if isinstance(message, dict) else None
+    chat_id = chat.get("id") if isinstance(chat, dict) else None
+    group = group_for_chat(cfg, chat_id, token)
+    if group is None:
+        # No names, callback data, or message bodies here — only transport identifiers.
+        log(f"ignored update {update.get('update_id')} from an unconfigured chat for this bot")
+        return
+    if isinstance(msg, dict):
+        handle_message(cfg, msg)
+    elif isinstance(query, dict):
+        handle_callback_query(cfg, query)
+
+
+def poll_updates(cfg, token, bot_key=None, offset=None):
+    if offset is None:
+        offset = initial_bot_offset(cfg, token, bot_key)
+    names = ", ".join(g["name"] for g in configured_groups(cfg) if g["bot_token"] == token)
+    log(f"poller started for groups {names}, offset={offset}")
+    while True:
+        try:
+            updates = api(token, "getUpdates", {
+                "offset": offset,
+                "timeout": POLL_TIMEOUT,
+                "allowed_updates": ALLOWED_UPDATES,
+            }, timeout=POLL_TIMEOUT + 20)
+        except Exception as e:
+            log(f"getUpdates error (groups {names}): {str(e).replace(token, '[bot token redacted]')}")
+            time.sleep(5)
+            continue
+        for update in updates:
+            offset = update["update_id"] + 1
+            try:
+                route_update(cfg, token, update)
+            except Exception as e:
+                log(f"update handling error (groups {names}): {str(e).replace(token, '[bot token redacted]')}")
+        if updates:
+            if bot_key:
+                save_offset(offset, bot_key)
+            if token == cfg["bot_token"]:
+                # Compatibility mirror only in multi-group mode; the fingerprint cursor
+                # above is authoritative, so a crash between writes cannot cross bots.
+                save_offset(offset)
 
 
 def main():
@@ -8403,8 +9011,12 @@ def main():
     # every other reference in this module mutates this dict in place.
     pending_reopens.update(_load_pending_reopens())
     offset = load_offset()
+    bots = polling_bots(cfg)
+    default_token, default_bot_key = bots[0]
+    offset = initial_bot_offset(cfg, default_token, default_bot_key, legacy_offset=offset)
     restore_on_boot(cfg)  # BEFORE any loop or getUpdates: no thread may observe stale registry
     resend_undelivered_reopen_questions(cfg)  # a question persisted but never sent (C5)
+    recover_interrupted_moves(cfg)  # before lifecycle_loop: a stale `running` is never retried
     threading.Thread(target=warning_loop, args=(cfg,), daemon=True).start()
     threading.Thread(target=lifecycle_loop, args=(cfg,), daemon=True).start()
     threading.Thread(target=dashboard_loop, args=(cfg,), daemon=True).start()
@@ -8413,32 +9025,9 @@ def main():
         threading.Thread(target=idle_park_loop, args=(cfg,), daemon=True).start()
     threading.Thread(target=snapshot_loop, args=(cfg,), daemon=True).start()
     log(f"daemon started, chat_id={cfg['chat_id']}, offset={offset}")
-    while True:
-        try:
-            updates = api(cfg["bot_token"], "getUpdates", {
-                "offset": offset,
-                "timeout": POLL_TIMEOUT,
-                "allowed_updates": ALLOWED_UPDATES,
-            }, timeout=POLL_TIMEOUT + 20)
-        except Exception as e:
-            log(f"getUpdates error: {e}")
-            time.sleep(5)
-            continue
-        for update in updates:
-            offset = update["update_id"] + 1
-            msg = update.get("message")
-            if msg:
-                try:
-                    handle_message(cfg, msg)
-                except Exception as e:
-                    log(f"handle_message error: {e}")
-            elif update.get("callback_query"):
-                try:
-                    handle_callback_query(cfg, update["callback_query"])
-                except Exception as e:
-                    log(f"handle_callback_query error: {e}")
-        if updates:
-            save_offset(offset)
+    for token, bot_key in bots[1:]:
+        threading.Thread(target=poll_updates, args=(cfg, token, bot_key), daemon=True).start()
+    poll_updates(cfg, default_token, default_bot_key, offset=offset)
 
 
 if __name__ == "__main__":

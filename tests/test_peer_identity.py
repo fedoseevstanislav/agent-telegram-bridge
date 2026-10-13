@@ -317,3 +317,64 @@ def test_owner_only_flag_reaches_notify_from_the_command_line(tmp_path, monkeypa
     out = json.loads(capsys.readouterr().out)
     assert out["status"] == "posted" and out["wake"] == "not-requested"
     assert mirrored == [(B, "pulse: pulse line")]
+
+
+# --- agent-only notices: for the agent, never posted to Telegram (#393) -------------------
+
+def test_agent_only_notice_enqueues_and_wakes_without_posting(tmp_path, monkeypatch):
+    mirrored = _notify_env(monkeypatch, tmp_path, pane=None)
+    nudged = []
+    monkeypatch.setattr(cli, "maybe_nudge", lambda *args: nudged.append(args) or True,
+                        raising=False)
+
+    result = cli.notify_topic(CFG, B, "Coach nudge", "coach-nudge:evening:2026-10-08",
+                              "[COACH-NUDGE] Slot: evening", agent_only=True)
+
+    assert result == {"status": "enqueued", "topic_id": B, "wake": "nudged",
+                      "telegram": "skipped", "echo": "skipped"}
+    assert len(nudged) == 1
+    assert mirrored == []
+    record = _record(tmp_path)
+    assert (record["from"], record["kind"], record["idempotency_key"], record["text"]) == (
+        "Coach nudge", "notification", "coach-nudge:evening:2026-10-08",
+        "[COACH-NUDGE] Slot: evening")
+    assert not (tmp_path / "topics" / str(B) / "notices.jsonl").exists()
+
+
+def test_agent_only_notice_is_idempotent(tmp_path, monkeypatch):
+    mirrored = _notify_env(monkeypatch, tmp_path, pane=None)
+    for _ in range(2):
+        result = cli.notify_topic(CFG, B, "Coach nudge", "coach-nudge:k", "x", agent_only=True)
+    assert result == {"status": "duplicate", "topic_id": B}
+    lines = (tmp_path / "topics" / str(B) / "inbox.jsonl").read_text().splitlines()
+    assert len(lines) == 1 and mirrored == []
+
+
+def test_agent_only_is_refused_for_a_session_pane(tmp_path, monkeypatch):
+    mirrored = _notify_env(monkeypatch, tmp_path)          # caller is session A's pane
+    with pytest.raises(SystemExit, match="for automation"):
+        cli.notify_topic(CFG, B, "x", "k1", "hidden peer message", agent_only=True)
+    assert mirrored == []
+    assert not (tmp_path / "topics" / str(B) / "inbox.jsonl").exists()
+    assert not (tmp_path / "topic-locks").exists()       # refused before the lock is taken
+
+
+def test_agent_only_and_owner_only_together_are_refused(tmp_path, monkeypatch):
+    mirrored = _notify_env(monkeypatch, tmp_path, pane=None)
+    with pytest.raises(SystemExit, match="exclude each other"):
+        cli.notify_topic(CFG, B, "cron", "k2", "x", owner_only=True, agent_only=True)
+    assert mirrored == []
+    assert not (tmp_path / "topics").exists()            # nothing written, not even the lock
+    assert not (tmp_path / "topic-locks").exists()
+
+
+def test_agent_only_flag_reaches_notify_from_the_command_line(tmp_path, monkeypatch, capsys):
+    mirrored = _notify_env(monkeypatch, tmp_path, pane=None)
+    monkeypatch.setattr("sys.stdin", io.StringIO("[COACH-NUDGE] Slot: morning"))
+    args = cli.build_parser().parse_args(
+        ["notify", "--topic", str(B), "--sender", "Coach nudge", "--idempotency-key", "cn:1",
+         "--agent-only"])
+    cli.cmd_notify(CFG, args)
+    out = json.loads(capsys.readouterr().out)
+    assert out["status"] == "enqueued" and out["telegram"] == "skipped"
+    assert mirrored == []

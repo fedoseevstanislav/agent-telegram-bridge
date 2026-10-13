@@ -47,6 +47,43 @@ tg-bridge status                                     # daemon health and every t
 `send` refuses with **exit 3** when that topic has unread messages — you wrote while it was
 working, and it should read you before it answers. `--force` overrides for progress pings.
 
+### Moving a topic between groups
+
+An operator can move a live or parked session to another [configured group](CONFIGURATION.md#multiple-groups-and-bots):
+
+```bash
+tg-bridge move --topic 7 --to personal
+# prints topic_id=personal:17 (the new thread id is assigned by Telegram)
+tg-bridge move --topic personal:17 --to work
+# prints a bare topic id for the default group
+```
+
+The daemon must be running. The command leaves a local request, and the daemon processes it
+on its next lifecycle poll (normally within 30 seconds). It creates the destination topic
+through that group's bot with the same name and the same forum icon when the bot can set it.
+The pane and session are retained; the move neither restarts the session nor types into it.
+A pending reopen question, carry-forward, revive, or another operation using the topic
+refuses the move. Moving to the current group is also refused.
+
+The registry entry, inbox and read cursor, outbox, media, and carry-forward files follow the
+new key. The old topic receives a link to the destination and is closed; the new topic gets
+a move notice. Later owner messages in the old topic receive a pointer and never enter a
+session's inbox. `notify --topic <old key>` follows the pointer, including repeated moves.
+The previous topic folder becomes an alias so attachment paths already stored in the
+append-only inbox remain readable.
+
+Use the printed key for later commands. Existing `--topic` arguments and `TG_BRIDGE_TOPIC`
+values naming the old key also follow the pointer. A cwd's `.tg-bridge-topic` is rewritten
+only if it names the source; a shared cwd bound to another topic is left alone. Without an
+explicit key or environment binding, a moved live session resolves its own topic through
+`TMUX_PANE` before consulting that cwd file. `current-topic` reports the new binding.
+A parked session stays parked until the owner writes in or reopens the new topic, with the
+usual reopen question for a large session.
+
+If the command times out, the request remains for the daemon; check `tg-bridge status`
+before retrying. Warnings after a printed new key mean the move committed but a notice,
+topic close, or auxiliary file update needs attention.
+
 ---
 
 ## Control commands
