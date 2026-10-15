@@ -249,3 +249,71 @@ def test_a_failed_download_leaks_no_file_descriptor(tmp_path, monkeypatch):
 
     assert after <= before + 1               # +1 tolerance for the listdir handle itself
     assert not list(dest.parent.glob("*.part-*"))
+
+
+# A video sent the ordinary way (not "as a file") arrives as `video`, a GIF as `animation`.
+# Both used to vanish like documents did before #150.
+@pytest.mark.parametrize("field,mime,expected_suffix", [
+    ("video", "video/mp4", "7001-video.mp4"),
+    ("animation", "video/mp4", "7001-animation.mp4"),
+])
+def test_an_ordinary_video_or_animation_reaches_the_session(bridge, field, mime, expected_suffix):
+    daemon.handle_message(bridge["cfg"], _msg(**{field: {"file_id": "VID-1", "mime_type": mime,
+                                                         "file_size": 5_000_000}}))
+
+    record, = _records(bridge["tmp"])
+    assert record["kind"] == "file"
+    path = record["text"].split(": ", 1)[1].rstrip("]")
+    assert os.path.exists(path) and path.endswith(expected_suffix)
+    assert bridge["downloaded"] == [("VID-1", path)]
+
+
+def test_a_named_video_keeps_its_safe_name(bridge):
+    daemon.handle_message(bridge["cfg"], _msg(video={"file_id": "VID-2", "file_name": "my clip.MOV",
+                                                     "mime_type": "video/quicktime"}))
+
+    record, = _records(bridge["tmp"])
+    assert record["text"].rstrip("]").endswith("7001-my_clip.MOV")
+
+
+@pytest.mark.parametrize("extra,size", [
+    ({"video": {"file_id": "BIG", "mime_type": "video/mp4", "file_size": 20 * 1024 * 1024 + 1}},
+     20 * 1024 * 1024 + 1),
+    ({"document": {"file_id": "BIG", "file_name": "a.zip", "mime_type": "application/zip",
+                   "file_size": 60 * 1024 * 1024}}, 60 * 1024 * 1024),
+    # an image sent as a file takes the image path when small; over the limit it must not
+    ({"document": {"file_id": "BIG", "file_name": "scan.png", "mime_type": "image/png",
+                   "file_size": 30 * 1024 * 1024}}, 30 * 1024 * 1024),
+])
+def test_a_file_over_the_bot_limit_is_reported_and_not_fetched(bridge, extra, size):
+    daemon.handle_message(bridge["cfg"], _msg(caption="look", **extra))
+
+    record, = _records(bridge["tmp"])
+    assert record["kind"] == "file"
+    assert record["text"].startswith("look\n")
+    assert "not downloaded" in record["text"] and f"{size:,} bytes" in record["text"]
+    assert "link" in record["text"]
+    assert bridge["downloaded"] == []
+
+
+def test_an_unnamed_quicktime_video_gets_a_mov_name(bridge):
+    daemon.handle_message(bridge["cfg"], _msg(video={"file_id": "VID-3", "mime_type": "video/quicktime"}))
+
+    record, = _records(bridge["tmp"])
+    assert record["text"].rstrip("]").endswith("7001-video.mov")
+
+
+@pytest.mark.parametrize("size", [None, "big", True, 3.5])
+def test_an_odd_file_size_does_not_block_delivery(bridge, size):
+    daemon.handle_message(bridge["cfg"], _msg(video={"file_id": "VID-4", "mime_type": "video/mp4",
+                                                     "file_size": size}))
+
+    record, = _records(bridge["tmp"])
+    assert "[File attached" in record["text"]
+
+
+def test_a_file_at_the_bot_limit_is_still_fetched(bridge):
+    daemon.handle_message(bridge["cfg"], _msg(video={"file_id": "EDGE", "mime_type": "video/mp4",
+                                                     "file_size": 20 * 1024 * 1024}))
+
+    assert [fid for fid, _ in bridge["downloaded"]] == ["EDGE"]

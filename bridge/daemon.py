@@ -10,6 +10,7 @@ import fcntl
 import hashlib
 import json
 import math
+import mimetypes
 import os
 import re
 import secrets
@@ -4107,19 +4108,48 @@ def safe_media_name(message_id, raw_name, fallback_ext="bin"):
     return f"{message_id}-{base}"
 
 
+# Bot API getFile serves files of at most 20 MB; a larger file cannot be fetched by a bot at all.
+BOT_DOWNLOAD_LIMIT = 20 * 1024 * 1024
+
+
 def extract_file(msg):
-    """(file_id, file_name) for a non-image document, else (None, None).
+    """(file_id, file_name, file_size) for a non-image document, video or animation, else Nones.
 
     Images are deliberately excluded: `extract_image` already handles `photo` and
     image-mime documents, and their note tells the agent to VIEW the file. Everything else
-    used to reach `if not text: return` and vanish without a record (#150).
+    used to reach `if not text: return` and vanish without a record (#150). A video sent the
+    ordinary way (not "as a file") arrives as `video`, a GIF as `animation`; both vanished the
+    same way until they were read here too. A missing name gets the mime subtype as extension.
     """
     doc = msg.get("document")
+    if doc and (doc.get("mime_type") or "").startswith("image/"):
+        return None, None, None
+    doc = doc or msg.get("video") or msg.get("animation")
     if not doc:
-        return None, None
-    if (doc.get("mime_type") or "").startswith("image/"):
-        return None, None
-    return doc.get("file_id"), doc.get("file_name")
+        return None, None, None
+    name = doc.get("file_name")
+    if not name:
+        mime = (doc.get("mime_type") or "").split(";")[0].strip().lower()
+        ext = mimetypes.guess_extension(mime) or "." + (mime.split("/", 1)[-1].split("+")[0] or "bin")
+        name = f"{'video' if 'video' in msg else 'animation' if 'animation' in msg else 'file'}{ext}"
+    return doc.get("file_id"), name, doc.get("file_size")
+
+
+def oversize_note(msg):
+    """A plain note when the attachment is over the Bot API download limit, else None.
+
+    Checked before any download path, image or file: getFile refuses the file anyway, and the
+    agent can only ask for a link if it is told why nothing arrived. The exact byte count keeps
+    a file one byte over the limit distinguishable from the limit itself.
+    """
+    att = msg.get("document") or msg.get("video") or msg.get("animation")
+    if not att and msg.get("photo"):
+        att = msg["photo"][-1]
+    size = (att or {}).get("file_size")
+    if isinstance(size, int) and not isinstance(size, bool) and size > BOT_DOWNLOAD_LIMIT:
+        return (f"[file received but not downloaded: it is {size:,} bytes and Telegram lets a bot "
+                f"download at most 20 MB ({BOT_DOWNLOAD_LIMIT:,} bytes) — ask for a link or a shorter file]")
+    return None
 
 
 # Bot API: an id "has at most 52 significant bits". Anything wider is not an id Telegram
@@ -4507,7 +4537,12 @@ def _handle_message(cfg, msg):
             if os.path.exists(tmp):
                 os.remove(tmp)
 
-    if not file_id:  # not audio — it may be an image (screenshot)
+    too_big = None if file_id else oversize_note(msg)
+    if too_big:
+        kind = "file"
+        log(f"attachment in message {msg['message_id']} is over the bot download limit")
+        text = (text + "\n" if text else "") + too_big
+    elif not file_id:  # not audio — it may be an image (screenshot)
         img_id, img_ext, img_kind = extract_image(msg)
         if img_id:
             kind = img_kind
@@ -4521,7 +4556,7 @@ def _handle_message(cfg, msg):
                 text = (text + "\n" if text else "") + f"[image received — download failed: {e}]"
                 log(f"image download failed for message {msg['message_id']}: {e}")
         else:
-            doc_id, doc_name = extract_file(msg)
+            doc_id, doc_name, _doc_size = extract_file(msg)
             if doc_id:
                 kind = "file"
                 name = safe_media_name(msg["message_id"], doc_name)
