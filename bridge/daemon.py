@@ -26,7 +26,7 @@ from urllib.parse import quote
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from bridge.common import (
-    api, append_jsonl, download_file, load_config, now_iso, openai_api_key,
+    api, append_jsonl, assemblyai_api_key, download_file, load_config, now_iso, openai_api_key,
     md_to_telegram_html, read_registry, redact_secrets, secure_process_umask, secure_state_tree,
     send_message, state_path,
     unsafe_state_ancestors, update_registry, valid_owner_id, validate_wake_claim,
@@ -34,7 +34,7 @@ from bridge.common import (
     TopicKeyError, topic_credentials, topic_key, topic_parts,
     group_config, move_request_path, resolve_moved_topic, topic_lock, topic_operation,
 )
-from bridge.transcribe import transcribe
+from bridge.transcribe import transcribe, transcribe_assemblyai
 from bridge import codex_ctx, transcript
 
 POLL_TIMEOUT = 50
@@ -118,6 +118,12 @@ SWEEP_POLL = 60  # seconds between sweeps
 SWEEP_GRACE = 150  # seconds an unread backlog must persist before we act
 SWEEP_COOLDOWN = 600  # min seconds between re-nudges of the same topic
 RECENT_INBOX_WINDOW = 1200  # preserve the park safety gate for recently drained messages
+
+# Stall watch (#413): a seat idle at its prompt while its footer lists running background
+# shells or subagents is woken to check that work. 0 disables the watch.
+STALL_IDLE_MIN = float(os.environ.get("TG_BRIDGE_STALL_IDLE_MIN", "20"))
+STALL_REPEAT = 30 * 60  # min seconds between two checks of the same topic
+STALL_POLL = 120  # seconds between stall sweeps
 
 SERVICE_KEYS = (
     "forum_topic_created", "forum_topic_edited", "forum_topic_closed",
@@ -292,8 +298,16 @@ def _tmux(argv, **kwargs):
     takes _cf_lock on every message) freezes with it. Bounding every tmux call means a hung
     tmux op raises TimeoutExpired, which unwinds out of any held lock, so a stuck tmux/CF
     degrades to a failed op instead of a daemon-wide freeze. Callers pass their usual kwargs
-    (check / capture_output / text); only `timeout` is defaulted here."""
+    (check / capture_output / text); `timeout` is defaulted here and `env` is filtered.
+
+    Every call goes to the user's default tmux server, where the registry's panes live (#407).
+    A CLI caller inside another tmux server (one started with `tmux -L <name>`) inherits TMUX and
+    TMUX_TMPDIR, which would send a liveness probe to that server and report a live pane dead —
+    or, on an id collision, name a different pane. The systemd daemon has neither variable set,
+    so for it this changes nothing."""
     kwargs.setdefault("timeout", TMUX_TIMEOUT)
+    env = kwargs.get("env", os.environ)
+    kwargs["env"] = {k: v for k, v in env.items() if k not in ("TMUX", "TMUX_TMPDIR")}
     return subprocess.run(argv, **kwargs)
 
 
@@ -549,7 +563,7 @@ def _await_receipt(pane, nonce, want_present, geo_before, looks, first_wait=None
     return "no", capture
 
 
-def type_line(pane, text, settle=0.3, still_ok=None):
+def type_line(pane, text, settle=0.3, still_ok=None, clear_first=False):
     """Type `text` into a pane and press Enter ONLY once the text is confirmed to have
     reached an input box (#133). Returns "sent", "swallowed", "failed", or "abandoned".
 
@@ -615,6 +629,13 @@ def type_line(pane, text, settle=0.3, still_ok=None):
             # nothing was typed into the pane.
             log(f"type_line: {e} — not typing")
             return "failed"
+        if clear_first:
+            # Under the lock, so it cannot erase another writer's line before its Enter.
+            try:
+                _tmux(["tmux", "send-keys", "-t", pane, "C-u"], check=True, capture_output=True)
+            except Exception as e:
+                log(f"type_line: could not clear the composer on pane {pane}: {e} — not typing")
+                return "failed"
         captured = _echo_capture(pane)
         if captured is None:
             log(f"type_line: can't read pane {pane} — not typing")
@@ -4071,6 +4092,155 @@ def idle_sweep_loop(cfg):
         time.sleep(SWEEP_POLL)
 
 
+_STALL_SHELLS_RE = re.compile(r"(?:^|·)\s*(\d+) shells?\b")
+_last_stall_check = {}  # tid -> epoch of the last check that typed into its pane
+
+
+def background_work(capture):
+    """What a Claude pane's footer lists as still running, from a capture of its bottom:
+    `(shells, agents)`. Only the text below the input box's last rule line is read, so
+    scrollback that merely mentions "1 shell" never counts. Shells come from the mode line
+    (`⏵⏵ bypass permissions on · 2 shells, 1 monitor`), and include the shells of
+    subagents; monitors are watches, not work. Agents are the rows under `● main`, which
+    Claude Code lists only while a subagent is alive (seen 2026-10-28: the rows went away
+    when the subagent finished)."""
+    lines = capture.splitlines()
+    rules = [i for i, line in enumerate(lines) if line.strip() and set(line.strip()) == {"─"}]
+    if not rules:
+        return (0, 0)
+    below = lines[rules[-1] + 1:]
+    shells = 0
+    for line in below:
+        m = _STALL_SHELLS_RE.search(line)
+        if m:
+            shells = int(m.group(1))
+    agents, listing = 0, False
+    for line in below:
+        s = line.strip()
+        if s == "● main":
+            listing = True
+        elif listing and s[:1] in ("◯", "●"):
+            agents += 1
+    return (shells, agents)
+
+
+def stall_check_text(tid, idle_min, shells, agents):
+    """The line typed into a seat that has sat idle while background work runs."""
+    work = ", ".join(part for part in (
+        f"{shells} background shell{'s' if shells != 1 else ''}" if shells else "",
+        f"{agents} subagent{'s' if agents != 1 else ''}" if agents else "") if part)
+    return nudge_text(tid, (
+        f"You have been idle for {idle_min} min while your footer shows {work} still "
+        f"running. Check each one for evidence that it is progressing: its log or output "
+        f"growing, CPU time, new files. A launch that has produced nothing at all is the "
+        f"hang to look for. Stop anything stuck, relaunch it if it is still needed, and tell "
+        f"the owner in one line what was stuck. If everything is progressing, end your turn "
+        f"without messaging the owner."
+    ))
+
+
+def _stall_log(msg):
+    """log() for the stall watch: a failure to log must not end the watch thread."""
+    try:
+        log(msg)
+    except Exception:
+        pass
+
+
+def stall_watch_loop(cfg):
+    """Wake a Claude seat that has been idle for STALL_IDLE_MIN while its own footer lists
+    running background shells or subagents (#413). A seat that ends its turn to wait for a
+    completion notice is never woken if the work hangs instead of ending: two Codex builds
+    sat 6 h and 1.6 h on a stdin that never closed. The footer is Claude Code's own count
+    of running work, so nothing is inferred from transcripts. The idle clock is the park
+    clock, so a seat's answer to a check restarts it; checks of one topic are at least
+    STALL_REPEAT apart. A bug here must never crash the daemon."""
+    while True:
+        time.sleep(STALL_POLL)
+        try:
+            now = time.time()
+            engine_by_pane = {pid: eng for pid, _s, _t, eng in (fleet_panes() or [])}
+            for tid, info in read_registry().items():
+                try:
+                    pane = info.get("pane")
+                    if not pane or info.get("ended") or info.get("feed"):
+                        continue
+                    if (info.get("engine") or "claude") != "claude":
+                        continue
+                    if engine_by_pane.get(pane) != "claude" or not pane_alive(pane):
+                        continue
+                    last = _park_activity(tid, info)
+                    if last is None or now - last < STALL_IDLE_MIN * 60:
+                        continue
+                    if now - _last_stall_check.get(str(tid), 0) < STALL_REPEAT:
+                        continue
+                    if not pane_is_idle(pane):
+                        continue
+                    out = _tmux(["tmux", "capture-pane", "-p", "-t", pane, "-S", "-40"],
+                                capture_output=True, text=True)
+                    if out.returncode != 0:
+                        continue
+                    shells, agents = background_work(out.stdout)
+                    if not shells and not agents:
+                        continue
+                    idle_min = int((now - last) // 60)
+                    # still_ok re-runs the screen inside type_line's pane lock, before the
+                    # first keystroke and before Enter: a turn can start, or the topic can be
+                    # rebound, ended or switched to codex, after the checks above.
+                    def _still_ok(tid=tid, pane=pane):
+                        # Any error reads as False: type_line then withholds and counts the
+                        # attempt instead of the exception leaving text in the composer.
+                        try:
+                            entry = read_registry().get(str(tid)) or {}
+                            return (entry.get("pane") == pane and not entry.get("ended")
+                                    and not entry.get("feed")
+                                    and (entry.get("engine") or "claude") == "claude"
+                                    and engine_of_pane(pane) == "claude"
+                                    and pane_is_idle(pane))
+                        except Exception:
+                            return False
+                    status = type_line(pane, stall_check_text(tid, idle_min, shells, agents),
+                                       still_ok=_still_ok)
+                    # Only "sent" and "swallowed" start the repeat wait, so a swallowing
+                    # modal is not retried each poll. "failed" and "abandoned" are retried
+                    # at the next poll. Either may have left the text unsent in the composer;
+                    # type_line counts most such copies per pane, not all (its own residual).
+                    if status in ("sent", "swallowed"):
+                        _last_stall_check[str(tid)] = now
+                    _stall_log(f"stall check {status} for topic {tid} (pane {pane}): idle "
+                               f"{idle_min} min, footer lists {shells} shell(s), {agents} "
+                               f"subagent(s)")
+                except Exception as e:
+                    _stall_log(f"stall_watch_loop topic {tid} error: {e}")
+        except Exception as e:
+            _stall_log(f"stall_watch_loop error: {e}")
+
+
+def transcribe_voice(path):
+    """The OpenAI path first; AssemblyAI when it fails and an AssemblyAI key is configured
+    (the OpenAI account ran out of credits on 2026-10-28); when both fail the error names
+    both. The AssemblyAI key is cut out of every error text here, because redact_secrets
+    only knows OpenAI-shaped keys."""
+    key = assemblyai_api_key()
+    if not key:
+        return transcribe(path, openai_api_key())
+
+    def scrub(e):
+        return redact_secrets(str(e).replace(key, "[redacted]"))
+
+    try:
+        return transcribe(path, openai_api_key())
+    except Exception as first:
+        first_text = scrub(first)
+        log(f"OpenAI transcription failed ({first_text}); trying AssemblyAI")
+        try:
+            return transcribe_assemblyai(path, key)
+        except Exception as second:
+            combined = RuntimeError(f"OpenAI: {first_text} | AssemblyAI: {scrub(second)}")
+        # Raised outside both handlers, so no key-bearing original rides along as context.
+    raise combined
+
+
 def extract_audio(msg):
     """Return (file_id, kind) for voice-like content, else (None, None)."""
     for kind in ("voice", "audio", "video_note"):
@@ -4505,7 +4675,7 @@ def _handle_message(cfg, msg):
         tmp = state_path("tmp", filename)
         try:
             download_file(token, file_id, tmp)
-            transcript = transcribe(tmp, openai_api_key())
+            transcript = transcribe_voice(tmp)
             log(f"transcribed {audio_kind} message {msg['message_id']} ({len(transcript)} chars)")
             if not transcript.strip():
                 transcript = ""   # whitespace is not a message; don't queue a blank one
@@ -5461,11 +5631,23 @@ def session_context_tokens(sid, cwd):
 
     Returns None when it cannot be established; the caller then says so rather than quoting
     a number it does not have. Read from the transcript tail: the last usage record is the
-    live figure and these files reach tens of MB, so they are never parsed whole."""
+    live figure and these files reach tens of MB, so they are never parsed whole.
+
+    A compaction boundary is a live figure too. Claude Code compacts a session on its own
+    after it sits idle just under its one-hour cache lifetime, and no turn follows to write a
+    new usage record — so the last usage is the size BEFORE that compaction (#404: a 19,877-
+    token session reopened as 221,545 and was compacted a second time). The boundary records
+    the size it left in `compactMetadata.postTokens`; whichever of the two came last wins."""
     try:
         path = transcript.transcript_path(cwd, sid)
         total = None
         for record in transcript.read_tail_records(path):
+            if record.get("subtype") == "compact_boundary":
+                post = (record.get("compactMetadata") or {}).get("postTokens")
+                # Without a usable figure the size is unknown, not the stale pre-boundary one.
+                ok = isinstance(post, int) and not isinstance(post, bool) and post > 0
+                total = post if ok else None
+                continue
             usage = (record.get("message") or {}).get("usage")
             if not isinstance(usage, dict):
                 continue
@@ -5634,7 +5816,7 @@ def reopen_question(entry, tokens):
     if tokens:
         cost = f"re-read about {tokens:,} tokens ({tokens / 10_000:.0f}% of a 1M window)"
     else:
-        cost = "re-read its whole history (size unknown — no usage record found)"
+        cost = "re-read its whole history (size unknown)"
     return (
         f"🔄 Reopening '{' '.join(str(entry.get('name', '?')).split())}'. Full will {cost}.\n"
         f"`compact` resumes from a summary; `full` brings back the whole session.\n"
@@ -6193,26 +6375,38 @@ def last_model_and_effort_for_session(sid, cwd):
     Returns (None, None) when the transcript cannot establish a model; the caller then falls
     back to the watchdog for the model alone and takes no effort with it."""
     try:
-        path = transcript.transcript_path(cwd, sid)
-        for record in reversed(transcript.read_tail_records(path)):
-            # Stop at the NEWEST record that names a model, and take that record's effort —
-            # do not keep scanning for any effort at all. A session that ran Fable at
-            # `medium` and later switched to Opus 4.8 (which records none) would otherwise
-            # hand Opus `--effort medium`, a flag it rejects: the revive dies, and because
-            # the answer has already been consumed that lands in the dead-session state this
-            # whole feature exists to remove (Codex review, finding 7).
-            # Assistant records only, and never a synthetic one (#353 review r1, C2): a record
-            # the client wrote about the session is not the session running a model.
-            if record.get("type") != "assistant" or transcript._is_synthetic(record):
-                continue
-            model = (record.get("message") or {}).get("model")
-            if not model or model == "<synthetic>":
-                continue
-            effort = record.get("effort")
-            return model, (effort if isinstance(effort, str) and effort else None)
-        return None, None
+        record = newest_model_record(transcript.read_tail_records(transcript.transcript_path(cwd, sid)))
+        if record is None:
+            return None, None
+        effort = record.get("effort")
+        return record["message"]["model"], (effort if isinstance(effort, str) and effort else None)
     except Exception:
         return None, None
+
+
+def newest_model_record(records):
+    """The newest record in which the session ran a model, or None: an assistant record, not
+    synthetic, whose message names a real model id. One definition for every reader that asks
+    "what did this session last run, and when" — the model/effort pair and the cache age
+    (#353 review of the cache rule, C5: two filters had drifted apart).
+
+    Stop at the NEWEST such record, and take the effort from it — do not keep scanning for any
+    effort at all. A session that ran Fable at `medium` and later switched to Opus 4.8 (which
+    records none) would otherwise hand Opus `--effort medium`, a flag it rejects: the revive
+    dies, and because the answer has already been consumed that lands in the dead-session state
+    this whole feature exists to remove (Codex review, finding 7). Assistant records only, and
+    never a synthetic one (#353 review r1, C2): a record the client wrote about the session is
+    not the session running a model."""
+    for record in reversed(records):
+        if not isinstance(record, dict) or record.get("type") != "assistant" \
+                or transcript._is_synthetic(record):
+            continue
+        message = record.get("message")
+        model = message.get("model") if isinstance(message, dict) else None
+        if not isinstance(model, str) or not model or model == "<synthetic>":
+            continue
+        return record
+    return None
 
 
 # Claude Code's own resume picker — "Resume from summary (recommended)" / "Resume full
@@ -6472,6 +6666,14 @@ def _inject_compact(pane):
     return "failed", None
 
 
+def _swallow_cap_release_in(pane):
+    """Seconds until `type_line` will try a capped pane again; 0 if it is not capped."""
+    streak, capped_at = _swallowed_streak.get(pane, (0, 0.0))
+    if streak < SWALLOW_MAX_ATTEMPTS:
+        return 0.0
+    return max(0.0, capped_at + SWALLOW_RETRY_AFTER - time.time())
+
+
 def _briefing_exhausted(pane, tid, engine, briefing_tpl, attempt, reason, retry_kwargs=None,
                         report_now=False):
     """The ONE answer to "this attempt could not brief the pane — now what?".
@@ -6506,13 +6708,22 @@ def _briefing_exhausted(pane, tid, engine, briefing_tpl, attempt, reason, retry_
     if attempt < BRIEFING_MAX_ATTEMPTS:
         if report_now:
             report_blocked_pane(tid, pane, "its session-revival briefing")
-        threading.Timer(BRIEFING_RETRY_DELAY, deliver_briefing,
+        delay = BRIEFING_RETRY_DELAY
+        if attempt + 1 == BRIEFING_MAX_ATTEMPTS:
+            # The final attempt is scheduled after type_line's cap, as it stands now, releases.
+            # The chain is shorter than the cap, so two early swallows on a pane that was only
+            # slow to start made every later attempt a refusal without a keystroke, and the
+            # chain ended while the pane was already taking input (#404). Another writer may
+            # spend the released retry first: if it lands, the cap clears and this attempt
+            # runs its usual checks; if it fails, the pane is capped again and this attempt
+            # ends in the final report below, as before.
+            delay = max(delay, _swallow_cap_release_in(pane) + 1)
+        threading.Timer(delay, deliver_briefing,
                         args=(pane, tid, engine, briefing_tpl, attempt + 1),
                         kwargs=retry_kwargs or {}).start()
-        log(f"revive: topic {tid} {reason} — retrying the briefing in "
-            f"{BRIEFING_RETRY_DELAY}s")
+        log(f"revive: topic {tid} {reason} — retrying the briefing in {delay:.0f}s")
         return
-    # Last attempt: the chain ends here, before type_line's own cap can release, and for a
+    # Last attempt: the chain ends here, and for a
     # codex pane with an empty inbox idle_sweep_loop is not a fallback either (it only acts
     # on unread). Force the escalation past its cooldown so giving up is never silent —
     # this is the one report that must get through.
@@ -6766,12 +6977,26 @@ def revive_one(cfg, tid, entry, fresh=False, brief=True, taken=None, cause="boot
                 log(f"revive: codex trust write failed for {cwd}: {e}")
         if do_fresh:
             launch = engine_launch(engine)
+            if entry.get("model_owed"):
+                _set_model_owed(tid, None)  # owed by the old session, not the fresh one
         else:
             # #190: the model was already carried deliberately; effort was not, so a revived
             # session silently came back at the machine default. That is not cosmetic on a
             # rate-limited model, and correcting it afterwards costs a full context re-read.
             model, effort = (last_model_and_effort_for_session(sid, cwd)
                              if engine == "claude" else (None, None))
+            owed = _owed_pair(entry) if engine == "claude" else None
+            if owed and model and _base_model(model) == _base_model(owed[0]):
+                # The transcript's newest reply is on the owed base model, so the session is
+                # back on it; its own newer record decides the effort, and the debt is paid.
+                _set_model_owed(tid, None)
+            elif owed:
+                # A switch back after a compaction was not confirmed, so the transcript's
+                # newest model may be the compaction model. Launch on the pair the session
+                # was on before the switch; the debt stays until a reply on it is recorded.
+                log(f"revive: topic {tid} owes {owed[0]} at {owed[1]} from an unconfirmed "
+                    f"switch back; launching on it instead of {model} at {effort}")
+                model, effort = owed
             if model and effort:
                 # #353: what the session is launched on, from its own record — the pair a
                 # bridge-driven compaction on this reopen switches back to.
@@ -7326,6 +7551,12 @@ def _try_send_model(cfg, thread_id, alias, pane, engine, attempt):
 #     sequence here runs inside a snapshot that is restored byte-for-byte.
 COMPACT_MODEL = "claude-sonnet-5-5[1m]"
 COMPACT_EFFORT = "xhigh"
+# The switch pays only when the session's prompt cache has expired. These sessions cache for one
+# hour (`ephemeral_1h` in their usage records), and a warm 530k-token context re-read on its own
+# model costs a fraction of reading it fresh on Sonnet, which shares no cache with it. So a
+# session whose newest model reply is younger than this compacts on its own model (owner's
+# decision, 2026-10-27).
+PROMPT_CACHE_TTL = 3600
 MODEL_CMD_WAIT = 15          # s for a /model or /effort to confirm itself in the transcript
 _SWITCH_DIALOG_RE = re.compile(r"❯\s*1\.\s*Yes, switch")
 # One lock for every sequence that rewrites settings.json, so two topics compacting at once
@@ -7389,6 +7620,23 @@ def _argv_model(pane):
     return None
 
 
+def _last_reply_age(tpath):
+    """Seconds since the newest non-synthetic assistant record in the transcript, or None when
+    it cannot be read or carries no parseable timestamp. That record is written when a model
+    call returns, which is when the session's prompt cache was last refreshed."""
+    try:
+        record = newest_model_record(transcript.read_tail_records(tpath))
+    except OSError:
+        return None
+    ts = record.get("timestamp") if record is not None else None
+    if not isinstance(ts, str):
+        return None
+    try:
+        return time.time() - datetime.fromisoformat(ts.replace("Z", "+00:00")).timestamp()
+    except (ValueError, OverflowError):
+        return None
+
+
 def compaction_plan(sid, cwd, pane, model=None, effort=None):
     """What to switch back to after a compaction, or None to compact as before.
 
@@ -7396,7 +7644,9 @@ def compaction_plan(sid, cwd, pane, model=None, effort=None):
     record and its effort (`last_model_and_effort_for_session`, the source revive uses). The
     reopen path passes the pair it just launched with, which came from that same record, and
     is taken as-is — the launch argv is newer than anything typed before it.
-    Either unknown → None. Already on exactly the compaction model and effort → None.
+    Either unknown → None. Already on exactly the compaction model and effort → None. A newest
+    model reply younger than PROMPT_CACHE_TTL → None: the cache is warm, so the session's own model
+    compacts cheaper than Sonnet would; a reply with no readable timestamp switches as before.
 
     The record names `claude-opus-5-5` for both context windows, and restoring the wrong one
     would change the session's window. So the id to restore is the newest `/model` typed into
@@ -7423,6 +7673,11 @@ def compaction_plan(sid, cwd, pane, model=None, effort=None):
     if not restore or not effort:
         return None
     if restore == COMPACT_MODEL and effort == COMPACT_EFFORT:
+        return None
+    age = _last_reply_age(tpath)
+    if age is not None and age < PROMPT_CACHE_TTL:
+        log(f"compaction model switch skipped: the newest model reply is {age / 60:.0f} min old, "
+            f"so the prompt cache is warm; compacting on {restore} ({tpath})")
         return None
     return {"model": restore, "effort": effort, "tpath": tpath,
             "now": {"model": restore, "effort": effort}, "sent": None}
@@ -7483,12 +7738,16 @@ def _model_cmd(pane, text, needle, tpath, guard, plan):
         # sees either nothing typed or this command marked as sent — never the gap between
         # a submitted command and its record (#353 review r2, C7).
         before, plan["sent"] = plan.get("sent"), text
-        status = type_line(pane, text, settle=0.5)
+        # Leftover text in the composer turns this line into its argument: after a halt's
+        # Escape put a queued /compact back in the box, the restore went out as
+        # `/compact /model claude-fable-5-1[1m]` and the session stayed on Sonnet for five
+        # days (2026-10-23). So the composer is cleared first, under the pane lock.
+        status = type_line(pane, text, settle=0.5, clear_first=True)
         if status != "sent":
             plan["sent"] = before  # withheld: Enter was never pressed on it
+            _clear_composer(pane)  # a withheld line must not ride out with the next /compact
     if status != "sent":
         log(f"compaction model switch: `{text}` {status} on pane {pane}")
-        _clear_composer(pane)  # a withheld line must not ride out with the next /compact
         return "failed"
     answered = False
     deadline = time.time() + MODEL_CMD_WAIT
@@ -7567,6 +7826,37 @@ def switch_for_compaction(pane, tid, plan, guard):
     return outcome
 
 
+def _owed_pair(entry):
+    """(model, effort) a topic's registry entry owes from an unconfirmed switch back, or
+    None when it owes nothing or the record is malformed."""
+    owed = (entry or {}).get("model_owed")
+    if (isinstance(owed, dict) and isinstance(owed.get("model"), str) and owed["model"]
+            and isinstance(owed.get("effort"), str) and owed["effort"]):
+        return owed["model"], owed["effort"]
+    return None
+
+
+def _set_model_owed(tid, pair):
+    """Record on the topic's registry entry the pair a failed switch back still owes, or
+    clear it (pair None) once a switch back is confirmed. Revive launches on an owed pair
+    instead of the transcript's newest model, which after an unconfirmed switch back may be
+    the compaction model, and the next carry-forward switches back to it. A topic not in
+    the registry is left alone. A failed write is logged only; the restore's own notice to
+    the topic is then the record."""
+    def _apply(reg):
+        entry = reg.get(str(tid))
+        if not isinstance(entry, dict):
+            return
+        if pair:
+            entry["model_owed"] = pair
+        else:
+            entry.pop("model_owed", None)
+    try:
+        update_registry(_apply)
+    except Exception as e:
+        log(f"compaction model restore: could not record the owed model for topic {tid}: {e}")
+
+
 def restore_after_compaction(pane, tid, plan, guard, compacted=True, halted=False):
     """Move the session back to plan["model"]/plan["effort"]. When that cannot be confirmed,
     the topic gets ONE notice naming what the session is left on (#353 C5). "aborted" sends
@@ -7575,6 +7865,9 @@ def restore_after_compaction(pane, tid, plan, guard, compacted=True, halted=Fals
     steps = _restore_steps(plan)
     outcome, settings_ok = _run_model_steps(pane, plan, steps, guard)
     log(f"compaction model restore (topic {tid}, pane {pane}): {outcome}; {_model_note(plan)}")
+    if outcome in ("ok", "failed"):
+        _set_model_owed(tid, None if outcome == "ok" else
+                        {"model": plan["model"], "effort": plan["effort"]})
     if outcome == "failed":
         if halted:
             plan["notified"] = True  # set just before the notice: _after_halt adds no second
@@ -7852,7 +8145,9 @@ def _cf_compaction_plan(tid, token, pane):
     sid = entry.get("session_id")
     if not sid or (entry.get("engine") or "claude") != "claude":
         return None
-    plan = compaction_plan(sid, entry.get("cwd") or "~", pane)
+    owed = _owed_pair(entry)
+    plan = (compaction_plan(sid, entry.get("cwd") or "~", pane, model=owed[0], effort=owed[1])
+            if owed else compaction_plan(sid, entry.get("cwd") or "~", pane))
     if plan:
         with _cf_lock:
             st = _pending_cf.get(str(tid))
@@ -8902,6 +9197,10 @@ def _after_halt(tid, pane, plan):
         with _cf_lock:
             if str(tid) in _pending_cf:
                 log(f"carry-forward halt: a new flow owns topic {tid}; nothing more typed or sent")
+                if reason != "done" and _halt_needs_switch_back(plan):
+                    # The new flow plans from the transcript, which may now name the
+                    # compaction model; the debt makes it switch back to the right pair.
+                    _set_model_owed(tid, {"model": plan["model"], "effort": plan["effort"]})
                 return
             alive = pane_alive(pane)
             if alive:
@@ -8921,6 +9220,7 @@ def _after_halt(tid, pane, plan):
                "error": "Switching the session back failed with an error",
                "stopped": "Switching the session back was interrupted"}[reason]
         log(f"carry-forward halt: topic {tid} not switched back ({reason})")
+        _set_model_owed(tid, {"model": plan["model"], "effort": plan["effort"]})
         _reply_quietly(tid, f"⚠️ {why}, so I did not switch it back. {_model_note(plan)} "
                             f"Send `/model {plan['model']}` and `/effort {plan['effort']}` "
                             f"to put it back.")
@@ -9059,6 +9359,8 @@ def main():
     if IDLE_PARK_HOURS > 0:
         threading.Thread(target=idle_park_loop, args=(cfg,), daemon=True).start()
     threading.Thread(target=snapshot_loop, args=(cfg,), daemon=True).start()
+    if STALL_IDLE_MIN > 0:
+        threading.Thread(target=stall_watch_loop, args=(cfg,), daemon=True).start()
     log(f"daemon started, chat_id={cfg['chat_id']}, offset={offset}")
     for token, bot_key in bots[1:]:
         threading.Thread(target=poll_updates, args=(cfg, token, bot_key), daemon=True).start()

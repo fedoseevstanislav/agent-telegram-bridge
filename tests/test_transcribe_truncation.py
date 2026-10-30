@@ -92,7 +92,7 @@ def test_truncated_gpt_transcript_retries_with_whisper(monkeypatch):
             return _words(5)
         return whisper_text
 
-    monkeypatch.setattr(T, "_audio_duration", lambda path: 240)  # below threshold -> gpt-4o-mini first
+    monkeypatch.setattr(T, "_audio_duration", lambda path: 240)  # below threshold -> PRIMARY_MODEL first
     monkeypatch.setattr(T, "_request", fake_request)
 
     assert T.transcribe("/tmp/voice.ogg", "key") == whisper_text

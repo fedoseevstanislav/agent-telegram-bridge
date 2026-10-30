@@ -563,6 +563,24 @@ def _key_from_bridge_config():
     return key, None
 
 
+def assemblyai_api_key():
+    """The AssemblyAI key for voice transcription, or None when none is configured: the
+    `assemblyai_api_key` in this bridge's own config, held to the same permission and
+    cleanliness checks as `openai_api_key`. With a key, AssemblyAI catches a voice
+    the OpenAI path fails on."""
+    if _secret_file_rejection(CONFIG_PATH):
+        return None
+    try:
+        with open(CONFIG_PATH) as f:
+            data = json.load(f)
+    except (ValueError, OSError, RecursionError):
+        return None
+    if not isinstance(data, dict):
+        return None
+    key, _why = _clean_secret(data.get("assemblyai_api_key"))
+    return key or None
+
+
 def openai_api_key():
     """The OpenAI key used to transcribe voice messages.
 

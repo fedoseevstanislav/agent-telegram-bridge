@@ -257,3 +257,48 @@ def test_the_docstring_no_longer_names_idle_sweep_as_the_settle_fallback():
     assert "idle_sweep_loop to nudge" not in doc
     assert "_briefing_exhausted" in doc, (
         "the docstring should name the path a busy pane actually takes")
+
+
+# ---- #404: the final attempt is not spent inside type_line's swallow cap ----------------
+
+NOW = 1_000_000.0
+
+
+@pytest.fixture
+def capped(briefing, monkeypatch):
+    monkeypatch.setattr(daemon.time, "time", lambda: NOW)
+    monkeypatch.setattr(daemon, "_swallowed_streak", {})
+    return briefing
+
+
+def test_the_final_attempt_waits_for_the_cap_to_release(capped):
+    # 2026-10-16: capped at 12:25:12, attempts at 12:27:12 and 12:29:13 were refused without a
+    # keystroke, and the chain gave up while the pane was already taking input.
+    daemon._swallowed_streak["%7"] = (daemon.SWALLOW_MAX_ATTEMPTS, NOW - 120)
+    daemon._briefing_exhausted("%7", "4242", "claude", "brief {tid}",
+                               daemon.BRIEFING_MAX_ATTEMPTS - 1, "briefing swallowed")
+
+    (timer,) = capped["timers"]
+    assert timer.args[4] == daemon.BRIEFING_MAX_ATTEMPTS
+    assert NOW + timer.delay > NOW - 120 + daemon.SWALLOW_RETRY_AFTER
+
+
+def test_an_uncapped_pane_keeps_the_ordinary_delay(capped):
+    daemon._swallowed_streak["%7"] = (daemon.SWALLOW_MAX_ATTEMPTS - 1, 0.0)
+    daemon._briefing_exhausted("%7", "4242", "claude", "brief {tid}",
+                               daemon.BRIEFING_MAX_ATTEMPTS - 1, "briefing swallowed")
+    assert [t.delay for t in capped["timers"]] == [daemon.BRIEFING_RETRY_DELAY]
+
+
+def test_earlier_attempts_keep_the_ordinary_delay_even_when_capped(capped):
+    daemon._swallowed_streak["%7"] = (daemon.SWALLOW_MAX_ATTEMPTS, NOW)
+    daemon._briefing_exhausted("%7", "4242", "claude", "brief {tid}", 1, "briefing swallowed")
+    assert [t.delay for t in capped["timers"]] == [daemon.BRIEFING_RETRY_DELAY]
+
+
+def test_a_cap_already_released_keeps_the_ordinary_delay(capped):
+    daemon._swallowed_streak["%7"] = (daemon.SWALLOW_MAX_ATTEMPTS,
+                                      NOW - daemon.SWALLOW_RETRY_AFTER - 5)
+    daemon._briefing_exhausted("%7", "4242", "claude", "brief {tid}",
+                               daemon.BRIEFING_MAX_ATTEMPTS - 1, "briefing swallowed")
+    assert [t.delay for t in capped["timers"]] == [daemon.BRIEFING_RETRY_DELAY]

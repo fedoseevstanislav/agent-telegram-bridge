@@ -1,4 +1,4 @@
-"""Voice transcription via the OpenAI audio API. Stdlib multipart upload, ffmpeg fallback."""
+"""Voice transcription via AssemblyAI or the OpenAI audio API. Stdlib HTTP, ffmpeg fallback."""
 
 import json
 import os
@@ -10,11 +10,17 @@ import urllib.request
 import uuid
 
 OPENAI_URL = "https://api.openai.com/v1/audio/transcriptions"
-PRIMARY_MODEL = "gpt-4o-mini-transcribe"
+# gpt-transcribe (OpenAI, 2026-08) against whisper-1, gpt-4o-mini-transcribe, gpt-4o-transcribe
+# and AssemblyAI universal on 15 real voice notes of 7 s to 12 min, English, Russian and mixed
+# (2026-10-29): it disagreed least with the other models among the OpenAI ones, cut nothing
+# short, and was among the fastest. gpt-4o-transcribe kept only 28-66% of the words of 5 short
+# notes.
+PRIMARY_MODEL = "gpt-transcribe"
 FALLBACK_MODEL = "whisper-1"
-# At/above this, skip gpt-4o-mini-transcribe (which silently truncates near its ~2k output-token
-# cap) and use whisper-1 directly. Set below the observed cap: a real 8-min Russian voice truncated
-# after ~7 min of speech, and Cyrillic tokenizes densely, so 5 min leaves ~2 min of margin.
+# At/above this, a single request goes to whisper-1 first: gpt-4o-mini-transcribe silently
+# truncated near its ~2k output-token cap (a real 8-min Russian voice stopped after ~7 min), and
+# gpt-transcribe's cap is not measured. Long notes normally go in pieces (CHUNK_ABOVE_S), on
+# PRIMARY_MODEL; this order applies when splitting fails or the pieces come back empty.
 LONG_AUDIO_THRESHOLD_S = 300
 # Marker threshold, deliberately below natural slow speech. Measured on the two notes that
 # prompted #227: read in pieces they come out at 0.76 and 0.66 words/sec and are COMPLETE —
@@ -74,6 +80,61 @@ def _request(api_key, path, model):
     )
     with urllib.request.urlopen(req, timeout=300) as resp:
         return json.load(resp)["text"]
+
+
+ASSEMBLYAI_URL = "https://api.assemblyai.com/v2"
+ASSEMBLYAI_TIMEOUT_S = 300  # the upload, the request and the polling together
+
+
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    """A redirect would carry the authorization header to whatever host it names."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
+
+
+_AAI_OPENER = urllib.request.build_opener(_NoRedirect)
+
+
+def _aai(api_key, url, data=None, content_type=None, timeout=120):
+    headers = {"authorization": api_key}
+    if content_type:
+        headers["content-type"] = content_type
+    req = urllib.request.Request(url, data=data, headers=headers)
+    with _AAI_OPENER.open(req, timeout=timeout) as resp:
+        return json.load(resp)
+
+
+def transcribe_assemblyai(path, api_key, poll=1.0):
+    """Upload `path` to AssemblyAI, request a transcript with language detection on its
+    `universal` model, and poll until it completes. Returns the text ("" for no speech);
+    raises on an error status, on a redirect, or when a request is due after
+    ASSEMBLYAI_TIMEOUT_S. Every request's own timeout is at most 120 s and never more than the
+    time left, so a run ends within about one socket read of the deadline; a transcript that
+    completes in that last read is returned."""
+    import time
+    deadline = time.time() + ASSEMBLYAI_TIMEOUT_S
+
+    def left():
+        remaining = deadline - time.time()
+        if remaining <= 0:
+            raise RuntimeError(f"AssemblyAI did not finish within {ASSEMBLYAI_TIMEOUT_S}s")
+        return min(remaining, 120)
+
+    with open(path, "rb") as f:
+        upload = _aai(api_key, f"{ASSEMBLYAI_URL}/upload", f.read(), "application/octet-stream",
+                      timeout=left())
+    job = _aai(api_key, f"{ASSEMBLYAI_URL}/transcript",
+               json.dumps({"audio_url": upload["upload_url"], "speech_model": "universal",
+                           "language_detection": True}).encode(), "application/json",
+               timeout=left())
+    while True:
+        result = _aai(api_key, f"{ASSEMBLYAI_URL}/transcript/{job['id']}", timeout=left())
+        if result.get("status") == "completed":
+            return result.get("text") or ""
+        if result.get("status") == "error":
+            raise RuntimeError(f"AssemblyAI error: {result.get('error')}")
+        time.sleep(min(poll, max(left(), 0)))
 
 
 def _audio_duration(path):
@@ -183,7 +244,8 @@ def _mark_if_short(text, duration):
 
 
 def transcribe(path, api_key):
-    """Transcribe an audio file, routing long or unknown audio through whisper-1."""
+    """Transcribe an audio file: long audio in pieces on PRIMARY_MODEL, and a single request
+    on long or unknown-length audio through whisper-1 first."""
     duration = _audio_duration(path)
     if duration is None or duration >= LONG_AUDIO_THRESHOLD_S:
         primary, secondary = FALLBACK_MODEL, PRIMARY_MODEL
@@ -194,7 +256,7 @@ def transcribe(path, api_key):
     # of the content to repetition and hallucinated filler (see CHUNK_ABOVE_S above).
     if isinstance(duration, (int, float)) and duration > CHUNK_ABOVE_S:
         try:
-            pieced = _transcribe_in_pieces(api_key, path, FALLBACK_MODEL)
+            pieced = _transcribe_in_pieces(api_key, path, PRIMARY_MODEL)
         except Exception:
             pieced = None
         if pieced and pieced.strip():

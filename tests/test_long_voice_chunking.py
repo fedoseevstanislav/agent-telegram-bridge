@@ -65,7 +65,7 @@ def test_long_audio_is_transcribed_in_pieces_and_joined(monkeypatch, tmp_path):
 
     assert text == recorder.joined(3)
     assert [p for p, _ in recorder.paths] == pieces
-    assert {m for _, m in recorder.paths} == {transcribe.FALLBACK_MODEL}
+    assert {m for _, m in recorder.paths} == {transcribe.PRIMARY_MODEL}
 
 
 def test_the_pieces_are_deleted_afterwards(monkeypatch, tmp_path):

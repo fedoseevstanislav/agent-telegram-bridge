@@ -57,7 +57,7 @@ class FakeClaude:
         # What the real client does to the global file on every one of these.
         self.settings.write_bytes(self.settings.read_bytes() + f"\n// {arg}\n".encode())
 
-    def type_line(self, pane, text, settle=0.3, still_ok=None):
+    def type_line(self, pane, text, settle=0.3, still_ok=None, clear_first=False):
         self.typed.append(text)
         if text.startswith("/model "):
             if self.cached:
@@ -238,6 +238,69 @@ def test_the_context_window_falls_back_to_the_launch_argv(monkeypatch, fake):
     # An argv naming a different model is not evidence about this one.
     monkeypatch.setattr(daemon, "_argv_model", lambda pane: "claude-fable-5-1[1m]")
     assert daemon.compaction_plan("SID", "/srv/seat", "%0")["model"] == PREV_MODEL
+
+
+# ---- warm prompt cache: compact on the session's own model (owner's decision, 2026-10-27) ----
+
+def _reply_at(path, seconds_ago, ts=None):
+    import time as _t
+    from datetime import datetime as _dt, timezone as _tz
+    stamp = ts if ts is not None else _dt.fromtimestamp(_t.time() - seconds_ago, _tz.utc).strftime(
+        "%Y-%m-%dT%H:%M:%S.000Z")
+    _record(path, {"type": "assistant", "effort": PREV_EFFORT, "timestamp": stamp,
+                   "message": {"model": PREV_MODEL, "content": [{"type": "text", "text": "ok"}]}})
+
+
+def test_a_reply_younger_than_the_cache_ttl_compacts_without_switching(monkeypatch, tmp_path):
+    f = FakeClaude(tmp_path)
+    _reply_at(f.transcript, 10 * 60)
+    _install(monkeypatch, f)
+    _run(monkeypatch, f)
+    assert f.commands() == ["/compact", daemon.COMPACT_RESUME_PROMPT]
+    assert f.settings.read_bytes() == SETTINGS_BYTES
+
+
+def test_a_reply_older_than_the_cache_ttl_still_switches(monkeypatch, tmp_path):
+    f = FakeClaude(tmp_path)
+    _reply_at(f.transcript, daemon.PROMPT_CACHE_TTL + 60)
+    _install(monkeypatch, f)
+    _run(monkeypatch, f)
+    assert f.commands()[:3] == [f"/model {daemon.COMPACT_MODEL}",
+                                f"/effort {daemon.COMPACT_EFFORT}", "/compact"]
+
+
+@pytest.mark.parametrize("stamp", ["not a time", 12345])
+def test_an_unreadable_reply_time_switches_as_before(monkeypatch, tmp_path, stamp):
+    f = FakeClaude(tmp_path)
+    _reply_at(f.transcript, 0, ts=stamp)
+    _install(monkeypatch, f)
+    plan = daemon.compaction_plan("SID", "/srv/seat", "%0")
+    assert plan is not None and plan["model"] == PREV_MODEL
+
+
+def test_a_warm_cache_skips_the_switch_on_the_reopen_path_too(monkeypatch, tmp_path):
+    f = FakeClaude(tmp_path)
+    _reply_at(f.transcript, 5 * 60)
+    _install(monkeypatch, f)
+    assert daemon.compaction_plan("SID", "/srv/seat", "%77", PREV_MODEL, PREV_EFFORT) is None
+    (tmp_path / "cold").mkdir()
+    f2 = FakeClaude(tmp_path / "cold")
+    _reply_at(f2.transcript, 3 * 3600)
+    _install(monkeypatch, f2)
+    assert daemon.compaction_plan("SID", "/srv/seat", "%77", PREV_MODEL, PREV_EFFORT) is not None
+
+
+@pytest.mark.parametrize("junk", [{"model": False}, {"model": ""}, [], "text"])
+def test_a_newer_record_without_a_real_model_does_not_make_the_cache_warm(monkeypatch, tmp_path, junk):
+    # Review of the cache rule, C5: the age comes from the same record the model comes from.
+    f = FakeClaude(tmp_path)
+    _reply_at(f.transcript, daemon.PROMPT_CACHE_TTL + 60)
+    _record(f.transcript, {"type": "assistant", "timestamp": "2099-01-01T00:00:00.000Z",
+                           "message": junk})
+    _install(monkeypatch, f)
+    for args in ((), (PREV_MODEL, PREV_EFFORT)):
+        plan = daemon.compaction_plan("SID", "/srv/seat", "%77", *args)
+        assert plan is not None and plan["model"] == PREV_MODEL
 
 
 # ---- C4: settings.json byte-identical ----

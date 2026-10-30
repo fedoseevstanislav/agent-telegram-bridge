@@ -91,6 +91,55 @@ def test_the_last_record_wins_even_when_it_is_smaller(tmp_path, monkeypatch):
     assert daemon.session_context_tokens("SID", "/home/user") == 30_000
 
 
+def _records(tmp_path, monkeypatch, records, sid="SID", cwd="/srv/user"):
+    monkeypatch.setattr(transcript, "PROJECTS_DIR", str(tmp_path))
+    path = transcript.transcript_path(cwd, sid)
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "w", encoding="utf-8") as fh:
+        for r in records:
+            fh.write(json.dumps(r) + "\n")
+    return path
+
+
+def _turn(cache_read):
+    return {"type": "assistant", "message": {"usage": {
+        "input_tokens": 0, "cache_creation_input_tokens": 0, "cache_read_input_tokens": cache_read}}}
+
+
+def _boundary(meta):
+    # The record shape Claude Code 2.1.301 writes when it compacts an idle session itself.
+    return {"type": "system", "subtype": "compact_boundary", "content": "Conversation compacted",
+            "compactMetadata": meta}
+
+
+def test_claudes_own_idle_compaction_is_the_live_size(tmp_path, monkeypatch):
+    # #404: no turn follows an idle compaction, so the last usage is the pre-compaction size.
+    _records(tmp_path, monkeypatch, [
+        _turn(221_545),
+        _boundary({"trigger": "auto", "preTokens": 221_589, "postTokens": 19_877}),
+        {"type": "user", "isCompactSummary": True, "message": {"content": "summary"}},
+        {"type": "system", "subtype": "informational",
+         "content": "Compacted while idle, before the prompt cache expired"},
+    ])
+    assert daemon.session_context_tokens("SID", "/srv/user") == 19_877
+
+
+def test_a_turn_after_the_boundary_is_newer_than_it(tmp_path, monkeypatch):
+    _records(tmp_path, monkeypatch, [
+        _turn(221_545),
+        _boundary({"trigger": "auto", "postTokens": 19_877}),
+        _turn(31_000),
+    ])
+    assert daemon.session_context_tokens("SID", "/srv/user") == 31_000
+
+
+@pytest.mark.parametrize("meta", [{}, {"postTokens": None}, {"postTokens": "19877"},
+                                  {"postTokens": 0}, {"postTokens": True}])
+def test_a_boundary_without_a_size_makes_it_unknown_not_stale(tmp_path, monkeypatch, meta):
+    _records(tmp_path, monkeypatch, [_turn(221_545), _boundary(meta)])
+    assert daemon.session_context_tokens("SID", "/srv/user") is None
+
+
 def test_an_unknown_size_is_None_not_zero(tmp_path, monkeypatch):
     monkeypatch.setattr(transcript, "PROJECTS_DIR", str(tmp_path))
     assert daemon.session_context_tokens("missing", "/home/user") is None
