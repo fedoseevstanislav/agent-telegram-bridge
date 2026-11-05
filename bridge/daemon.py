@@ -2314,14 +2314,29 @@ def pane_engine(command, pane_pid):
     if command in ("claude", "codex"):
         return command
     if command == "node":
-        try:
-            with open(f"/proc/{pane_pid}/cmdline", "rb") as f:
-                argv = f.read().decode(errors="replace").split("\0")
-        except (OSError, ValueError):
-            return None
-        if any(a == "codex" or a.endswith("/codex") for a in argv[:3]):
-            return "codex"
+        # The pane's root process, then its direct children: a pane started as a shell that
+        # then runs codex (`tmux new-session 'bash'` + typed `codex ...`) reports the codex
+        # child as its current command while pane_pid stays the shell. Missing that left a
+        # live codex seat unseen by every pane loop, with a stale (claude, sid) record no
+        # snapshot ever corrected (2026-11-02).
+        for pid in [str(pane_pid)] + _child_pids(pane_pid):
+            try:
+                with open(f"/proc/{pid}/cmdline", "rb") as f:
+                    argv = f.read().decode(errors="replace").split("\0")
+            except (OSError, ValueError):
+                continue
+            if any(a == "codex" or a.endswith("/codex") for a in argv[:3]):
+                return "codex"
     return None
+
+
+def _child_pids(pid):
+    """Direct children of `pid` from /proc/<pid>/task/<pid>/children; [] when unreadable."""
+    try:
+        with open(f"/proc/{pid}/task/{pid}/children") as f:
+            return f.read().split()
+    except (OSError, ValueError):
+        return []
 
 
 def fleet_panes():
@@ -2538,10 +2553,14 @@ def ppid_of(pid):
 
 
 def headless_worker_count():
-    """claude/codex processes with no tmux pane in their ancestry — headless workers."""
+    """claude/codex processes whose effective uid is this process's (`pgrep -u`) and that have
+    no tmux pane in their ancestry — headless workers. Processes under any other uid are
+    skipped: another user's interactive sessions sit under their own tmux server, which
+    `tmux list-panes` here cannot see, so they would be counted as headless."""
     matched = set()
     for args in (("-x", "claude"), ("-f", "codex exec")):
-        out = subprocess.run(["pgrep", *args], capture_output=True, text=True)
+        out = subprocess.run(["pgrep", "-u", str(os.geteuid()), *args],
+                             capture_output=True, text=True)
         matched.update(int(p) for p in out.stdout.split())
     panes = _tmux(["tmux", "list-panes", "-a", "-F", "#{pane_pid}"],
                            capture_output=True, text=True)
